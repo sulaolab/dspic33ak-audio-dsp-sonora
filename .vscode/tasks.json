@@ -1,0 +1,91 @@
+{
+    // VS Code build tasks for the MPLAB X project "dspic33ak_audio_dsp.X".
+    //
+    // These tasks reproduce the MPLAB X command-line build using the MPLAB X
+    // generated Makefiles + the XC-DSC toolchain. No project source is touched.
+    //
+    // Build tool locations are resolved by buildtools/build.ps1 from the newest
+    // installed MPLAB X version, or overridden with environment variables:
+    //   MPLABX_MAKE   - full path to MPLAB X make.exe
+    //   MPLABX_GEN    - full path to prjMakefilesGenerator.bat
+    //   MPLABX_CONF   - configuration name (dsPIC33AK512_CLASSIC_SERIAL_UPDATE,
+    //                   dsPIC33AK512_ASRC_SERIAL_UPDATE, dsPIC33AK128_SERIAL_UPDATE)
+    //   MPLABX_MDB    - full path to mdb.bat (flashing via MPLAB Debugger CLI)
+    //   MPLABX_DEVICE - target part name (default: dsPIC33AK512MPS512)
+    //   MPLABX_TOOL   - mdb hwtool token (default: pkob4; e.g. pickit4, snap, icd4)
+    //
+    // Flashing uses mdb.bat (not ipecmd): on this machine ipecmd cannot locate the
+    // DFP because the standalone-IPE user dir was never initialized, whereas mdb
+    // reuses the working MPLAB X IDE user dir and resolves packs/tools correctly.
+    "version": "2.0.0",
+    "options": {
+        "cwd": "${workspaceFolder}/dspic33ak_audio_dsp.X",
+        "shell": {
+            "executable": "powershell.exe",
+            "args": [ "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command" ]
+        }
+    },
+    "tasks": [
+        {
+            // Regenerates nbproject/Makefile-<conf>.mk and Makefile-local-<conf>.mk
+            // from configurations.xml for THIS machine's toolchain install.
+            // Idempotent; required at least once on a fresh checkout.
+            "label": "MPLAB: Generate Makefiles",
+            "type": "shell",
+            "command": "& '${workspaceFolder}/buildtools/build.ps1' -Generate",
+            "problemMatcher": []
+        },
+        {
+            "label": "MPLAB: Build",
+            "type": "shell",
+            "command": "& '${workspaceFolder}/buildtools/build.ps1'",
+            "dependsOn": [ "MPLAB: Generate Makefiles" ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": {
+                "owner": "xc-dsc",
+                "fileLocation": [ "relative", "${workspaceFolder}/dspic33ak_audio_dsp.X" ],
+                "pattern": {
+                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|fatal error):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
+        },
+        {
+            "label": "MPLAB: Clean",
+            "type": "shell",
+            "command": "& '${workspaceFolder}/buildtools/build.ps1' -Clean",
+            "problemMatcher": []
+        },
+        {
+            "label": "MPLAB: Rebuild",
+            "dependsOrder": "sequence",
+            "dependsOn": [ "MPLAB: Clean", "MPLAB: Build" ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            // Flashes the already-built production hex to the target via PKOB4.
+            // Does NOT build first (run "MPLAB: Build" beforehand, or use "MPLAB: Build & Flash").
+            // buildtools/flashauto.ps1 resolves configuration/device from the active
+            // switch_config.ps1 selection and refuses a hex that predates it; it also
+            // resets the board afterwards and best-effort mutes the console first.
+            "label": "MPLAB: Flash (PKOB4)",
+            "type": "shell",
+            "command": "& '${workspaceFolder}/buildtools/flashauto.ps1'",
+            "problemMatcher": []
+        },
+        {
+            "label": "MPLAB: Build & Flash",
+            "dependsOrder": "sequence",
+            "dependsOn": [ "MPLAB: Build", "MPLAB: Flash (PKOB4)" ],
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://www.netbeans.org/ns/project/1">
+    <type>com.microchip.mplab.nbide.embedded.makeproject</type>
+    <configuration>
+        <data xmlns="http://www.netbeans.org/ns/make-project/1">
+            <name>dspic33ak_audio_dsp</name>
+            <creation-uuid>e432fd91-71b6-4c24-8197-ca66cee297d1</creation-uuid>
+            <make-project-type>0</make-project-type>
+            <sourceEncoding>ISO-8859-1</sourceEncoding>
+            <make-dep-projects/>
+            <sourceRootList>
+                <sourceRootElem>../src</sourceRootElem>
+            </sourceRootList>
+            <confList>
+                <confElem>
+                    <name>dsPIC33AK512_ASRC_SERIAL_UPDATE</name>
+                    <type>2</type>
+                </confElem>
+                <confElem>
+                    <name>dsPIC33AK512_CLASSIC_SERIAL_UPDATE</name>
+                    <type>2</type>
+                </confElem>
+                <confElem>
+                    <name>dsPIC33AK128_SERIAL_UPDATE</name>
+                    <type>2</type>
+                </confElem>
+                <confElem>
+                    <name>dsPIC33AK128_ASRC_BI_CODEC_SERIAL_UPDATE</name>
+                    <type>2</type>
+                </confElem>
+            </confList>
+            <formatting>
+                <project-formatting-style>false</project-formatting-style>
+            </formatting>
+        </data>
+    </configuration>
+</project>

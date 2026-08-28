@@ -1,0 +1,17 @@
+#ifndef NORA_CCP_INPUT_CAPTURE_DSPIC33AK_CONF_H
+#define NORA_CCP_INPUT_CAPTURE_DSPIC33AK_CONF_H
+
+// Optional project-wide configuration for the NORA dsPIC33AK CCP backend.
+// The HAL defines no interrupt vectors unless one of these options is enabled.
+//
+// SPDX-FileCopyrightText: 2026 SulaoLab
+// SPDX-License-Identifier: MIT-0
+
+/* Own all CCP Input Capture vectors. */
+// #define NORA_CCP_DSPIC33AK_DEFINE_VECTORS (1)
+
+/* Or own only the vectors used by this application. */
+// #define NORA_CCP_DSPIC33AK_DEFINE_CCP1_VECTOR (1)
+// #define NORA_CCP_DSPIC33AK_DEFINE_CCP2_VECTOR (1)
+
+#endif /* NORA_CCP_INPUT_CAPTURE_DSPIC33AK_CONF_H */

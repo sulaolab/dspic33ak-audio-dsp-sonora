@@ -1,0 +1,112 @@
+# MPLAB X / XC generated files
+*.i
+*.s
+*.o
+*.obj
+*.d
+*.lst
+*.map
+*.elf
+*.hex
+*.hxl
+*.cof
+
+# Exception: hand-written assembly source, not a build byproduct (generated
+# .s land under build/, ignored separately). Windows Git's ignore matching is
+# case-insensitive, so *.s also matches *.S.
+!src/app/dspic33-cmsis-dsp/Source/**/*.s
+!src/boot/resident_de_boot_precrt.S
+
+# MPLAB X output directories
+build/
+dist/
+
+# Serial update package history, written by build.ps1. Deliberately outside
+# dist/ so -Clean/-Full cannot delete packages you may still want to send to
+# a board.
+artifacts/
+.generated_files/
+debug/
+production/
+queuelogs/
+
+# Local build selection, written by buildtools/switch_config.ps1. Per-developer
+# state, like the IDE's private/configurations.xml: never tracked.
+/buildtools/active_build.json
+
+# MPLAB X local/private project files
+**/nbproject/private/
+**/nbproject/Makefile-local-*.mk
+**/nbproject/Makefile-genesis.properties
+
+# MPLAB X per-configuration makefiles, regenerated from configurations.xml by
+# buildtools/build.ps1 (or the IDE) -- a fresh clone needs none of them.
+# Makefile-variables.mk stays tracked: same generator, but it holds no
+# per-configuration selection.
+**/nbproject/Makefile-dsPIC33AK*.mk
+**/nbproject/Makefile-impl.mk
+
+# MPLAB X build byproduct: copy of the device linker script the toolchain
+# drops into the project dir during a build.
+dspic33ak_audio_dsp.X/p33*MPS*.*.00
+resident_bootloader.X/p33*MPS*.*.00
+
+# resident_bootloader.X is generated from src/boot/boot_image.psd1 by
+# buildtools/generate_resident_project.ps1. Only the two files it writes are
+# tracked; everything else the IDE adds on first open is not -- otherwise
+# merely opening the project would make every later image's dirty-tree stamp
+# meaningless. The project's own Makefile stays tracked (same generator, no
+# stamp risk).
+resident_bootloader.X/nbproject/Makefile*
+resident_bootloader.X/nbproject/project.properties
+resident_bootloader.X/nbproject/configurations.xml.bak
+
+# MPLAB IPE / ipecmd programming logs (written in the working dir when flashing)
+MPLABXLog.xml*
+log.[0-9]*
+
+# Scratch measurement data + Python bytecode (keeps `git status` clean); the
+# empty meas_logs/ dir stays tracked via its .gitkeep.
+docs_internal/asrc_study/meas_logs/*
+!docs_internal/asrc_study/meas_logs/.gitkeep
+__pycache__/
+dspic33ak_audio_dsp.X/nbproject/private/
+defmplabxtrace.log*
+
+# Local engineering notebook: research notes, hardware logs, board serial
+# numbers, machine-specific paths. Never part of the public source tree.
+/notes_private/
+
+# Host-test binaries: a build product of run_host_tests.ps1, not source.
+src/tests/**/out/
+
+# Per-tool measurement history, not source.
+tools/rom_diet/measurements.log
+
+# Per-run measurement/build scratch these tools drop in the repository root.
+/build_*.log
+/flash_*.log
+/gate_*.log
+/sweep_*.log
+/verify_*.log
+/rm_*.log
+/dis_*.txt
+/nm_*.txt
+/legs_*.txt
+/tmp_*.txt
+/*.jsonl
+
+# tools_local/ keeps its scripts tracked; ignore only their output.
+tools_local/**/*.log
+tools_local/**/*.out
+tools_local/**/*.jsonl
+tools_local/**/*.dis
+tools_local/**/*.err
+tools_local/*.txt
+tools_local/frag_*.md
+tools_local/report_frag_*.md
+tools_local/ds/
+
+# JVM crash dumps from a Java-based flashing helper.
+/hs_err_pid*.log
+/replay_pid*.log

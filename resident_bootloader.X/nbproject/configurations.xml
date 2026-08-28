@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configurationDescriptor version="65">
+  <logicalFolder name="root" displayName="root" projectFiles="true">
+    <logicalFolder name="HeaderFiles" displayName="Header Files" projectFiles="true">
+    </logicalFolder>
+    <logicalFolder name="LinkerScript" displayName="Linker Files" projectFiles="true">
+      <itemPath>../src/linker/p33AK128MC106_serial_update_app.gld</itemPath>
+      <itemPath>../src/linker/p33AK512MPS512_serial_update_app.gld</itemPath>
+    </logicalFolder>
+    <logicalFolder name="SourceFiles" displayName="Source Files" projectFiles="true">
+      <logicalFolder name="src_boot_hal_clock" displayName="src/boot/hal_clock" projectFiles="true">
+        <itemPath>../src/boot/hal_clock/nora_clock_device_dspic33ak.c</itemPath>
+        <itemPath>../src/boot/hal_clock/nora_clock_dspic33ak_reg.c</itemPath>
+        <itemPath>../src/boot/hal_clock/nora_clock_dspic33ak.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_boot_hal_gpio" displayName="src/boot/hal_gpio" projectFiles="true">
+        <itemPath>../src/boot/hal_gpio/nora_gpio_dspic33ak.c</itemPath>
+        <itemPath>../src/boot/hal_gpio/nora_pps_dspic33ak.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_boot_hal_noinit_ram" displayName="src/boot/hal_noinit_ram" projectFiles="true">
+        <itemPath>../src/boot/hal_noinit_ram/nora_noinit_ram_dspic33ak.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_boot_hal_nvm" displayName="src/boot/hal_nvm" projectFiles="true">
+        <itemPath>../src/boot/hal_nvm/nora_nvm_dspic33ak.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_boot_hal_timer" displayName="src/boot/hal_timer" projectFiles="true">
+        <itemPath>../src/boot/hal_timer/nora_tick_timer_dspic33ak.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_boot_hal_uart" displayName="src/boot/hal_uart" projectFiles="true">
+        <itemPath>../src/boot/hal_uart/nora_uart_dspic33ak_device.c</itemPath>
+        <itemPath>../src/boot/hal_uart/nora_uart_dspic33ak_rx_isr_ring.c</itemPath>
+        <itemPath>../src/boot/hal_uart/nora_uart_dspic33ak.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_boot" displayName="src/boot" projectFiles="true">
+        <itemPath>../src/boot/resident_de_boot_crc32.c</itemPath>
+        <itemPath>../src/boot/resident_de_boot_led.c</itemPath>
+        <itemPath>../src/boot/resident_de_boot_main.c</itemPath>
+        <itemPath>../src/boot/resident_de_boot_platform.c</itemPath>
+        <itemPath>../src/boot/resident_de_boot_precrt.S</itemPath>
+        <itemPath>../src/boot/resident_de_boot_xmodem.c</itemPath>
+        <itemPath>../src/boot/resident_de_bootloader.c</itemPath>
+      </logicalFolder>
+      <logicalFolder name="src_shared" displayName="src/shared" projectFiles="true">
+        <itemPath>../src/shared/resident_de_mailbox.c</itemPath>
+        <itemPath>../src/shared/resident_de_pipe.c</itemPath>
+      </logicalFolder>
+    </logicalFolder>
+    <logicalFolder name="ExternalFiles" displayName="Important Files" projectFiles="false">
+    </logicalFolder>
+  </logicalFolder>
+  <projectmakefile>Makefile</projectmakefile>
+  <confs>
+    <conf name="dsPIC33AK512_RESIDENT_BOOT" type="2">
+      <toolsSet>
+        <developmentServer>localhost</developmentServer>
+        <targetDevice>dsPIC33AK512MPS512</targetDevice>
+        <targetHeader></targetHeader>
+        <targetPluginBoard></targetPluginBoard>
+        <platformTool>noID</platformTool>
+        <languageToolchain>XCDSC</languageToolchain>
+        <languageToolchainVersion>3.31.01</languageToolchainVersion>
+        <platform>3</platform>
+      </toolsSet>
+      <compileType>
+        <linkerTool>
+          <linkerLibItems>
+          </linkerLibItems>
+        </linkerTool>
+        <loading>
+          <useAlternateLoadableFile>false</useAlternateLoadableFile>
+          <parseOnProdLoad>false</parseOnProdLoad>
+          <alternateLoadableFile></alternateLoadableFile>
+        </loading>
+      </compileType>
+      <makeCustomizationType>
+        <makeCustomizationPreStepEnabled>false</makeCustomizationPreStepEnabled>
+        <makeUseCleanTarget>false</makeUseCleanTarget>
+        <makeCustomizationPreStep></makeCustomizationPreStep>
+        <makeCustomizationPostStepEnabled>true</makeCustomizationPostStepEnabled>
+        <makeCustomizationPostStep>pwsh -NoProfile -File ../buildtools/verify_resident_image.ps1 -Elf &quot;${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.elf&quot; -Map &quot;${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.map&quot; -Hex &quot;${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.hex&quot; -Objdump ${MP_CC_DIR}\xc-dsc-objdump.exe -Dfp &quot;${DFP_DIR}/xc16&quot; -ImageType ${IMAGE_TYPE} -MaxBytes 32768</makeCustomizationPostStep>
+        <makeCustomizationPutChecksumInUserID>false</makeCustomizationPutChecksumInUserID>
+        <makeCustomizationEnableLongLines>false</makeCustomizationEnableLongLines>
+        <makeCustomizationNormalizeHexFile>false</makeCustomizationNormalizeHexFile>
+      </makeCustomizationType>
+      <item path="../src/linker/p33AK128MC106_serial_update_app.gld"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <C30>
+        <property key="enable-all-warnings" value="true"/>
+        <property key="enable-symbols" value="true"/>
+        <property key="extra-include-directories" value="..\src\boot;..\src\shared;..\src\boot\hal_noinit_ram;..\src\boot\hal_nvm;..\src\boot\hal_clock;..\src\boot\hal_gpio;..\src\boot\hal_uart;..\src\boot\hal_timer"/>
+        <property key="isolate-each-function" value="true"/>
+        <property key="oXC16gcc-data-sects" value="true"/>
+        <property key="oXC16gcc-sfr-warn" value="false"/>
+        <property key="optimization-level" value="s"/>
+        <property key="preprocessor-macros" value="SONORA_RESIDENT_BOOTLOADER=1"/>
+      </C30>
+      <C30-AS>
+        <property key="extra-include-directories-for-assembler" value="..\src\boot;..\src\shared;..\src\boot\hal_noinit_ram;..\src\boot\hal_nvm;..\src\boot\hal_clock;..\src\boot\hal_gpio;..\src\boot\hal_uart;..\src\boot\hal_timer"/>
+        <property key="preprocessor-macros" value="SONORA_RESIDENT_BOOTLOADER=1"/>
+      </C30-AS>
+      <C30-LD>
+        <property key="enable-check-sections" value="true"/>
+        <property key="enable-data-init" value="true"/>
+        <property key="enable-handles" value="true"/>
+        <property key="enable-pack-data" value="true"/>
+        <property key="generate-cross-reference-file" value="true"/>
+        <property key="linker-stack" value="true"/>
+        <property key="map-file" value="${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.map"/>
+        <property key="no-ivt" value="false"/>
+        <property key="oXC16ld-extra-opts" value="-Wl,--defsym=__SONORA_PROGRAM_LENGTH=0x7FFC,--defsym=__SONORA_PROGRAM_ORIGIN=0x800004"/>
+        <property key="oXC16ld-force-link" value="false"/>
+        <property key="oXC16ld-no-smart-io" value="false"/>
+        <property key="oXC16ld-stackguard" value="64"/>
+        <property key="remove-unused-sections" value="true"/>
+        <property key="report-memory-usage" value="true"/>
+        <property key="stack-size" value="1024"/>
+        <property key="warn-section-align" value="true"/>
+      </C30-LD>
+      <C30Global>
+        <property key="legacy-libc" value="true"/>
+        <property key="output-file-format" value="elf"/>
+      </C30Global>
+    </conf>
+    <conf name="dsPIC33AK128_RESIDENT_BOOT" type="2">
+      <toolsSet>
+        <developmentServer>localhost</developmentServer>
+        <targetDevice>dsPIC33AK128MC106</targetDevice>
+        <targetHeader></targetHeader>
+        <targetPluginBoard></targetPluginBoard>
+        <platformTool>noID</platformTool>
+        <languageToolchain>XCDSC</languageToolchain>
+        <languageToolchainVersion>3.31.01</languageToolchainVersion>
+        <platform>3</platform>
+      </toolsSet>
+      <compileType>
+        <linkerTool>
+          <linkerLibItems>
+          </linkerLibItems>
+        </linkerTool>
+        <loading>
+          <useAlternateLoadableFile>false</useAlternateLoadableFile>
+          <parseOnProdLoad>false</parseOnProdLoad>
+          <alternateLoadableFile></alternateLoadableFile>
+        </loading>
+      </compileType>
+      <makeCustomizationType>
+        <makeCustomizationPreStepEnabled>false</makeCustomizationPreStepEnabled>
+        <makeUseCleanTarget>false</makeUseCleanTarget>
+        <makeCustomizationPreStep></makeCustomizationPreStep>
+        <makeCustomizationPostStepEnabled>true</makeCustomizationPostStepEnabled>
+        <makeCustomizationPostStep>pwsh -NoProfile -File ../buildtools/verify_resident_image.ps1 -Elf &quot;${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.elf&quot; -Map &quot;${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.map&quot; -Hex &quot;${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.hex&quot; -Objdump ${MP_CC_DIR}\xc-dsc-objdump.exe -Dfp &quot;${DFP_DIR}/xc16&quot; -ImageType ${IMAGE_TYPE} -MaxBytes 16384</makeCustomizationPostStep>
+        <makeCustomizationPutChecksumInUserID>false</makeCustomizationPutChecksumInUserID>
+        <makeCustomizationEnableLongLines>false</makeCustomizationEnableLongLines>
+        <makeCustomizationNormalizeHexFile>false</makeCustomizationNormalizeHexFile>
+      </makeCustomizationType>
+      <item path="../src/linker/p33AK512MPS512_serial_update_app.gld"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <C30>
+        <property key="enable-all-warnings" value="true"/>
+        <property key="enable-symbols" value="true"/>
+        <property key="extra-include-directories" value="..\src\boot;..\src\shared;..\src\boot\hal_noinit_ram;..\src\boot\hal_nvm;..\src\boot\hal_clock;..\src\boot\hal_gpio;..\src\boot\hal_uart;..\src\boot\hal_timer"/>
+        <property key="isolate-each-function" value="true"/>
+        <property key="oXC16gcc-data-sects" value="true"/>
+        <property key="oXC16gcc-sfr-warn" value="false"/>
+        <property key="optimization-level" value="s"/>
+        <property key="preprocessor-macros" value="SONORA_RESIDENT_BOOTLOADER=1"/>
+      </C30>
+      <C30-AS>
+        <property key="extra-include-directories-for-assembler" value="..\src\boot;..\src\shared;..\src\boot\hal_noinit_ram;..\src\boot\hal_nvm;..\src\boot\hal_clock;..\src\boot\hal_gpio;..\src\boot\hal_uart;..\src\boot\hal_timer"/>
+        <property key="preprocessor-macros" value="SONORA_RESIDENT_BOOTLOADER=1"/>
+      </C30-AS>
+      <C30-LD>
+        <property key="enable-check-sections" value="true"/>
+        <property key="enable-data-init" value="true"/>
+        <property key="enable-handles" value="true"/>
+        <property key="enable-pack-data" value="true"/>
+        <property key="generate-cross-reference-file" value="true"/>
+        <property key="linker-stack" value="true"/>
+        <property key="map-file" value="${DISTDIR}/${PROJECTNAME}.${IMAGE_TYPE}.map"/>
+        <property key="no-ivt" value="false"/>
+        <property key="oXC16ld-extra-opts" value="-Wl,--defsym=__SONORA_PROGRAM_LENGTH=0x3FFC,--defsym=__SONORA_PROGRAM_ORIGIN=0x800004"/>
+        <property key="oXC16ld-force-link" value="false"/>
+        <property key="oXC16ld-no-smart-io" value="false"/>
+        <property key="oXC16ld-stackguard" value="64"/>
+        <property key="remove-unused-sections" value="true"/>
+        <property key="report-memory-usage" value="true"/>
+        <property key="stack-size" value="1024"/>
+        <property key="warn-section-align" value="true"/>
+      </C30-LD>
+      <C30Global>
+        <property key="legacy-libc" value="true"/>
+        <property key="output-file-format" value="elf"/>
+      </C30Global>
+    </conf>
+  </confs>
+</configurationDescriptor>
