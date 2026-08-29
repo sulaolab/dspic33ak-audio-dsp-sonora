@@ -73,11 +73,13 @@ if ([string]::IsNullOrWhiteSpace($Objdump)) {
     $Objdump = $candidates[0]
 }
 if ([string]::IsNullOrWhiteSpace($Dfp)) {
-    $packRoot = Join-Path $HOME '.mchp_packs\Microchip\dsPIC33AK-MP_DFP'
-    $versions = @(Get-ChildItem $packRoot -Directory -ErrorAction SilentlyContinue |
-        Sort-Object { [Version]$_.Name } -Descending)
-    if ($versions.Count -eq 0) { throw "DFP not found under $packRoot; pass -Dfp." }
-    $Dfp = (Join-Path $versions[0].FullName 'xc16') -replace '\\', '/'
+    # Read out of tools/dfp_packs.py's PINS (via its CLI, since PowerShell
+    # cannot import a Python module) rather than "newest installed" -- that
+    # silently picked a pack version the build never used. RefElf and NewElf
+    # are expected to be the same device, so RefElf decides the pin.
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $Dfp = & python (Join-Path $repoRoot 'tools/dfp_packs.py') $RefElf
+    if ($LASTEXITCODE -ne 0) { throw "dfp_packs.py could not resolve a DFP for $RefElf : $Dfp" }
 }
 
 if ([string]::IsNullOrWhiteSpace($OutDir)) {

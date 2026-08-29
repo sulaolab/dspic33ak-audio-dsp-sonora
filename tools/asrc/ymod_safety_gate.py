@@ -59,6 +59,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import dfp_packs
+
 # Modulo control registers, from the DFP linker script (p33AK512MPS512.gld):
 # MODCON 0x14, XMODSRT 0x18, XMODEND 0x1C, YMODSRT 0x20, YMODEND 0x24.
 MODULO_SFR = {0x14: "MODCON", 0x18: "XMODSRT", 0x1C: "XMODEND",
@@ -96,9 +99,9 @@ SECTION = re.compile(r"^Disassembly of section (\S+):")
 # e.g. "dsPIC33AK512MPS512" as a rodata string linked into every configuration --
 # found 2026-08-26 on an AK128 build, one bare match beside 70 -mcpu= matches for
 # the real target, which is exactly the "answer would not be trustworthy" case
-# device_of() below already guards against; it just was not looking at the
-# discriminating text.
-DEVICE_IN_IMAGE = re.compile(rb"-mcpu=(33AK\d+M[A-Z]+\d+)\b")
+# dfp_packs.device_of() guards against; it just was not looking at the
+# discriminating text. device_of()/pack resolution moved to tools/dfp_packs.py
+# on 2026-08-28 so the other objdump-consuming tools share the same logic.
 
 
 class Insn:
@@ -156,44 +159,6 @@ def newest(pattern, what, flag):
     return found[-1]
 
 
-def device_of(elf):
-    """-> the part the image was built for, e.g. dsPIC33AK128MC106.
-
-    Read out of the image rather than passed in: the caller that knows the answer
-    (the build) is not the only caller, and a gate that has to be told which part it
-    is looking at can be told wrong.  The part name appears in the image many times
-    over -- device header path, linker script, debug info -- so requiring a single
-    distinct match is a check rather than a guess: two matches would mean the
-    pattern is catching something else, and the answer would not be trustworthy.
-    """
-    with open(elf, "rb") as handle:
-        blob = handle.read()
-    names = {match.group(1).decode() for match in DEVICE_IN_IMAGE.finditer(blob)}
-    if len(names) != 1:
-        bail("could not read the device out of %s (found %s) -- pass --mdfp"
-             % (elf, ", ".join(sorted(names)) if names else "nothing"))
-    return "dsPIC" + names.pop()
-
-
-def pack_for(device):
-    """-> the xc16 directory of the installed device pack that supports `device`.
-
-    NOT a constant: the parts this project builds for sit in different packs -- the
-    AK512MPS512 in dsPIC33AK-MP_DFP, the AK128MC106 in dsPIC33AK-MC_DFP.  Naming one
-    of them here handed objdump a pack that does not describe the image, and objdump
-    does not degrade when that happens, it refuses the disassembly outright ("can't
-    disassemble for architecture UNKNOWN!") -- so a safe AK128 image read as a gate
-    failure.
-
-    The pack is identified by the one file that settles the question, the device
-    header it does or does not carry, so a part added later needs no table here.
-    """
-    header = "support/dsPIC33A/h/p%s.h" % device[len("dsPIC"):]
-    found = glob.glob(os.path.expanduser("~") +
-                      "/.mchp_packs/Microchip/dsPIC33AK-*_DFP/*/xc16/" + header)
-    if not found:
-        bail("no installed device pack supports %s -- pass --mdfp" % device)
-    return sorted((path[:-(len(header) + 1)] for path in found), key=version_key)[-1]
 
 
 def run(argv):
@@ -353,7 +318,8 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("elf", help="the linked image to check")
     parser.add_argument("--objdump", help="xc-dsc-objdump.exe (default: newest installed)")
-    parser.add_argument("--mdfp", help="device family pack (default: newest installed)")
+    parser.add_argument("--mdfp", help="device family pack (default: the pin in "
+                        "tools/dfp_packs.py, else newest installed)")
     args = parser.parse_args()
 
     if not os.path.isfile(args.elf):
@@ -361,8 +327,11 @@ def main():
     objdump = args.objdump or newest(
         "C:/Program Files/Microchip/xc-dsc/*/bin/xc-dsc-objdump.exe",
         "xc-dsc-objdump.exe", "--objdump")
-    device = None if args.mdfp else device_of(args.elf)
-    mdfp = (args.mdfp or pack_for(device)).replace("\\", "/")
+    try:
+        device = None if args.mdfp else dfp_packs.device_of(args.elf)
+        mdfp = dfp_packs.resolve_dfp(device, override=args.mdfp)
+    except dfp_packs.DfpResolutionError as exc:
+        bail(str(exc) + " -- pass --mdfp")
 
     sized, labels = read_symbols(run([objdump, "-t", "--mdfp=" + mdfp, args.elf]))
     funcs = parse(run([objdump, "-d", "--mdfp=" + mdfp, args.elf]), sized, labels)

@@ -36,17 +36,18 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import dfp_packs
+
 DEFAULT_ELF = os.path.join(
     "dspic33ak_audio_dsp.X", "dist", "dsPIC33AK512_ASRC", "production",
     "dspic33ak_audio_dsp.X.production.elf")
 DEFAULT_MAP = DEFAULT_ELF[:-len(".elf")] + ".map"
 DEFAULT_OBJDUMP = r"C:\Program Files\Microchip\xc-dsc\v3.31.01\bin\xc-dsc-objdump.exe"
-# Same resolution order as buildtools/provision.ps1: an explicit DSPIC33AK_DFP
-# wins, otherwise the per-user pack directory. Never a hard-coded home path --
-# this file is published.
-DEFAULT_DFP = os.environ.get("DSPIC33AK_DFP") or os.path.join(
-    os.path.expanduser("~"), ".mchp_packs", "Microchip",
-    "dsPIC33AK-MP_DFP", "1.3.185", "xc16")
+# DEFAULT_ELF is always the AK512MPS512 config, so the pin for that device
+# (see tools/dfp_packs.py.PINS) is the right default even before the ELF is
+# built. resolve_dfp() still honours DSPIC33AK_DFP / an explicit --dfp.
+DEFAULT_DFP = dfp_packs.resolve_dfp("dsPIC33AK512MPS512")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 

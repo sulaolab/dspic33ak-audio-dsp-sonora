@@ -19,13 +19,12 @@ leaked into every later unqualified build in that shell — so it was retired).
 | `check_configurations.ps1` | Gate on what each MPLAB configuration builds and excludes (`build.ps1` runs it every time). |
 | `check_hal_drift.ps1` | **Report, not a gate** (always exits 0): where `src/boot/hal_*` and `src/app/hal_*` have diverged. |
 | `sonora_build_state.ps1` | Selection-state helper shared by the above (do not run directly). |
-| `_flash_reset_tools/` | Our own PKOB4 flash / reset / UDID executables. **Not included in this initial release** — see note below; program via MPLAB X / MPLAB IPE and the on-board PKOB4 instead. |
+| `_flash_reset_tools/` | Our own PKOB4 flash / reset / UDID executables, shipped with this repository. Used by `flashauto.ps1` / `resetauto.ps1` and the `-Reset*` paths. See [`_flash_reset_tools/README.md`](./_flash_reset_tools/README.md). |
 
-> **Note.** `flashauto.ps1`, `resetauto.ps1`, and the `-Reset*` paths on the
-> other scripts call into `_flash_reset_tools/`. Without it they throw. Build
-> and program via the command line (`build.ps1`) plus MPLAB X / MPLAB IPE for
-> flashing, or add your own PKOB4 flash/reset executables under
-> `_flash_reset_tools/` if you have them.
+> **Note.** The flash/reset executables drive an installed MPLAB X (its bundled
+> `mdb` / `ipecmdboost` and Java). MPLAB X must be present; a separate .NET
+> runtime is not needed. If you would rather not use them, program via MPLAB X
+> or MPLAB IPE and the on-board PKOB4 instead.
 
 ## Support scope: command line vs MPLAB X
 

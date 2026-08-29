@@ -1,6 +1,9 @@
 #ifndef _SND_EFFECT_PLAY_H
 #define	_SND_EFFECT_PLAY_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #if defined(ENA_SND_EFFECT_PLAY)
 //===========================================================
 // INCLUDES
@@ -41,6 +44,7 @@ typedef enum se_tone_id
 //===========================================================
 
 extern void  snd_effect_int( uint32_t sample_rate_Hz );
+extern void  snd_effect_set_sample_rate( uint32_t sample_rate_Hz );
 extern bool  snd_effect_verify( void );
 extern bool  snd_effect_prepare_flash_data( void );
 

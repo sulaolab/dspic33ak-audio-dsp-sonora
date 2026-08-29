@@ -110,3 +110,4 @@ tools_local/ds/
 # JVM crash dumps from a Java-based flashing helper.
 /hs_err_pid*.log
 /replay_pid*.log
+/buildtools/dfp_pack_notice.json

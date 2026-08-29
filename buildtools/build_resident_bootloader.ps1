@@ -128,20 +128,13 @@ if (-not (Test-Path -LiteralPath $objdump)) {
 # The device pack, per device: the MPS512 is in dsPIC33AK-MP_DFP and the MC106 in
 # dsPIC33AK-MC_DFP, so this cannot be a constant (it was one while there was one part).
 $dfpPack = $image.DfpPack
-# Not $profile: that is a PowerShell automatic variable, and assigning to it is
-# flagged by the analyser even where the scope makes it harmless.
-$userProfile = [Environment]::GetFolderPath('UserProfile')
-$packBase = Join-Path $userProfile (Join-Path '.mchp_packs\Microchip' $dfpPack)
-
-# Whether a pack root actually supports THIS part, decided by the one file that says
-# so. Every branch below asks, because a wrong pack does not announce itself: -mdfp
-# simply supplies another part's headers and linker support.
-function Test-SonoraDfpSupportsDevice {
-    param([string]$Root, [string]$Device)
-    if ([string]::IsNullOrWhiteSpace($Root)) { return $false }
-    $header = Join-Path $Root ('xc16\support\dsPIC33A\h\p{0}.h' -f $Device)
-    return (Test-Path -LiteralPath $header -PathType Leaf)
-}
+# Both "where the versions live" and "does this root serve THIS part" come from
+# boot_image.ps1 (dot-sourced above) rather than from copies here, because the pin in
+# the manifest now has a second reader: check_configurations.ps1 compares it with what
+# the application project pins. Two copies would have been two chances to answer
+# differently, and a wrong answer is silent -- -mdfp simply supplies another part's
+# headers and linker support.
+$packBase = Get-BootImageDfpPackBase -Pack $dfpPack
 
 # Resolution order, and why it is this order.
 #
@@ -166,7 +159,7 @@ $dfpOrigin = $null
 $dfpPinned = $image.DfpPackVersion
 
 if (-not [string]::IsNullOrWhiteSpace($env:DSPIC33AK_DFP)) {
-    if (Test-SonoraDfpSupportsDevice -Root $env:DSPIC33AK_DFP -Device $image.Device) {
+    if (Test-BootImageDfpSupportsDevice -Root $env:DSPIC33AK_DFP -Device $image.Device) {
         $dfpRoot   = $env:DSPIC33AK_DFP
         $dfpOrigin = 'DSPIC33AK_DFP'
     }
@@ -178,20 +171,16 @@ if (-not [string]::IsNullOrWhiteSpace($env:DSPIC33AK_DFP)) {
 }
 if (-not $dfpRoot -and -not [string]::IsNullOrWhiteSpace($dfpPinned)) {
     $candidate = Join-Path $packBase $dfpPinned
-    if (Test-SonoraDfpSupportsDevice -Root $candidate -Device $image.Device) {
+    if (Test-BootImageDfpSupportsDevice -Root $candidate -Device $image.Device) {
         $dfpRoot   = $candidate
         $dfpOrigin = "boot_image.psd1 pin $dfpPinned"
     }
 }
 if (-not $dfpRoot) {
-    $newest = @(Get-ChildItem -LiteralPath $packBase -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            $version = $null
-            if ([Version]::TryParse($_.Name, [ref]$version) -and
-                (Test-SonoraDfpSupportsDevice -Root $_.FullName -Device $image.Device)) {
-                [pscustomobject]@{ Version = $version; Path = $_.FullName }
-            }
-        } | Sort-Object Version -Descending | Select-Object -First 1)
+    # Same enumeration check_configurations.ps1 uses to spot a newer installed pack,
+    # so the two never disagree about which versions are candidates for this part.
+    $newest = @(Get-BootImageInstalledDfpVersions -Pack $dfpPack -Device $image.Device |
+        Select-Object -First 1)
     if ($newest.Count -ne 0) {
         $dfpRoot   = $newest[0].Path
         $dfpOrigin = "newest installed, $($newest[0].Version)"

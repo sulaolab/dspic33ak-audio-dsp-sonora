@@ -105,10 +105,11 @@ Three facts worth knowing before you debug silence:
 | PowerShell | 7 (`pwsh`) — the build scripts are PowerShell |
 | Python | 3.11+ — required by `build.ps1` to produce the delivery artifacts (`SERIAL_UPDATE_PACKAGE` / `FACTORY_IMAGE`), and used by the host-side analysis tools under `tools/` |
 
-Flashing and resetting the board uses MPLAB X / MPLAB IPE and the on-board
-PKOB4 — no separate host-side flash tooling is required for that. (A
-standalone flash/reset helper for scripting this without MPLAB X installed
-exists but is not part of this initial release; see `buildtools/README.md`.)
+Flashing and resetting the board uses the on-board PKOB4. You can do it by
+hand from MPLAB X / MPLAB IPE, or from the command line with the flash/reset
+helper shipped in `buildtools/_flash_reset_tools/` — three self-contained
+executables that need no .NET runtime, but do drive an installed MPLAB X. See
+[`buildtools/README.md`](buildtools/README.md).
 
 Two notes on the toolchain that save time later:
 
@@ -139,9 +140,8 @@ Two notes on the toolchain that save time later:
 `dspic33ak_audio_dsp.X`, via MPLAB X or MPLAB IPE and the on-board PKOB4 — in
 that order (their linker scripts place them in disjoint flash regions on
 purpose). See ["IDE-only path"](#ide-only-path-first-boot--learning) below for
-the click-through version. If you have the standalone flash/reset helper
-(`buildtools/README.md`), `.\buildtools\flashauto.ps1` does the same two-image
-program-and-reset from the command line.
+the click-through version, or run `.\buildtools\flashauto.ps1` to do the same
+two-image program-and-reset from the command line.
 
 Then open the PKOB4 CDC port at **230400 8N1**. The banner prints the profile
 and the build, `?` prints the console grammar and module-letter legend, and

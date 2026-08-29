@@ -67,6 +67,11 @@ void classic_audio_path_prepare( uint32_t sample_rate_hz )
 #if defined(ENA_SAMPLE_DELAY)
     app_audio_sample_delay_init( sample_rate_hz );
 #endif
+#if defined(ENA_SND_EFFECT_PLAY)
+    // The source assets stay at their own stored rate; retune only the
+    // playback Q16 step when codec-A changes rate during a mute-bounded restart.
+    snd_effect_set_sample_rate( sample_rate_hz );
+#endif
 }
 
 static inline void copy_to_codec( const int32_t* src_ptr,

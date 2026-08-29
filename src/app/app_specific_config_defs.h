@@ -1001,6 +1001,31 @@
   #endif //!APP_B_INDEP_DOMAIN && APP_USE_SST26
  #endif //APP_TARGET == APP_TARGET_AK512
 
+ // AK128 has no independent SST26 bus while MikroBUS-A carries the continuous audio
+ // stream ([[ak128-dim-pinmap-led-pot-sst26]]-style pin sharing), so button sounds use
+ // immutable IMA-ADPCM assets linked into internal Program Flash instead. Same
+ // ASRC-focused pruning as AK512 above: drop it when the ASRC engine is active.
+ #if (APP_TARGET == APP_TARGET_AK128) && !APP_B_INDEP_DOMAIN
+  #define ENA_SND_EFFECT_PLAY
+ #endif //(APP_TARGET == APP_TARGET_AK128) && !APP_B_INDEP_DOMAIN
+
+ // Sound-effect storage backend. AK512 keeps the existing external-SST26 path;
+ // AK128 reads generated IMA-ADPCM blocks directly from internal Program Flash.
+ #if defined(ENA_SND_EFFECT_PLAY) && (APP_TARGET == APP_TARGET_AK128)
+  #define APP_SND_EFFECT_INTERNAL_ADPCM  (1)
+  #define APP_SND_EFFECT_EXTERNAL_SST26  (0)
+ #elif defined(ENA_SND_EFFECT_PLAY) && (APP_TARGET == APP_TARGET_AK512)
+  #define APP_SND_EFFECT_INTERNAL_ADPCM  (0)
+  #define APP_SND_EFFECT_EXTERNAL_SST26  (1)
+ #else
+  #define APP_SND_EFFECT_INTERNAL_ADPCM  (0)
+  #define APP_SND_EFFECT_EXTERNAL_SST26  (0)
+ #endif
+
+ #if defined(ENA_SND_EFFECT_PLAY) && ((APP_SND_EFFECT_INTERNAL_ADPCM + APP_SND_EFFECT_EXTERNAL_SST26) != 1)
+  #error "ENA_SND_EFFECT_PLAY requires exactly one storage backend."
+ #endif
+
 #endif //ENA_DRC_DF2T_CASCADE
 
 #endif //APP_PROFILE != APP_PROFILE_ASRC (the ASRC profile defines none of the demo effect set above)
@@ -1127,8 +1152,12 @@
 // (The "SPI3/SPI4 TDM is ASRC-only" check references the ASRC-private APP_B_ROUTE_IS_ASRC and
 //  now lives in apps/asrc/asrc_app_validate.h, included from the end of this section.)
 
-#if defined(ENA_SND_EFFECT_PLAY) && !APP_USE_SST26
-  #error "ENA_SND_EFFECT_PLAY requires APP_USE_SST26 (button effects are stored in external flash)."
+// Backend requirement is enforced where the backend macros are selected
+// (APP_SND_EFFECT_INTERNAL_ADPCM / APP_SND_EFFECT_EXTERNAL_SST26, above): AK512
+// needs APP_USE_SST26 for its external-flash path, AK128 uses internal Flash and
+// has no such dependency.
+#if defined(ENA_SND_EFFECT_PLAY) && APP_SND_EFFECT_EXTERNAL_SST26 && !APP_USE_SST26
+  #error "APP_SND_EFFECT_EXTERNAL_SST26 requires APP_USE_SST26 (button effects are stored in external flash)."
 #endif
 
 #if (APP_TDM_PORT_MODE < APP_TDM_PORT_MODE_SPI12) || \

@@ -387,6 +387,204 @@ foreach ($conf in $confNodes) {
     }
 }
 
+# --- 4. DFP pack pins ------------------------------------------------------
+# The application project pins a device pack version per configuration (Project
+# Properties -> Packs in the IDE, <packs><pack> here); src/boot/boot_image.psd1 pins
+# one per device for the resident boot image. They must agree, and nothing else in
+# either build checks that they do.
+#
+# WHY THIS IS AN ERROR AND NOT A WARNING. Both halves still compile and link with
+# different pack versions, and the resulting hex still runs. What differs is the
+# register definitions and config-pragma value names the two images were built
+# against, for the same silicon, in a pair of images that are flashed together and
+# share a mailbox ABI. Nothing downstream reports it.
+#
+# Only delivery configurations are compared. A standalone configuration ships without
+# a resident boot image, so there is no second half for it to disagree with.
+#
+# The pins are deliberate, and both of them exist because newest-installed is wrong:
+# MC 1.5.263+ removed PLL1CON.OE, MP 1.5.269 stopped accepting NOBTSWP = OFF. So this
+# check never prefers the newer pack -- it only insists the two halves name the same
+# one. Raising a pin is a deliberate edit to boot_image.psd1 AND to the IDE project.
+. (Join-Path $PSScriptRoot 'boot_image.ps1')
+$bootManifest = Get-BootImageManifest -RepoRoot $repoRoot
+$dfpMismatches = [System.Collections.Generic.List[object]]::new()
+
+foreach ($conf in $confNodes) {
+    $name = $conf.name
+    if (-not $expectedConfigurations.Contains($name)) { continue }
+    if (-not [bool]$expectedConfigurations[$name].Delivery) { continue }
+
+    $device = $conf.toolsSet.targetDevice
+    # The manifest keys devices without the 'dsPIC' prefix the project uses.
+    $deviceKey = $device -replace '^dsPIC', ''
+    if (-not $bootManifest.Devices.ContainsKey($deviceKey)) {
+        Add-Problem $name ("is a delivery configuration for $device, but src/boot/boot_image.psd1 " +
+                           'has no resident boot image for that part. A delivery build needs one: ' +
+                           'add the device to the manifest, or make this configuration standalone.')
+        continue
+    }
+    $bootEntry = $bootManifest.Devices[$deviceKey]
+
+    $packNodes = @($conf.SelectNodes('./packs/pack'))
+    if ($packNodes.Count -eq 0) {
+        Add-Problem $name ("names no device pack. MPLAB X writes <packs><pack .../> per " +
+                           "configuration; without it the IDE picks a version on its own, and " +
+                           "the resident boot image is pinned to $($bootEntry.DfpPack) " +
+                           "$($bootEntry.DfpPackVersion).")
+        continue
+    }
+    if ($packNodes.Count -gt 1) {
+        $listed = ($packNodes | ForEach-Object { "$($_.GetAttribute('name')) $($_.GetAttribute('version'))" }) -join ', '
+        Add-Problem $name "names $($packNodes.Count) device packs ($listed); this check expects exactly one."
+        continue
+    }
+
+    $appPack = $packNodes[0].GetAttribute('name')
+    $appVersion = $packNodes[0].GetAttribute('version')
+
+    # The pack FAMILY, checked before the version: the two parts are in different
+    # families (MP for the MPS512, MC for the MC106), so a device change in the IDE
+    # moves this too. A wrong family is a louder failure than a wrong version --
+    # "pack does not support" at build time, "architecture UNKNOWN" under objdump --
+    # but it is the same edit that causes it, so it is caught in the same place.
+    if ($appPack -ne $bootEntry.DfpPack) {
+        $dfpMismatches.Add([pscustomobject]@{
+            Configuration = $name; Device = $device; Kind = 'family'
+            AppPack = $appPack; AppVersion = $appVersion
+            BootPack = $bootEntry.DfpPack; BootVersion = $bootEntry.DfpPackVersion
+        })
+        Add-Problem $name ("names device pack family '$appPack', but $device is served by " +
+                           "'$($bootEntry.DfpPack)' (src/boot/boot_image.psd1). See the DFP note below.")
+        continue
+    }
+    if ($appVersion -ne $bootEntry.DfpPackVersion) {
+        $dfpMismatches.Add([pscustomobject]@{
+            Configuration = $name; Device = $device; Kind = 'version'
+            AppPack = $appPack; AppVersion = $appVersion
+            BootPack = $bootEntry.DfpPack; BootVersion = $bootEntry.DfpPackVersion
+        })
+        Add-Problem $name ("pins $appPack $appVersion, but the resident boot image for $device " +
+                           "is pinned to $($bootEntry.DfpPackVersion) (src/boot/boot_image.psd1). " +
+                           'See the DFP note below.')
+    }
+}
+
+# --- The DFP note ----------------------------------------------------------
+# Printed as its own block rather than squeezed into a one-line problem: the person
+# who reaches this has just changed something in an IDE dialog, and what they need is
+# which two files disagree, why it matters, and both ways out -- including the GUI
+# gesture, because that is where the change came from.
+function Write-DfpMismatchExplanation {
+    param([object[]]$Mismatches)
+
+    Write-Host ''
+    # Family and version are both possible, and saying "version" over a family
+    # mismatch would send the reader looking at the wrong attribute.
+    $kinds = @(@($Mismatches | ForEach-Object { $_.Kind }) | Sort-Object -Unique)
+    $what = if ($kinds -contains 'family' -and $kinds -contains 'version') { 'pack family and version' }
+            elseif ($kinds -contains 'family') { 'pack family' }
+            else { 'pack version' }
+    Write-Host "DFP $what mismatch between the application project and the resident boot image." -ForegroundColor Red
+    Write-Host ''
+    foreach ($m in $Mismatches) {
+        Write-Host "  device $($m.Device)  (configuration $($m.Configuration))"
+        Write-Host "    application   dspic33ak_audio_dsp.X/nbproject/configurations.xml"
+        Write-Host "                  -> $($m.AppPack) $($m.AppVersion)"
+        Write-Host "    resident boot src/boot/boot_image.psd1"
+        Write-Host "                  -> $($m.BootPack) $($m.BootVersion)"
+    }
+    Write-Host ''
+    Write-Host 'WHY THIS IS AN ERROR AND NOT A WARNING'
+    Write-Host '  Both halves would still compile and link, and the resulting hex would run.'
+    Write-Host '  But the application and the boot image would be built against DIFFERENT'
+    Write-Host '  register definitions for the same silicon, and they are flashed together and'
+    Write-Host '  share a mailbox ABI. Nothing tells you afterwards.'
+    Write-Host ''
+    Write-Host 'HOW TO FIX -- pick ONE, then make the other match:'
+    Write-Host '  a) You changed the pack in the MPLAB X GUI on purpose:'
+    Write-Host '       edit src/boot/boot_image.psd1 and set DfpPackVersion for this device to'
+    Write-Host '       the version you chose, then rebuild the resident boot image with'
+    Write-Host '       buildtools/build_resident_bootloader.ps1 -Full.'
+    Write-Host '       Expect real work, not just an edit: the newer packs of both families'
+    Write-Host '       break this image for unrelated reasons --'
+    Write-Host '         dsPIC33AK-MC_DFP 1.5.263+ removed PLL1CON.OE / PLL2CON.OE, which'
+    Write-Host '           src/boot/hal_clock/nora_clock_dspic33ak_reg.c writes;'
+    Write-Host '         dsPIC33AK-MP_DFP 1.5.269 renamed the NOBTSWP values ON/OFF to'
+    Write-Host '           BTSWP_ENABLED/BTSWP_DISABLED, so the #pragma config in'
+    Write-Host '           src/boot/resident_de_boot_main.c is rejected.'
+    Write-Host '  b) You did NOT intend to change it -- MPLAB X can rewrite configurations.xml'
+    Write-Host '     on its own whenever the IDE touches the project:'
+    Write-Host '       in MPLAB X, right-click the project -> Properties -> Packs, and select the'
+    Write-Host '       version src/boot/boot_image.psd1 names for this device; or revert'
+    Write-Host '       dspic33ak_audio_dsp.X/nbproject/configurations.xml.'
+    Write-Host ''
+    Write-Host 'The pinned versions are deliberate and are floors, not preferences. The reason for'
+    Write-Host 'each one is written beside it in src/boot/boot_image.psd1.'
+}
+
+# --- Newer packs installed -------------------------------------------------
+# A pin means the build ignores a newer pack, which is the intended behaviour and must
+# not be a warning -- twice now the newer pack has been the broken one. But silently
+# ignoring it forever is how a pin turns into something nobody remembers deciding.
+#
+# So: a plain note, and only for a version this clone has not mentioned before. Said
+# every build it would stop being read by the third one; said never, the pin rots.
+# The marker file is untracked and per-clone, and deleting it only costs one repeat.
+function Write-DfpNewerPackNote {
+    param([hashtable]$BootManifest, [string]$RepoRoot)
+
+    $seenPath = Join-Path $RepoRoot 'buildtools\dfp_pack_notice.json'
+    $seen = @{}
+    if (Test-Path -LiteralPath $seenPath) {
+        try {
+            $json = Get-Content -LiteralPath $seenPath -Raw | ConvertFrom-Json
+            foreach ($property in $json.PSObject.Properties) { $seen[$property.Name] = [string]$property.Value }
+        } catch {
+            # An unreadable marker is not a reason to fail a gate, nor to be silent:
+            # it just means this note is said once more than it had to be.
+            $seen = @{}
+        }
+    }
+
+    $notes = @()
+    $updated = $false
+    foreach ($deviceKey in (@($BootManifest.Devices.Keys) | Sort-Object)) {
+        $entry = $BootManifest.Devices[$deviceKey]
+        $pinned = $null
+        if (-not [Version]::TryParse($entry.DfpPackVersion, [ref]$pinned)) { continue }
+
+        $installed = @(Get-BootImageInstalledDfpVersions -Pack $entry.DfpPack -Device $deviceKey |
+            Where-Object { $_.Version -gt $pinned })
+        if ($installed.Count -eq 0) { continue }
+
+        $newest = $installed[0].Name
+        if ($seen[$entry.DfpPack] -eq $newest) { continue }
+        $seen[$entry.DfpPack] = $newest
+        $updated = $true
+        $notes += "  note: $($entry.DfpPack) $newest is installed; this project is pinned to $($entry.DfpPackVersion) for $deviceKey (intentional)."
+    }
+
+    if ($notes.Count -eq 0) { return }
+    foreach ($n in $notes) { Write-Host $n }
+    Write-Host '        Newest-installed is not the default here on purpose -- see src/boot/boot_image.psd1.'
+    Write-Host '        To evaluate a newer pack, ask for a pack bump: it needs both pins raised,'
+    Write-Host '        all configurations rebuilt with -Full, and a run on both parts.'
+
+    if ($updated) {
+        try {
+            $payload = [ordered]@{}
+            $payload['comment'] = 'Which newer-than-pinned DFP pack versions this clone has already been told about, so buildtools/check_configurations.ps1 says it once instead of every build. Untracked; deleting it only repeats the note.'
+            foreach ($key in (@($seen.Keys) | Sort-Object)) { $payload[$key] = $seen[$key] }
+            $out = ($payload | ConvertTo-Json -Depth 3) -replace '(?<!\r)\n', "`r`n"
+            [System.IO.File]::WriteAllText($seenPath, $out + "`r`n", [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            # Read-only tree, or a parallel build writing the same file. Neither is a
+            # reason to fail: the only consequence is that the note repeats.
+        }
+    }
+}
+
 # --- Report -----------------------------------------------------------------
 Write-Host "Configuration gate: $confXmlPath"
 $trackedText = if ($trackedKnown) { "$($trackedSources.Count) tracked source(s) under src/app/ + src/shared/ + src/boot/" } else { 'tracked sources not checked' }
@@ -396,6 +594,7 @@ if ($problems.Count -gt 0) {
     Write-Host ''
     Write-Host "Configuration gate FAILED: $($problems.Count) problem(s)" -ForegroundColor Red
     foreach ($p in $problems) { Write-Host "  - $p" }
+    if ($dfpMismatches.Count -gt 0) { Write-DfpMismatchExplanation -Mismatches $dfpMismatches }
     Write-Host ''
     Write-Host 'These expectations are design intent, not a generated baseline. If a change here'
     Write-Host 'is intended, edit the tables at the top of this script deliberately.'
@@ -406,5 +605,6 @@ foreach ($name in $expectedConfigurations.Keys) {
     $mode = if ($expectedConfigurations[$name].Delivery) { 'delivery  ' } else { 'standalone' }
     Write-Host "  $mode  $name"
 }
+Write-DfpNewerPackNote -BootManifest $bootManifest -RepoRoot $repoRoot
 Write-Host 'Configuration gate: PASS'
 exit 0

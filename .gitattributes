@@ -39,7 +39,3 @@ tools/nora_hal_sync/ export-ignore
 tools/classic/avas_type_lb_l3/ export-ignore
 tools/rom_diet/_* export-ignore
 tools_local/ export-ignore
-
-# Self-contained PKOB4 flash/reset helper: not part of this initial release
-# (see buildtools/README.md). Program via MPLAB X / MPLAB IPE instead.
-buildtools/_flash_reset_tools/ export-ignore

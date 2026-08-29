@@ -1,4 +1,4 @@
-﻿
+
 #include "app_specific_config_defs.h"
 #include "app_runtime_overrides.h"
 #include <xc.h>
@@ -10,11 +10,17 @@
 #include <math.h>   // for fmaxf
 #include <assert.h>
 #include "timer_app.h"
+#if APP_SND_EFFECT_EXTERNAL_SST26
 #include "board/devices/SST26_drv.h"
+#endif
 #include "apps/shared/float_conversion.h"
 
 
 #include "snd_effect_play.h"
+
+#if defined(ENA_SND_EFFECT_PLAY) && APP_SND_EFFECT_INTERNAL_ADPCM
+#include "tone_data_ima_adpcm.h"
+#endif
 
 
 
@@ -30,10 +36,13 @@
 #define CLAMPF(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
 
 /*
- * Embedded sound-effect source data is generated as mono int16 at a per-tone
- * sample rate (Button_Tone_i16.Tone_*_rate; 16 kHz for the button clicks,
- * 32 kHz for the notification, because the tones are narrow-band and storing
- * them all at 48 kHz wasted program flash).
+ * Embedded sound-effect source data decodes to mono int16 at a per-tone
+ * sample rate (Tone_*_rate; 12 kHz for the button clicks, 24 kHz for the
+ * notification, because the tones are narrow-band and storing them all at
+ * 48 kHz wasted program flash). AK512 stores that PCM in external SST26
+ * flash; AK128 has no independent SST26 bus while MikroBUS-A carries the
+ * continuous audio stream, so it decodes immutable IMA-ADPCM blocks from
+ * internal Program Flash instead. Both backends feed the same runtime SRC.
  * The processing sample rate may be 44.1 kHz, 48 kHz or 96 kHz.
  *
  * Runtime SRC policy:
@@ -81,13 +90,31 @@ typedef enum se_play_state
 
 typedef struct se_tone_info
 {
-    const int16_t* pDat;
-    uint32_t       size;       // byte size
-    uint32_t       arraysize;  // number of int16 samples
-    uint32_t       flash_addr; // byte address in external flash
-    uint32_t       rate_Hz;    // stored sample rate of this tone
+    const void* pDat;
+    uint32_t    size;       // stored byte size (PCM or ADPCM)
+    uint32_t    arraysize;  // decoded number of int16 samples
+    uint32_t    flash_addr; // byte address in external flash (AK512 only)
+    uint32_t    rate_Hz;    // stored sample rate of this tone
 
 } ST_SE_TONE_INFO;
+
+#if APP_SND_EFFECT_INTERNAL_ADPCM
+typedef struct se_adpcm_decoder
+{
+    const snd_effect_adpcm_asset_t* asset;
+    uint32_t next_sample;
+    uint32_t block_start;
+    uint16_t block_samples;
+    uint16_t nibble_index;
+    int16_t  predictor;
+    uint8_t  step_index;
+    uint8_t  tone_id;
+    uint8_t  valid;
+    uint8_t  have_last;
+    uint32_t last_sample_index;
+    int16_t  last_sample;
+} ST_SE_ADPCM_DECODER;
+#endif
 
 
 
@@ -96,11 +123,23 @@ typedef struct se_tone_info
 // Function Prototype
 //===========================================================
 
+#if APP_SND_EFFECT_EXTERNAL_SST26
 static void     snd_effect_flash_probe( void );
+static bool     snd_effect_verify_tone_data( uint8_t id );
+#endif
 static void     snd_effect_init_tone_info( void );
 static uint32_t snd_effect_get_tone_size( uint8_t id );
-static void     snd_effect_read_tone_dat(uint8_t id, uint32_t addr, uint8_t *buf, size_t len);
-static bool     snd_effect_verify_tone_data( uint8_t id );
+static bool     snd_effect_read_tone_samples( uint8_t id,
+                                              uint32_t first_sample,
+                                              int16_t* buf,
+                                              uint32_t sample_count );
+
+#if APP_SND_EFFECT_INTERNAL_ADPCM
+static void     snd_effect_adpcm_reset( void );
+static bool     snd_effect_adpcm_load_block( uint8_t id, uint32_t block_index );
+static bool     snd_effect_adpcm_decode_next( int16_t* sample );
+static bool     snd_effect_adpcm_seek( uint8_t id, uint32_t sample_index );
+#endif
 
 static inline uint32_t local_get_valid_sample_rate( uint32_t sample_rate_Hz );
 static inline uint32_t local_tone_source_rate( uint8_t id );
@@ -120,7 +159,12 @@ static inline int      local_calc_src_frames_to_read( uint32_t phase_q16,
 // Variables
 //===========================================================
 
+#if APP_SND_EFFECT_EXTERNAL_SST26
 #include "tone_data_int16.h"
+#elif APP_SND_EFFECT_INTERNAL_ADPCM
+_Static_assert( SND_EFFECT_ADPCM_ASSET_COUNT == SE_TONE_NUM,
+                "ADPCM asset order/count must match ENUM_SE_TONE_ID" );
+#endif
 
 static ENUM_SE_PLAY    Ply_Status   = SE_SLEEP;
 static uint8_t         Req_Tone_Id  = SE_TONE_ON;
@@ -134,6 +178,24 @@ static uint32_t        Snd_Effect_Sample_Rate_Hz = (uint32_t)SAMPLE_RATE;
 static uint32_t        Wave_Phase_Q16            = 0u;
 static uint32_t        Wave_Phase_Step_Q16       = SE_PHASE_ONE_Q16;
 
+#if APP_SND_EFFECT_INTERNAL_ADPCM
+static ST_SE_ADPCM_DECODER Adpcm_Decoder;
+
+static const int16_t Adpcm_Step_Table[89] =
+{
+       7,     8,     9,    10,    11,    12,    13,    14,    16,    17,
+      19,    21,    23,    25,    28,    31,    34,    37,    41,    45,
+      50,    55,    60,    66,    73,    80,    88,    97,   107,   118,
+     130,   143,   157,   173,   190,   209,   230,   253,   279,   307,
+     337,   371,   408,   449,   494,   544,   598,   658,   724,   796,
+     876,   963,  1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,
+    2272,  2499,  2749,  3024,  3327,  3660,  4026,  4428,  4871,  5358,
+    5894,  6484,  7132,  7845,  8630,  9493, 10442, 11487, 12635, 13899,
+   15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+};
+
+static const int8_t Adpcm_Index_Table[8] = { -1, -1, -1, -1, 2, 4, 6, 8 };
+#endif
 
 
 
@@ -144,27 +206,46 @@ static uint32_t        Wave_Phase_Step_Q16       = SE_PHASE_ONE_Q16;
 
 void snd_effect_int( uint32_t sample_rate_Hz )
 {
+#if APP_SND_EFFECT_EXTERNAL_SST26
     // Bring-up probe: confirm the external flash device answers before we rely
     // on it to store the tone data.  This absorbs the former driver-side
     // "SST26_test" self-test so the SST26 driver stays a pure device driver and
     // the flash sound-effect feature owns its own bring-up diagnostics.
     snd_effect_flash_probe();
-
-    Snd_Effect_Sample_Rate_Hz = local_get_valid_sample_rate( sample_rate_Hz );
-    Wave_Phase_Q16            = 0u;
+#endif
 
     snd_effect_init_tone_info();
 
-    // The step is per tone; this is only the value used until the first play.
-    Wave_Phase_Step_Q16       = local_calc_phase_step_q16( local_tone_source_rate( Req_Tone_Id ),
-                                                           Snd_Effect_Sample_Rate_Hz );
+    snd_effect_set_sample_rate( sample_rate_Hz );
 
     snd_effect_prepare_flash_data();
 }
 
 
+/*
+ * snd_effect_set_sample_rate
+ * ---------------------------
+ * Re-derive the SRC step for a processing-rate change (e.g. codec-A restart
+ * with a new output rate) without touching the tone data itself. Safe to call
+ * whether or not a tone is currently playing: stops any in-flight playback and
+ * resets the ADPCM decoder so the next snd_effect_play_se() starts clean.
+ */
+void snd_effect_set_sample_rate( uint32_t sample_rate_Hz )
+{
+    Snd_Effect_Sample_Rate_Hz = local_get_valid_sample_rate( sample_rate_Hz );
+    Wave_Phase_Step_Q16       = local_calc_phase_step_q16( local_tone_source_rate( Req_Tone_Id ),
+                                                           Snd_Effect_Sample_Rate_Hz );
+    Wave_Phase_Q16            = 0u;
+    Ply_Status                = SE_SLEEP;
+#if APP_SND_EFFECT_INTERNAL_ADPCM
+    snd_effect_adpcm_reset();
+#endif
+}
+
+
 bool snd_effect_verify( void )
 {
+#if APP_SND_EFFECT_EXTERNAL_SST26
     if( !snd_effect_verify_tone_data( SE_TONE_ON ) )
     {
         return false;
@@ -181,6 +262,11 @@ bool snd_effect_verify( void )
     }
 
     return true; // good
+#else
+    // Internal assets are immutable linker data. The generator's --check mode
+    // verifies their byte stream and the normal device programmer supplies ECC.
+    return Tone_Info_Initialized;
+#endif
 }
 
 
@@ -193,6 +279,7 @@ bool snd_effect_verify( void )
  */
 bool snd_effect_prepare_flash_data( void )
 {
+#if APP_SND_EFFECT_EXTERNAL_SST26
     if( snd_effect_verify() )
     {
         return true; // good
@@ -233,6 +320,9 @@ bool snd_effect_prepare_flash_data( void )
     printf(" Verify NOT OK!!\n");
     printf("@@@@@@@@@@@@@@@@@@@@\n");
     return false;
+#else
+    return snd_effect_verify();
+#endif
 }
 
 
@@ -252,9 +342,9 @@ void snd_effect_play_se( uint8_t id )
 /**
  * wav_to_tdm_float_process
  * ----------------------------
- * Mix a mono notification WAV (int16 samples in external flash) into channel-major float I/O buffers.
+ * Mix a mono notification (decoded int16 samples) into channel-major float I/O buffers.
  * - I/O are normalized floats in [-1.0, +1.0].
- * - Embedded WAV source is 48 kHz mono int16.
+ * - Embedded WAV source is mono int16, stored at each tone's own rate.
  * - Source sample position is SRC-converted to the processing sample rate using Q16 phase.
  * - Each int16 sample is normalized by 1/32768.0f and then scaled by Pre_Gain_WAV (linear).
  * - Mixed to all processing channels. The mono WAV sample is added equally to every channel.
@@ -289,6 +379,9 @@ void wav_to_tdm_float_process(const float* in_buf,
         // Each tone is stored at its own sample rate -> re-derive the SRC step.
         Wave_Phase_Step_Q16 = local_calc_phase_step_q16( local_tone_source_rate( Play_Tone_Id ),
                                                          Snd_Effect_Sample_Rate_Hz );
+#if APP_SND_EFFECT_INTERNAL_ADPCM
+        snd_effect_adpcm_reset();
+#endif
     }
     else if (Ply_Status != SE_PLAY)
     {
@@ -376,19 +469,21 @@ void wav_to_tdm_float_process(const float* in_buf,
     }
 
 
-#if APP_TARGET == APP_TARGET_AK512
-#if defined(ENA_SND_EFFECT_PLAY)
     /*
-     * Read source samples from external flash.
+     * Read/decode source samples through the selected storage backend.
      * +1 sample is included by local_calc_src_frames_to_read() when possible
      * so linear interpolation can read x0 and x1 safely.
      */
-    snd_effect_read_tone_dat( Play_Tone_Id,
-                              base_idx * (uint32_t)sizeof(int16_t),
-                              (uint8_t*)WavData,
-                              (uint32_t)srcFramesToRead * (uint32_t)sizeof(int16_t));
-#endif //defined(ENA_SND_EFFECT_PLAY)
-#endif //APP_TARGET == APP_TARGET_AK512
+    if( !snd_effect_read_tone_samples( Play_Tone_Id,
+                                       base_idx,
+                                       WavData,
+                                       (uint32_t)srcFramesToRead ) )
+    {
+        local_copy_pass_through( in_buf, out_buf, frameSize, num_proc_ch );
+        Wave_Phase_Q16 = 0u;
+        Ply_Status     = SE_SLEEP;
+        return;
+    }
 
 
     // Main processing
@@ -469,6 +564,7 @@ void wav_to_tdm_float_process(const float* in_buf,
 // Local Function
 //===========================================================
 
+#if APP_SND_EFFECT_EXTERNAL_SST26
 /*
  * snd_effect_flash_probe
  * ----------------------
@@ -484,6 +580,7 @@ static void snd_effect_flash_probe( void )
     printf(" SR = 0x%02X\n", sst26_read_status());
     printf(" CR = 0x%02X\n", sst26_read_config());
 }
+#endif //APP_SND_EFFECT_EXTERNAL_SST26
 
 
 static inline uint32_t local_get_valid_sample_rate( uint32_t sample_rate_Hz )
@@ -621,6 +718,7 @@ static void snd_effect_init_tone_info( void )
         return;
     }
 
+#if APP_SND_EFFECT_EXTERNAL_SST26
     Tone_Info[ SE_TONE_ON ].pDat          = Button_Tone_i16.Tone_ON;
     Tone_Info[ SE_TONE_ON ].size          = Button_Tone_i16.Tone_ON_size;
     Tone_Info[ SE_TONE_ON ].arraysize     = Button_Tone_i16.Tone_ON_array_s;
@@ -638,6 +736,17 @@ static void snd_effect_init_tone_info( void )
     Tone_Info[ SE_TONE_NOTIF ].arraysize  = Button_Tone_i16.Tone_Notif_array_s;
     Tone_Info[ SE_TONE_NOTIF ].rate_Hz    = Button_Tone_i16.Tone_Notif_rate;
     Tone_Info[ SE_TONE_NOTIF ].flash_addr = Tone_Info[ SE_TONE_OFF ].flash_addr + Tone_Info[ SE_TONE_OFF ].size;
+#elif APP_SND_EFFECT_INTERNAL_ADPCM
+    for( uint8_t id = 0u; id < (uint8_t)SE_TONE_NUM; id++ )
+    {
+        const snd_effect_adpcm_asset_t* asset = &Snd_Effect_Adpcm_Assets[id];
+        Tone_Info[id].pDat       = asset->data;
+        Tone_Info[id].size       = asset->encoded_size;
+        Tone_Info[id].arraysize  = asset->sample_count;
+        Tone_Info[id].rate_Hz    = asset->rate_Hz;
+        Tone_Info[id].flash_addr = 0u;
+    }
+#endif
 
     Tone_Info_Initialized = true;
 }
@@ -655,30 +764,253 @@ static uint32_t snd_effect_get_tone_size( uint8_t id )
 
 
 /*
- * snd_effect_read_tone_dat
- * ---------------
- * Purpose : Read one tone from external flash.
- * Notes   : Tone offset/address layout is owned by snd_effect_play.
+ * snd_effect_read_tone_samples
+ * -----------------------------
+ * Purpose : Fetch `sample_count` decoded int16 samples of tone `id`, starting
+ *           at `first_sample`, through whichever storage backend is active.
+ * Notes   : Tone offset/address layout (SST26) or ADPCM block/decoder state
+ *           is owned entirely by this module.
  */
-static void snd_effect_read_tone_dat(uint8_t id, uint32_t addr, uint8_t *buf, size_t len)
+static bool snd_effect_read_tone_samples( uint8_t id,
+                                          uint32_t first_sample,
+                                          int16_t* buf,
+                                          uint32_t sample_count )
 {
-    if (!len)
+    if( sample_count == 0u )
     {
-        return;
+        return true;
+    }
+    if( (buf == NULL) || (id >= SE_TONE_NUM) )
+    {
+        return false;
+    }
+    if( (first_sample >= Tone_Info[id].arraysize) ||
+        (sample_count > (Tone_Info[id].arraysize - first_sample)) )
+    {
+        return false;
     }
 
-    if( id >= SE_TONE_NUM )
+#if APP_SND_EFFECT_EXTERNAL_SST26
+    const uint32_t addr = Tone_Info[id].flash_addr +
+                          (first_sample * (uint32_t)sizeof(int16_t));
+    sst26_read_fast( addr, (uint8_t*)buf, sample_count * (uint32_t)sizeof(int16_t) );
+    return true;
+#elif APP_SND_EFFECT_INTERNAL_ADPCM
+    uint32_t produced = 0u;
+
+    // Consecutive SRC windows overlap by the interpolation look-ahead sample.
+    // Reuse that one decoded sample instead of rewinding the ADPCM stream.
+    if( Adpcm_Decoder.valid &&
+        (Adpcm_Decoder.tone_id == id) &&
+        Adpcm_Decoder.have_last &&
+        (Adpcm_Decoder.last_sample_index == first_sample) &&
+        (Adpcm_Decoder.next_sample == (first_sample + 1u)) )
     {
-        return;
+        buf[produced++] = Adpcm_Decoder.last_sample;
     }
 
-    // adjust the offset address
-    addr += Tone_Info[id].flash_addr;
+    if( produced < sample_count )
+    {
+        const uint32_t wanted = first_sample + produced;
+        if( !Adpcm_Decoder.valid ||
+            (Adpcm_Decoder.tone_id != id) ||
+            (Adpcm_Decoder.next_sample != wanted) )
+        {
+            if( !snd_effect_adpcm_seek( id, wanted ) )
+            {
+                return false;
+            }
+        }
 
-    sst26_read_fast( addr, buf, len );
+        while( produced < sample_count )
+        {
+            if( !snd_effect_adpcm_decode_next( &buf[produced] ) )
+            {
+                return false;
+            }
+            produced++;
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
 }
 
 
+#if APP_SND_EFFECT_INTERNAL_ADPCM
+static void snd_effect_adpcm_reset( void )
+{
+    Adpcm_Decoder.asset             = NULL;
+    Adpcm_Decoder.next_sample       = 0u;
+    Adpcm_Decoder.block_start       = 0u;
+    Adpcm_Decoder.block_samples     = 0u;
+    Adpcm_Decoder.nibble_index      = 0u;
+    Adpcm_Decoder.predictor         = 0;
+    Adpcm_Decoder.step_index        = 0u;
+    Adpcm_Decoder.tone_id           = 0u;
+    Adpcm_Decoder.valid             = 0u;
+    Adpcm_Decoder.have_last         = 0u;
+    Adpcm_Decoder.last_sample_index = 0u;
+    Adpcm_Decoder.last_sample       = 0;
+}
+
+
+static bool snd_effect_adpcm_load_block( uint8_t id, uint32_t block_index )
+{
+    if( id >= SE_TONE_NUM )
+    {
+        return false;
+    }
+
+    const snd_effect_adpcm_asset_t* asset = &Snd_Effect_Adpcm_Assets[id];
+    if( (asset->data == NULL) || (block_index >= asset->block_count) )
+    {
+        return false;
+    }
+
+    const uint32_t block_start = block_index * SND_EFFECT_ADPCM_BLOCK_SAMPLES;
+    if( block_start >= asset->sample_count )
+    {
+        return false;
+    }
+
+    const uint32_t remaining = asset->sample_count - block_start;
+    const uint16_t block_samples = (remaining < SND_EFFECT_ADPCM_BLOCK_SAMPLES)
+                                 ? (uint16_t)remaining
+                                 : (uint16_t)SND_EFFECT_ADPCM_BLOCK_SAMPLES;
+    const uint32_t block_offset = block_index * SND_EFFECT_ADPCM_FULL_BLOCK_BYTES;
+    const uint32_t block_bytes  = SND_EFFECT_ADPCM_BLOCK_HEADER_BYTES +
+                                  ((uint32_t)block_samples / 2u);
+    if( (block_offset > asset->encoded_size) ||
+        (block_bytes > (asset->encoded_size - block_offset)) )
+    {
+        return false;
+    }
+
+    const uint8_t* header = asset->data + block_offset;
+    const uint16_t raw_predictor = (uint16_t)header[0] | ((uint16_t)header[1] << 8);
+    if( (header[2] > 88u) || (header[3] != 0u) )
+    {
+        return false;
+    }
+
+    Adpcm_Decoder.asset         = asset;
+    Adpcm_Decoder.next_sample   = block_start;
+    Adpcm_Decoder.block_start   = block_start;
+    Adpcm_Decoder.block_samples = block_samples;
+    Adpcm_Decoder.nibble_index  = 0u;
+    Adpcm_Decoder.predictor     = (int16_t)raw_predictor;
+    Adpcm_Decoder.step_index    = header[2];
+    Adpcm_Decoder.tone_id       = id;
+    Adpcm_Decoder.valid         = 1u;
+    return true;
+}
+
+
+static bool snd_effect_adpcm_decode_next( int16_t* sample )
+{
+    if( (sample == NULL) || !Adpcm_Decoder.valid || (Adpcm_Decoder.asset == NULL) )
+    {
+        return false;
+    }
+    if( Adpcm_Decoder.next_sample >= Adpcm_Decoder.asset->sample_count )
+    {
+        return false;
+    }
+
+    if( Adpcm_Decoder.next_sample >=
+        (Adpcm_Decoder.block_start + (uint32_t)Adpcm_Decoder.block_samples) )
+    {
+        const uint32_t next_block = Adpcm_Decoder.next_sample /
+                                    SND_EFFECT_ADPCM_BLOCK_SAMPLES;
+        if( !snd_effect_adpcm_load_block( Adpcm_Decoder.tone_id, next_block ) )
+        {
+            return false;
+        }
+    }
+
+    int16_t decoded;
+    if( Adpcm_Decoder.next_sample == Adpcm_Decoder.block_start )
+    {
+        decoded = Adpcm_Decoder.predictor;
+    }
+    else
+    {
+        if( Adpcm_Decoder.nibble_index >= (uint16_t)(Adpcm_Decoder.block_samples - 1u) )
+        {
+            return false;
+        }
+
+        const uint32_t block_index  = Adpcm_Decoder.block_start /
+                                      SND_EFFECT_ADPCM_BLOCK_SAMPLES;
+        const uint32_t block_offset = block_index * SND_EFFECT_ADPCM_FULL_BLOCK_BYTES;
+        const uint8_t* payload = Adpcm_Decoder.asset->data + block_offset +
+                                 SND_EFFECT_ADPCM_BLOCK_HEADER_BYTES;
+        const uint8_t packed = payload[ Adpcm_Decoder.nibble_index >> 1 ];
+        const uint8_t code = (Adpcm_Decoder.nibble_index & 1u)
+                           ? (uint8_t)((packed >> 4) & 0x0Fu)
+                           : (uint8_t)(packed & 0x0Fu);
+        const int32_t step = Adpcm_Step_Table[ Adpcm_Decoder.step_index ];
+        int32_t delta = step >> 3;
+        if( code & 4u ) delta += step;
+        if( code & 2u ) delta += step >> 1;
+        if( code & 1u ) delta += step >> 2;
+
+        int32_t predictor = Adpcm_Decoder.predictor;
+        predictor = (code & 8u) ? (predictor - delta) : (predictor + delta);
+        if( predictor > 32767 ) predictor = 32767;
+        if( predictor < -32768 ) predictor = -32768;
+
+        int32_t step_index = (int32_t)Adpcm_Decoder.step_index +
+                             (int32_t)Adpcm_Index_Table[code & 7u];
+        if( step_index > 88 ) step_index = 88;
+        if( step_index < 0 )  step_index = 0;
+
+        Adpcm_Decoder.predictor  = (int16_t)predictor;
+        Adpcm_Decoder.step_index = (uint8_t)step_index;
+        Adpcm_Decoder.nibble_index++;
+        decoded = (int16_t)predictor;
+    }
+
+    Adpcm_Decoder.last_sample_index = Adpcm_Decoder.next_sample;
+    Adpcm_Decoder.last_sample       = decoded;
+    Adpcm_Decoder.have_last         = 1u;
+    Adpcm_Decoder.next_sample++;
+    *sample = decoded;
+    return true;
+}
+
+
+static bool snd_effect_adpcm_seek( uint8_t id, uint32_t sample_index )
+{
+    if( (id >= SE_TONE_NUM) ||
+        (sample_index >= Snd_Effect_Adpcm_Assets[id].sample_count) )
+    {
+        return false;
+    }
+
+    Adpcm_Decoder.valid     = 0u;
+    Adpcm_Decoder.have_last = 0u;
+    if( !snd_effect_adpcm_load_block( id,
+                                      sample_index / SND_EFFECT_ADPCM_BLOCK_SAMPLES ) )
+    {
+        return false;
+    }
+
+    while( Adpcm_Decoder.next_sample < sample_index )
+    {
+        int16_t discarded;
+        if( !snd_effect_adpcm_decode_next( &discarded ) )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+#endif //APP_SND_EFFECT_INTERNAL_ADPCM
+
+#if APP_SND_EFFECT_EXTERNAL_SST26
 static bool snd_effect_verify_tone_data( uint8_t id )
 {
     printf(" snd_effect_verify_tone_data:\n");
@@ -706,5 +1038,6 @@ static bool snd_effect_verify_tone_data( uint8_t id )
         return false;
     }
 }
+#endif //APP_SND_EFFECT_EXTERNAL_SST26
 
 #endif //defined(ENA_SND_EFFECT_PLAY)

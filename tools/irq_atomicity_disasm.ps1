@@ -18,11 +18,17 @@ param(
     [Parameter(Mandatory = $true)][string]$Elf,
     [Parameter(Mandatory = $true)][string]$Out,
     [string]$Objdump = 'C:\Program Files\Microchip\xc-dsc\v3.31.01\bin\xc-dsc-objdump.exe',
-    # Same resolution order as buildtools/provision.ps1: an explicit
-    # DSPIC33AK_DFP wins, otherwise the per-user pack directory. Never a
-    # hard-coded home path -- this file is published.
-    [string]$Dfp = ($env:DSPIC33AK_DFP ?? (Join-Path $HOME '.mchp_packs/Microchip/dsPIC33AK-MP_DFP/1.3.185/xc16'))
+    # Read out of tools/dfp_packs.py's PINS (via its CLI, since PowerShell
+    # cannot import a Python module) so this stays in sync with the pin the
+    # build itself uses, instead of duplicating "MP_DFP/1.3.185" here.
+    [string]$Dfp
 )
+
+if ([string]::IsNullOrWhiteSpace($Dfp)) {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $Dfp = & python (Join-Path $repoRoot 'tools/dfp_packs.py') $Elf
+    if ($LASTEXITCODE -ne 0) { throw "dfp_packs.py could not resolve a DFP for $Elf : $Dfp" }
+}
 
 $ErrorActionPreference = 'Stop'
 

@@ -175,13 +175,16 @@ void sonora_app_prepare( void )
 #endif
 
 #if defined(ENA_SND_EFFECT_PLAY)
-    // Classic uses the SST26 external flash solely to store and play the button
-    // sound effects.  Bring the flash SPI up (formerly inlined in main()), then
-    // provision + verify the tone data.  The device bring-up probe (JEDEC/SR/CR)
-    // now lives inside snd_effect_int().  ENA_SND_EFFECT_PLAY implies
-    // APP_USE_SST26 (enforced in app_specific_config_defs.h), so the SST26
-    // driver is guaranteed available here.
+    // AK512 uses the SST26 external flash solely to store and play the button
+    // sound effects; bring the flash SPI up (formerly inlined in main()) before
+    // snd_effect_int() provisions + verifies the tone data (its own bring-up
+    // probe -- JEDEC/SR/CR -- runs from inside snd_effect_int() too).
+    // AK128 has no independent SST26 bus (shared with the audio TDM pins) and
+    // decodes immutable IMA-ADPCM assets from internal Program Flash instead,
+    // so there is no flash device to bring up.
+  #if APP_SND_EFFECT_EXTERNAL_SST26
     sst26_init();
+  #endif
     snd_effect_int( SAMPLE_RATE );
 #endif
 }

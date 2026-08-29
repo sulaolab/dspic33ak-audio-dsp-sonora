@@ -79,6 +79,7 @@
           <itemPath>../src/app/apps/classic/classic_demo_build_config.h</itemPath>
           <itemPath>../src/app/apps/classic/snd_effect_play.c</itemPath>
           <itemPath>../src/app/apps/classic/snd_effect_play.h</itemPath>
+          <itemPath>../src/app/apps/classic/tone_data_ima_adpcm.h</itemPath>
           <itemPath>../src/app/apps/classic/tone_data_int16.c</itemPath>
           <itemPath>../src/app/apps/classic/tone_data_int16.h</itemPath>
         </logicalFolder>

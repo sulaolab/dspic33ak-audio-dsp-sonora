@@ -120,3 +120,66 @@ function Get-BootImageForDevice {
     foreach ($key in $script:BootImageDeviceKeys) { $view[$key] = $Image.Devices[$Device][$key] }
     return $view
 }
+
+# ---------------------------------------------------------------------------
+# The device pack on THIS machine.
+#
+# Here rather than in build_resident_bootloader.ps1, where the first copy lived,
+# because the pin in the manifest now has a second reader: check_configurations.ps1
+# compares it with what the application project pins. Two copies of "does this pack
+# root serve this part" would have been two chances to answer differently, and the
+# wrong answer is silent -- -mdfp simply supplies another part's headers.
+# ---------------------------------------------------------------------------
+
+function Get-BootImageDfpPackBase {
+    <#
+      Where a pack family's installed versions live. The per-user pack directory, not
+      the copy bundled with MPLAB X: the IDE installs updates here, so this is the
+      directory that grows a version nobody asked for.
+    #>
+    param([Parameter(Mandatory)][string]$Pack)
+
+    # Not $profile: that is a PowerShell automatic variable.
+    $userProfile = [Environment]::GetFolderPath('UserProfile')
+    return (Join-Path $userProfile (Join-Path '.mchp_packs\Microchip' $Pack))
+}
+
+function Test-BootImageDfpSupportsDevice {
+    <#
+      Whether a pack root actually serves THIS part, decided by the one file that says
+      so. Every caller asks, because a wrong pack does not announce itself.
+      The header name carries no 'dsPIC' prefix -- p33AK128MC106.h, not pdsPIC33...
+    #>
+    param(
+        [string]$Root,
+        [Parameter(Mandatory)][string]$Device
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $false }
+    $header = Join-Path $Root ('xc16\support\dsPIC33A\h\p{0}.h' -f $Device)
+    return (Test-Path -LiteralPath $header -PathType Leaf)
+}
+
+function Get-BootImageInstalledDfpVersions {
+    <#
+      Every installed version of one pack family that serves this part, newest first.
+      Versions whose directory name is not a version, and versions that do not carry
+      the part's header, are not returned: they are not candidates for anything.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Pack,
+        [Parameter(Mandatory)][string]$Device
+    )
+
+    $base = Get-BootImageDfpPackBase -Pack $Pack
+    if (-not (Test-Path -LiteralPath $base -PathType Container)) { return @() }
+
+    return @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $version = $null
+            if ([Version]::TryParse($_.Name, [ref]$version) -and
+                (Test-BootImageDfpSupportsDevice -Root $_.FullName -Device $Device)) {
+                [pscustomobject]@{ Version = $version; Name = $_.Name; Path = $_.FullName }
+            }
+        } | Sort-Object Version -Descending)
+}
