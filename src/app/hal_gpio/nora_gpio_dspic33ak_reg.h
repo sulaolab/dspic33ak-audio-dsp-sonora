@@ -33,7 +33,7 @@
  * Motivation: the LED level meter is driven from both TDM RX-block ISRs, which today cannot
  * preempt each other only because they share one interrupt priority.  This layer must not be
  * what makes an interrupt-priority decision elsewhere unsafe.
- * [internal] report_ak512_16ch_mixed_rate_margin_cause_2026-08-24.md section 14.1 item 3.
+ * Validated on an AK512 16-channel mixed-rate configuration.
  */
 
 /*

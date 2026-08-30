@@ -218,7 +218,10 @@ uint32_t nora_fake_pllcon_word(uint32_t pll)
 {
     const nora_fake_pllcon_t *con = nora_fake_pllcon(pll);
 
-    return (con->ON & 1u) | ((con->OE & 1u) << 1) | ((con->OSWEN & 1u) << 2) |
+    /* Bit 1 is deliberately left out of the composed word: PLLxCON has no OE
+     * bit. No test may assert a raw word layout (see nora_fake_clock.h), so
+     * the remaining positions are left where they were. */
+    return (con->ON & 1u) | ((con->OSWEN & 1u) << 2) |
            ((con->DIVSWEN & 1u) << 3) | ((con->PLLSWEN & 1u) << 4) |
            ((con->FOUTSWEN & 1u) << 5) | ((con->NOSC & 0xffu) << 8);
 }

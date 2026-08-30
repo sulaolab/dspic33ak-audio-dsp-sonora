@@ -20,7 +20,7 @@
 #include "bass_enhancer.h"
 #endif
 #if defined(ENA_ENGINE_SYNTH)
-#include "engine_synth.h"   // app_engine_synth_blip_start (raw 'b' hotkey)
+#include "engine_select.h"   // app_engine_synth_blip_start (raw 'b' hotkey)
 #endif
 #if defined(ENA_AVAS_TYPE_LB_SYNTH)
 #include "avas_synth_type_lb.h"   // wind-level trim for "*cn" / "?cn"
@@ -355,6 +355,15 @@ static void classic_console_status( app_console_msg_t* msg )
 // so hotkey and command share one enable-state source (no desync). No value byte.
 // A known synth not built into this target returns UNSUPPORTED (vs unknown subcode
 // which is BAD_DATA), so callers can tell "not on this board" from "no such synth".
+//
+// 05..07 and 40..7F are the engine model's bring-up subcodes (section 39). They
+// exist because the engine's own switch is SW2's long press and a reset returns it
+// to off, so bisecting the model over a serial link meant a physical press per
+// reset; and because "it sounds like a different thing" needs the elements
+// separable one at a time. 40..7F carry the stage mask in the low 6 bits
+// (engine_v8.h): 40 = bare wavetable, 41 = +throttle, 43 = +deadband, 47 = +jitter,
+// 4F = +noise, 5F = +drift, 7F = the whole design, 7D = the design without the
+// POT deadband, i.e. exactly what section 38 froze.
 static void classic_console_synth( app_console_msg_t* msg )
 {
     const uint16_t in_len  = msg->data_len;
@@ -364,7 +373,10 @@ static void classic_console_synth( app_console_msg_t* msg )
 
     if( in_len != 1u )
     {
-        printf(" \"*cy SS\" SS=synth (00 avas(TYPE_TY) 01 pinger 02 kinkon 03 clickclack 04 engine)\n");
+        printf(" \"*cy SS\" SS=synth (00 avas(TYPE_TY) 01 pinger 02 kinkon 03 clickclack 04 engine blip)\n");
+#if defined(ENA_ENGINE_SYNTH)
+        printf("          engine: 05 on 06 off 07 report, 40..7F stage mask (7F all, 7D as frozen)\n");
+#endif
         msg->status = APP_CONSOLE_ERR_BAD_DATA;
         return;
     }
@@ -411,7 +423,37 @@ static void classic_console_synth( app_console_msg_t* msg )
         msg->status = APP_CONSOLE_ERR_UNSUPPORTED;
 #endif
         break;
+    case 0x05u:   // engine: on
+    case 0x06u:   // engine: off
+#if defined(ENA_ENGINE_SYNTH)
+        /* The same call SW2's long press makes, so the two cannot desync. */
+        app_engine_synth_enable( subcode == 0x05u );
+        printf("\n Engine Synth: %s.\n",
+               ( subcode == 0x05u ) ? "enable" : "disable");
+        msg->status = APP_CONSOLE_OK;
+#else
+        msg->status = APP_CONSOLE_ERR_UNSUPPORTED;
+#endif
+        break;
+    /* Beyond the shared four above, the engine's subcodes are the MODEL's, and this
+     * switch does not know what any of them mean -- a stage mask is engine_v8's
+     * concept and the legacy model has none. So both the report and the 40..7F
+     * ladder are forwarded: the model returns whether it handled the subcode, and
+     * that maps to OK / ERR_UNSUPPORTED here. Adding a subcode, or a third model,
+     * then touches no platform file. */
+    case 0x07u:   // engine: whatever this model reports
     default:
+        if( subcode == 0x07u || ( subcode & 0xC0u ) == 0x40u )
+        {
+#if defined(ENA_ENGINE_SYNTH)
+            msg->status = app_engine_synth_console_subcode( subcode )
+                        ? APP_CONSOLE_OK
+                        : APP_CONSOLE_ERR_UNSUPPORTED;
+#else
+            msg->status = APP_CONSOLE_ERR_UNSUPPORTED;
+#endif
+            break;
+        }
         printf(" \"*cy\" unknown synth subcode %u\n", (unsigned)subcode);
         msg->status = APP_CONSOLE_ERR_BAD_DATA;
         break;

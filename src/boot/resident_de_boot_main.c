@@ -80,7 +80,8 @@
  * served was retired with the resident bootloader, and nothing here rebuilds it. */
 #if defined(__dsPIC33AK512MPS512__)
 #pragma config BTMODE = SINGLE
-#pragma config NOBTSWP = OFF
+// Renamed in dsPIC33AK-MP_DFP 1.4.260: OFF -> BTSWP_DISABLED. Same fuse bit (bit15 = 1).
+#pragma config NOBTSWP = BTSWP_DISABLED
 #elif !defined(__dsPIC33AK128MC106__)
 #error "Unknown target: state whether this part has Flash Dual Partition (BTMODE/NOBTSWP)."
 #endif

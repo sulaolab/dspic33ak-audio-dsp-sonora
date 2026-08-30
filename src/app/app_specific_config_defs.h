@@ -466,8 +466,25 @@
 
 // gain for the engine synth
 /////////////////////////////////////////////
+// Measured on the model (section 41), full-range trajectory, after
+// ENGINE_V8_OUT_GAIN and this trim, before POST_GAIN_CODEC_DB:
+//   all elements on   peak -36.2 dBFS   settled idle rms -79.8 dBFS
+//   wavetable only    peak -46.3 dBFS   settled idle rms -86.5 dBFS
+// -36 dB therefore made the idle inaudible on the board (the LED level meter did
+// not move either), which is what the -28/-36 pair below was never checked for:
+// every offline wav is peak/rms normalised before it is saved, so the absolute
+// level was outside the verification loop. -20 dB puts the flare at -8.7 dBFS and
+// the idle at -51.8 dBFS at the codec. The idle-to-flare span is inherent to the
+// recording (~44 dB), so one trim cannot make both comfortable -- this one is set
+// so the idle is audible and the flare has headroom.
 //#define PRE_GAIN_ENG_SYNTH_DB     (-28.0f)
-#define PRE_GAIN_ENG_SYNTH_DB     (-36.0f)
+// -20 dB was still inaudible on an external amplifier at full volume, so the trim
+// is 0 dB by owner decision (section 41.4). At 0 dB the flare's peak reaches
+// 0.925 * Post_Gain_CODEC 3.98 = 3.68 at the codec, i.e. it overloads by ~11 dB;
+// the idle lands at -31.8 dBFS. Making the idle audible is what was asked for.
+//#define PRE_GAIN_ENG_SYNTH_DB     (-36.0f)
+//#define PRE_GAIN_ENG_SYNTH_DB     (-20.0f)
+#define PRE_GAIN_ENG_SYNTH_DB     (  0.0f)
 
 // Gain for the currently selected AVAS synth source (LAMB or TYPE_TY).
 // This is the final source gain; per-partial gains remain part of the timbre.
@@ -785,10 +802,21 @@
   #ifndef APP_BLOCK_FRAMES
    #define APP_BLOCK_FRAMES        (16)     // async (ASRC) engine, either part
   #endif
- #elif APP_TARGET == APP_TARGET_AK512
-  #define APP_BLOCK_FRAMES         (32)     // classic co-clock demo (CMSIS batching)
  #else
-  #define APP_BLOCK_FRAMES         (4)      // AK128 Classic: low-latency experiment value
+  // BOTH Classic targets batch 32 frames. AK128 Classic used to sit on 4 -- the
+  // "low-latency experiment value" the note above already calls undecided -- and
+  // that is what broke AVAS TYPE_TY on it (2026-08-29): a 4-frame block is an
+  // 83.3 us deadline, and every fixed per-block cost is then paid 8x as often as
+  // on AK512 for the same audio. With TYPE_TY sounding, the measured margin was
+  // +3.9 us of 83.3 us even after the engine's own rebuild burst was spread out;
+  // at 32 frames the same work has a 666.6 us window. Nothing in the Classic app
+  // asked for 4: no feature, no test and no measurement was keyed to it.
+  //
+  // The cost is latency -- 83.3 us -> 666.6 us of block delay at 48 kHz -- and
+  // the per-block scratch buffers grow 8x. Both were accepted deliberately,
+  // against the measured alternative above; see
+  // [internal] avas_type_ty_ak128_block_burst_2026-08-29.md.
+  #define APP_BLOCK_FRAMES         (32)     // classic co-clock demo (CMSIS batching)
  #endif //APP_B_INDEP_DOMAIN
 
 #endif //ENA_DRC_DF2T_CASCADE
@@ -986,6 +1014,23 @@
 
   #if !defined(ENA_96K_RATE)
   #define ENA_ENGINE_SYNTH      // it needs POT. AK128 doesn't use POT.
+
+  /* Which engine model ENA_ENGINE_SYNTH selects. Undefined = engine_v8, the
+   * resynthesised model (sections 39-45), which is the shipping sound.
+   *
+   * Define this to fall back to engine_synth.c, the hand-built model engine_v8
+   * replaced. It is a whole-model switch, not a parameter: the two files define the
+   * same app_engine_synth_* entry points and each is compiled only for its own
+   * setting, so exactly one is ever linked. Both are registered in the MPLAB
+   * project (neither is ex="true") and the selection is made here, in the source,
+   * so it cannot drift per configuration.
+   *
+   * The legacy model has no `*cy` bring-up ladder and no telemetry report, so those
+   * console subcodes answer ERR_UNSUPPORTED when it is selected -- it predates them.
+   *
+   * Kept because engine_v8 is a sound decision that was frozen by ear (section
+   * 44 / 45.7), and a sound decision is the kind that gets revisited. */
+//#define ENA_ENGINE_SYNTH_LEGACY
   #endif //!defined(ENA_96K_RATE)
 
   #define ENA_DEESSER

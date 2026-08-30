@@ -105,7 +105,7 @@ extern "C" {
 //-----------------------------------------------------------------------
 
 #if !defined( NORA_NOINIT_RAM_LINKER_RESERVED )
-#  error "hal_noinit_ram: reserve the block in the linker script first (KEEP + NOLOAD + a guard filler so the stack cannot be placed there), then #define NORA_NOINIT_RAM_LINKER_RESERVED 1. The attribute alone does NOT protect the range -- see [internal] resident_serial_bootloader.md part 3."
+#  error "hal_noinit_ram: reserve the block in the linker script first (KEEP + NOLOAD + a guard filler so the stack cannot be placed there), then #define NORA_NOINIT_RAM_LINKER_RESERVED 1. The attribute alone does NOT protect the range."
 #endif
 
 #if !defined( NORA_NOINIT_RAM_ADDRESS )

@@ -36,6 +36,8 @@ buildtools/check_publication.ps1 export-ignore
 buildtools/check_publication_archive.ps1 export-ignore
 buildtools/make_single_app_tree.ps1 export-ignore
 tools/nora_hal_sync/ export-ignore
+# Runs that tool and describes the private publish pipeline, so it goes with it.
+.github/ export-ignore
 tools/classic/avas_type_lb_l3/ export-ignore
 tools/rom_diet/_* export-ignore
 tools_local/ export-ignore

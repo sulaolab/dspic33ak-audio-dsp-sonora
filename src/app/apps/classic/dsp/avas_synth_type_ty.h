@@ -111,6 +111,10 @@
 
 typedef struct avas_type_ty_synth_s avas_type_ty_synth_t;
 
+/* One bit per cluster in pitch_apply_mask (see below). */
+_Static_assert( AVAS_TYPE_TY_L1_CLUSTERS <= 16u,
+                "pitch_apply_mask holds one bit per cluster" );
+
 struct avas_type_ty_synth_s
 {
     float fs;    // internal float sample rate used by oscillator/gate math
@@ -137,21 +141,61 @@ struct avas_type_ty_synth_s
     float env_di[AVAS_TYPE_TY_L1_CLUSTERS];
     float env_dq[AVAS_TYPE_TY_L1_CLUSTERS];
 
-    uint16_t dec_count;  // samples left before the next envelope rebuild
+    /* Envelope rebuild schedule, STAGGERED across the AVAS_TYPE_TY_DEC period.
+     *
+     * The clusters are mutually independent (env_*, car_*, bb_phase are all per
+     * cluster), so each one can keep its rebuild period of exactly
+     * AVAS_TYPE_TY_DEC samples while STARTING at a different phase.  Rebuilding
+     * all of them on the same sample -- what this engine did until 2026-08-29 --
+     * puts all AVAS_TYPE_TY_L1_TABLE_LINES baseband oscillators into ONE block
+     * ISR, which only fits where the block is as long as the decimation period.
+     * It is on AK512 (APP_BLOCK_FRAMES = 32 = D); it is NOT on AK128 Classic
+     * (APP_BLOCK_FRAMES = 4), where the measured miss rate was 1 block in 8 --
+     * DEC/APP_BLOCK_FRAMES exactly -- each overrunning its 83.3 us deadline by
+     * 2.2x, and the output was audibly gritty even though the AVERAGE load was
+     * only 70.8 % -- an average that cannot show a burst this short.  See
+     * [internal] avas_type_ty_ak128_block_burst_2026-08-29.md.
+     *
+     * dec_phase counts 0..D-1 over the shared period and cluster k is rebuilt at
+     * phase avas_type_ty_cluster_slot(k).  next_k / next_slot are that schedule
+     * walked forwards, so no per-cluster countdown is needed and the per-sample
+     * test stays one compare. */
+    uint16_t dec_phase;   // 0 .. AVAS_TYPE_TY_DEC-1, phase of the shared period
+    uint16_t next_slot;   // dec_phase at which cluster next_k is rebuilt
+    uint8_t  next_k;      // cluster due next
 
     /* Pitch trim.  pitch_ratio is what the step tables currently hold;
      * pitch_ratio_req is written by the caller's context (main loop) and picked
-     * up by the render context at the next envelope rebuild, so the tables are
-     * never rewritten while a sample is being computed from them.  Latency is
-     * at most AVAS_TYPE_TY_DEC samples (0.67 ms at 48 kHz / D = 32).
+     * up by the render context at each cluster's own envelope rebuild, so the
+     * tables are never rewritten while a sample is being computed from them.
      *
      * The flag is cleared BEFORE the request is read, and applying a ratio is
      * idempotent, so a request landing inside the handshake is either seen now
      * or seen at the next rebuild -- it cannot be lost, and re-applying the same
-     * value changes nothing. */
+     * value changes nothing.  Only single stores are used on either side: the
+     * render context must NEVER read-modify-write a field the caller writes, or a
+     * request landing between its read and its write is silently dropped. */
     float pitch_ratio;
     float pitch_ratio_req;
     volatile uint8_t pitch_req_pending;
+
+    /* The request as the render context is applying it: PRIVATE to that context,
+     * never touched by the caller, which is what keeps the read-modify-write on
+     * the mask race-free.
+     *
+     * Because the rebuilds are staggered (see dec_phase) a ratio cannot be handed
+     * over on one sample any more.  Taking the flag latches the ratio here and
+     * arms one bit per cluster; cluster k applies the steps at ITS OWN rebuild and
+     * clears its bit, and pitch_ratio follows once the last bit clears.  So the
+     * trim reaches all AVAS_TYPE_TY_L1_TABLE_LINES lines within one
+     * AVAS_TYPE_TY_DEC period (0.67 ms at 48 kHz / D = 32) rather than instantly
+     * -- inaudible, and it is what keeps every cluster internally consistent: a
+     * cluster's carrier step and its lines' baseband steps always come from the
+     * same ratio.  Latching the VALUE matters as much as the mask: a second POT
+     * move mid-hand-over would otherwise leave some clusters on the first ratio
+     * and the rest on the second. */
+    uint16_t pitch_apply_mask;
+    float    pitch_ratio_apply;
 
     /* Same request, but "apply only once nothing is being rendered".  Stopping
      * the engine resets the trim (a session must not inherit the previous one's

@@ -122,8 +122,7 @@ struct nora_spi_i2s_tdm_inst_s {
     // channel on EVERY start/restart and the channel config carries a priority: with a constant
     // there, a whole-transport restart silently reverted the rate-monotonic map that the caller
     // had just applied (measured 2026-08-26 -- a leg-A rate change came out symmetric while a
-    // leg-B fast rate change, which does not re-arm, kept the asymmetry; see [internal]
-    // [internal] report_ak512_16ch_mixed_rate_margin_cause_2026-08-24.md section 23).
+    // leg-B fast rate change, which does not re-arm, kept the asymmetry).
     uint8_t        irq_priority;
     // CPU-load-profiler owner id for THIS leg's RX-block ISR (NORA_CPU_LOAD_OWNER_LEG_A/_B, or
     // _OTHER for a leg the profiler does not track separately). Held per leg rather than derived
@@ -2104,13 +2103,13 @@ bool nora_spi_i2s_tdm_get_status( nora_spi_i2s_tdm_status_t* status, bool clear_
  * `context` banks W0-W7 only (DS70005591D: seven alternate W0-W7 arrays plus AccA/AccB/
  * RCOUNT and the DSP CORCON bits, each inherently tied to an IPL).  W8-W14 are NOT banked,
  * so when the always_inline tdm_rx_block body needs W8 the compiler must save it -- and it
- * emitted `mov.l w8,[w15++]` as the vector's VERY FIRST instruction.  Measured on the
- * shipping AK512 ASRC BiDir image 2026-08-27: __DMA0Interrupt and __DMA2Interrupt each
+ * emitted `mov.l w8,[w15++]` as the vector's VERY FIRST instruction.  Measured on an
+ * AK512 bidirectional ASRC configuration: __DMA0Interrupt and __DMA2Interrupt each
  * carried 2 such pushes at +0, the only live ISRs besides __QEI2Interrupt (a deliberate
  * trap-reproduction harness) and __DefaultInterrupt that still did.
  *
  * That is the exact shape the A1 silicon STACK ERROR keys on -- see the DO-NOT-REVERT note
- * above _CCP1Interrupt in src/app/apps/asrc/asrc_clock_control.c, where a controlled A/B
+ * in the application-level ASRC clock control, where a controlled A/B
  * showed 6 prologue pushes trapping at stress cycle 16 and zero pushes surviving 70.
  * `context` cannot remove these ones: the registers really are outside the bank.
  *
@@ -2146,8 +2145,8 @@ bool nora_spi_i2s_tdm_get_status( nora_spi_i2s_tdm_status_t* status, bool clear_
  * revision is a RUNTIME fact (app_silicon.c prints it in the boot banner), so this cannot
  * key off it automatically; it is a deliberate build choice.
  *
- * Rationale and measurements: [internal] isr_w15_audit_2026-08-27.md and the
- * DO-NOT-REVERT note above _CCP1Interrupt in src/app/apps/asrc/asrc_clock_control.c.
+ * Rationale and measurements: the ISR W15 prologue-push audit, and the DO-NOT-REVERT
+ * note in the application-level ASRC clock control.
  */
 #ifndef APP_A1_ISR_STACK_WORKAROUND
 #define APP_A1_ISR_STACK_WORKAROUND (1)

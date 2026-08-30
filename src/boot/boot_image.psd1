@@ -95,22 +95,27 @@
     # header at worst. The build script resolves THIS pack and asserts the part's own
     # header is in it.
     #
-    # DfpPackVersion pins WHICH version of that pack, and it is not a preference --
-    # newest-installed is actively wrong on both parts, for two unrelated reasons:
+    # DfpPackVersion pins WHICH version of that pack. It is a floor, not a ceiling:
+    # raise it when a newer pack is verified to build the image, and say what was
+    # verified. Both pins were raised on 2026-08-29 (see below); the reason they had
+    # to be held back until then is worth keeping, because the same shape will recur:
     #
-    #   MC 1.5.263 and later removed PLL1CON.OE / PLL2CON.OE, so
-    #     src/boot/hal_clock/nora_clock_dspic33ak_reg.c stops compiling
-    #     ("has no member named 'OE'").
-    #   MP 1.5.269 no longer accepts NOBTSWP = OFF, so the #pragma config in
-    #     src/boot/resident_de_boot_main.c is rejected ("unknown value").
+    #   MC 1.5.263 and later removed PLL1CON.OE / PLL2CON.OE, which
+    #     src/boot/hal_clock/nora_clock_dspic33ak_reg.c used to write
+    #     ("has no member named 'OE'"). That write is gone now: PLLxCON has no OE
+    #     bit in the data sheet either -- the DFP had copied the CLKGEN CON template
+    #     -- so removing it was a correction, not an accommodation.
+    #   MP 1.4.260 renamed the NOBTSWP values ON/OFF to BTSWP_ENABLED/BTSWP_DISABLED,
+    #     so the #pragma config in src/boot/resident_de_boot_main.c and src/app/main.c
+    #     was rejected ("unknown value"). Both now spell BTSWP_DISABLED; the fuse bit
+    #     is unchanged.
     #
-    # Both failures read as defects in this repository and are not, and both appear
+    # Both failures read as defects in this repository and were not, and both appeared
     # only in a fresh clone -- a clone with an existing dist/ never rebuilds the boot
-    # image and so never sees them. Pinning here rather than in the build script
+    # image and so never saw them. Pinning here rather than in the build script
     # keeps it with the other per-device facts, and next to the reason.
     #
-    # These are floors, not ceilings: raise a pin when a newer pack is verified to
-    # build the image, and say what was verified.
+    # Full analysis: [internal] report_dfp_pack_change_2026-08-29.md
     Devices = @{
         '33AK512MPS512' = @{
             ConfigurationName = 'dsPIC33AK512_RESIDENT_BOOT'
@@ -121,8 +126,11 @@
             }
             SizeCapBytes = 0x8000
             DfpPack      = 'dsPIC33AK-MP_DFP'
-            # 1.5.269 rejects NOBTSWP = OFF; 1.3.185 builds and has p33AK512MPS512.h.
-            DfpPackVersion = '1.3.185'
+            # Raised 1.3.185 -> 1.5.269 on 2026-08-29 after the NOBTSWP value rename was
+            # taken up in src/app/main.c and src/boot/resident_de_boot_main.c. Verified:
+            # -Full clean build of the resident boot image and the delivery application,
+            # then on-target boot + TDM audio.
+            DfpPackVersion = '1.5.269'
         }
         '33AK128MC106' = @{
             ConfigurationName = 'dsPIC33AK128_RESIDENT_BOOT'
@@ -145,8 +153,11 @@
             }
             SizeCapBytes = 0x4000
             DfpPack      = 'dsPIC33AK-MC_DFP'
-            # 1.5.263+ removed PLL1CON.OE; 1.4.172 is the newest that still builds.
-            DfpPackVersion = '1.4.172'
+            # Raised 1.4.172 -> 1.6.272 on 2026-08-29 after the PLLxCON.OE writes were
+            # removed (the bit does not exist; see the note above). Verified: -Full clean
+            # build of the resident boot image and the delivery application, then
+            # on-target boot + TDM audio.
+            DfpPackVersion = '1.6.272'
         }
     }
 

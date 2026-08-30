@@ -607,7 +607,7 @@ void audio_app_meas_dump( void )
 // feed-forward ratio (perB/perA = FsA/FsB). OBSERVER ONLY -- never feeds the applied step.
 //   T1CK <- RP75 = BCLK-A (codec-A master, /RE10, shared with SPI1 SCK input)
 //   T3CK <- RP90 = BCLK-B (dsPIC-B master, /RF9, shared with SPI2 SCK output)
-// External SYNCHRONOUS count (TCS=1, TECS=0 -> TxCK pin, TSYNC=1, 1:1). Peripheral clock = FCY =
+// External SYNCHRONOUS count (TCS=1 -> TxCK pin, TSYNC=1, 1:1). Peripheral clock = FCY =
 // 100 MHz >> BCLK ~11-12 MHz (~8x margin), so synchronous mode is valid; T01 confirms empirically.
 #if APP_MEAS_Q11_BCLK_OBSERVER
 #define Q11_BCLK_A_RP   (75u)   // BCLK-A -> T1CK
@@ -633,14 +633,12 @@ static void q11_bclk_observer_init( void )
     // Timer1 = BCLK-A counter
     T1CON = 0u; T1CONbits.ON = 0;
     T1CONbits.TCS   = 1;                 // external clock
-    T1CONbits.TECS  = 0;                 // external source = T1CK pin (only option)
     T1CONbits.TSYNC = 1;                 // synchronous external count
     T1CONbits.TCKPS = 0;                 // 1:1
     TMR1 = 0u; PR1 = 0xFFFFFFFFu;
     // Timer3 = BCLK-B counter
     T3CON = 0u; T3CONbits.ON = 0;
     T3CONbits.TCS   = 1;
-    T3CONbits.TECS  = 0;
     T3CONbits.TSYNC = 1;
     T3CONbits.TCKPS = 0;
     TMR3 = 0u; PR3 = 0xFFFFFFFFu;
@@ -662,9 +660,9 @@ void audio_app_meas_q11_isolate( uint8_t mode )
     nora_pps_lock();
     if( mode >= 2u )
     {
-        T1CON = 0u; T1CONbits.TCS = 1; T1CONbits.TECS = 0; T1CONbits.TSYNC = 1; T1CONbits.TCKPS = 0;
+        T1CON = 0u; T1CONbits.TCS = 1; T1CONbits.TSYNC = 1; T1CONbits.TCKPS = 0;
         TMR1 = 0u; PR1 = 0xFFFFFFFFu;
-        T3CON = 0u; T3CONbits.TCS = 1; T3CONbits.TECS = 0; T3CONbits.TSYNC = 1; T3CONbits.TCKPS = 0;
+        T3CON = 0u; T3CONbits.TCS = 1; T3CONbits.TSYNC = 1; T3CONbits.TCKPS = 0;
         TMR3 = 0u; PR3 = 0xFFFFFFFFu;
         T1CONbits.ON = 1; T3CONbits.ON = 1;
     }

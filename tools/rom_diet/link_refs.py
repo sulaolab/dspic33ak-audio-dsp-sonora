@@ -36,11 +36,54 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# tools/ is two levels up from tools/rom_diet/ and is not a package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import dfp_packs  # noqa: E402
+
 PROG = 0x800000
-DFP = os.environ.get(
-    "AK_DFP",
-    str(Path.home() / ".mchp_packs/Microchip/dsPIC33AK-MC_DFP/1.4.172/xc16"),
-)
+# The device pack objdump needs is NOT a constant here any more. It used to
+# default to MC_DFP/1.4.172 -- the AK128 pack -- so pointing this tool at an
+# AK512 build did not degrade, it produced nothing usable ("can't disassemble
+# for architecture UNKNOWN!") and looked like a broken tool. The version was
+# also a third copy of a number the application project already pins.
+#
+# Resolved instead from the object file being read: tools/dfp_packs reads the
+# device out of the object's own -mcpu= record and then the pack the application
+# project pins for that device. AK_DFP still wins if set (an explicit .../xc16
+# directory), and DSPIC33AK_DFP relocates the pack root, as everywhere else.
+_DFP_OVERRIDE = os.environ.get("AK_DFP")
+_DFP_CACHE = None
+# Set by main() from its `map` argument, before any object is dumped.
+_MAP_PATH = None
+
+
+def _dfp_for(obj: Path) -> str:
+    """-> the `.../xc16` to pass as -mdfp= for `obj`, resolved once per run.
+
+    Once, not per object: every object in a build directory is the same device.
+
+    The device comes from the LINK MAP, not from the object: the map is an
+    argument this tool always has, while the object only carries a -mcpu= record
+    when the build emitted debug info -- the resident boot image does not, so
+    reading the object would work on the application and fail on the boot image.
+    The object is still the fallback, for a map too old or odd to name a part.
+    """
+    global _DFP_CACHE
+    if _DFP_CACHE is not None:
+        return _DFP_CACHE
+    if _DFP_OVERRIDE:
+        _DFP_CACHE = _DFP_OVERRIDE.replace("\\", "/")
+        return _DFP_CACHE
+    try:
+        device = dfp_packs.device_of_map(_MAP_PATH) if _MAP_PATH else None
+    except dfp_packs.DfpResolutionError:
+        device = None
+    if device is None:
+        device = dfp_packs.device_of(obj)
+    _DFP_CACHE = dfp_packs.resolve_dfp(device)
+    return _DFP_CACHE
+
+
 OBJDUMP = os.environ.get(
     "AK_OBJDUMP",
     r"C:/Program Files/Microchip/xc-dsc/v3.31.01/bin/xc-dsc-objdump.exe",
@@ -87,7 +130,7 @@ SYMROW = re.compile(r"^[0-9a-f]{8}\s+(\S+)\s*\S*\s+(\S+)\t[0-9a-f]{8}\s+(\S+)\s*
 
 def dump(obj: Path) -> str:
     return subprocess.run(
-        [OBJDUMP, f"-mdfp={DFP}", "-t", "-r", str(obj)],
+        [OBJDUMP, f"-mdfp={_dfp_for(obj)}", "-t", "-r", str(obj)],
         capture_output=True, text=True,
     ).stdout
 
@@ -135,6 +178,10 @@ def main() -> None:
                          "brought up and nothing can ever use it")
     ap.add_argument("--min", type=int, default=48)
     args = ap.parse_args()
+
+    # Before anything dumps an object: _dfp_for() reads the device out of this map.
+    global _MAP_PATH
+    _MAP_PATH = args.map
 
     live: dict[str, int] = {}
     owner: dict[str, str] = {}

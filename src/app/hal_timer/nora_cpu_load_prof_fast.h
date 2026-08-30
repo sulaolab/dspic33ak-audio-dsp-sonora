@@ -34,7 +34,8 @@
 //
 // dsPIC33AK512MPS512 rev A1 traps STACK ERROR on the `mov.l wN,[w15++]` register pushes a
 // compiler emits at the top of an interrupt handler (localised 2026-08-26 by controlled A/B;
-// see the long note above _CCP1Interrupt in asrc_clock_control.c -- DO NOT REVERT the
+// see the long note above _CCP1Interrupt in the application-level ASRC clock control -- DO NOT
+// REVERT the
 // `__attribute__((interrupt, context))` there). Those vectors are push-free only because they
 // are LEAF handlers living entirely in the hardware-banked W0-W7.
 //

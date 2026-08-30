@@ -25,6 +25,7 @@
 #include "clickclack_synth.h"
 #include "kinkon_synth.h"
 #include "pinger_synth.h"
+#include "engine_select.h"    // app_engine_synth_enable/is_enable (SW2 long press)
 
 #include "classic_controls.h"
 
@@ -252,6 +253,28 @@ void UsrOperate_pinger( void )
 #endif //defined(ENA_PINGER_SOUND)
 }
 
+/* Engine synth on/off. Bound to SW2 (treble) LONG press; SW2 short press keeps
+ * running the treble control, because BUTTON_EVENT_LONG_PRESS_REACHED fires once
+ * while the button is still down and suppresses the RELEASED event.
+ *
+ * The POT used to do this by threshold, which meant POT 0 % was OFF -- so the
+ * knob could not ask for the idle, the one speed the model is judged at. Now the
+ * POT is the throttle over its whole travel and this is the switch.
+ *
+ * No local `static uint8_t enabled` (the UsrOperate_pinger house style) on
+ * purpose: the AVAS hand-over in classic_demo_app.c also calls enable(false), so
+ * a local mirror would go stale and the next long press would be a no-op. The
+ * module's own state is the only state. */
+void UsrOperate_engine_synth( void )
+{
+#if defined(ENA_ENGINE_SYNTH)
+    bool enable = !app_engine_synth_is_enable();
+
+    printf(" Engine Synth: %s\n", enable ? "enable." : "disable.");
+    app_engine_synth_enable(enable);
+#endif //defined(ENA_ENGINE_SYNTH)
+}
+
 
 /* The two AVAS sources are STRICTLY exclusive at run time: TYPE_TY alone costs
  * 45.8 % of the block window on hardware, so letting both render would risk the
@@ -328,11 +351,12 @@ void UsrOperate_avas_synth( void )   /* TYPE_TY */
  * that is currently switched on, and each engine keeps its own trim value and
  * its own clamp.
  *
- * The POT is not free.  Above ENG_SYNTH_POT_ACTIVE_VAL it enables the engine
- * synth, and the engine synth and AVAS are exclusive in fx_domain_48k (their
- * loads would add up), so a knob sweep would otherwise silence AVAS and start
- * the engine sound instead -- and every usable pitch position is above that
- * threshold.  Ownership is therefore decided at run time: classic_demo_app.c
+ * The POT is not free.  While the engine synth is the sounding engine the same
+ * knob is its throttle (rest = the 900 rpm idle, full travel = maximum rpm), and
+ * the engine synth and AVAS are exclusive in fx_domain_48k (their loads would
+ * add up).  Turning the knob no longer switches the engine synth on -- that is
+ * SW2's long press, UsrOperate_engine_synth() -- so a pitch sweep cannot silence
+ * AVAS by itself.  Ownership is still decided at run time: classic_demo_app.c
  * refuses to enable the engine synth while either AVAS engine is active, and
  * this sampler only runs while one of them is switched on.
  *
@@ -812,7 +836,7 @@ static void local_button_handler( void )
         break;
 //    case BUTTON_EVENT_LONG_PRESSED:
     case BUTTON_EVENT_LONG_PRESS_REACHED:
-        printf(" TOUCH(%d): Long press.\n", 0);
+        printf(" SW%d: Long press.\n", 1);
         snd_effect_play_se(SE_TONE_NOTIF);
         /* The only button route into AVAS.  Each start alternates
          * TYPE_TY -> Type_LB -> TYPE_TY; see UsrOperate_avas_synth_button(). */
@@ -834,8 +858,10 @@ static void local_button_handler( void )
         break;
 //    case BUTTON_EVENT_LONG_PRESSED:
     case BUTTON_EVENT_LONG_PRESS_REACHED:
-        printf(" TOUCH(%d): Long press.\n", 1);
+        printf(" SW%d: Long press.\n", 2);
         snd_effect_play_se(SE_TONE_NOTIF);
+        /* The only button route to the engine synth. */
+        UsrOperate_engine_synth();
         break;
     default:
         break;
@@ -851,7 +877,7 @@ static void local_button_handler( void )
         break;
 //    case BUTTON_EVENT_LONG_PRESSED:
     case BUTTON_EVENT_LONG_PRESS_REACHED:
-        printf(" TOUCH(%d): Long press.\n", 2);
+        printf(" SW%d: Long press.\n", 3);
         snd_effect_play_se(SE_TONE_NOTIF);
         /* No AVAS here any more: the Mute button long press is the single button
          * route into AVAS (TYPE_TY). */
@@ -885,7 +911,7 @@ static void local_touch_handler( void )
         break;
 //    case BUTTON_EVENT_LONG_PRESSED:
     case BUTTON_EVENT_LONG_PRESS_REACHED:
-        printf(" TOUCH(%d): Long press.\n", 0);
+        printf(" TOUCH(%d): Long press.\n", 1);
         UsrOperate_clickclack_toggle();
         break;
     default:
@@ -898,7 +924,7 @@ static void local_touch_handler( void )
         break;
 //    case BUTTON_EVENT_LONG_PRESSED:
     case BUTTON_EVENT_LONG_PRESS_REACHED:
-        printf(" TOUCH(%d): Long press.\n", 1);
+        printf(" TOUCH(%d): Long press.\n", 2);
         snd_effect_play_se(SE_TONE_NOTIF);
         UsrOperate_pinger();
         break;
@@ -912,7 +938,7 @@ static void local_touch_handler( void )
         break;
 //    case BUTTON_EVENT_LONG_PRESSED:
     case BUTTON_EVENT_LONG_PRESS_REACHED:
-        printf(" TOUCH(%d): Long press.\n", 2);
+        printf(" TOUCH(%d): Long press.\n", 3);
         snd_effect_play_se(SE_TONE_NOTIF);
         UsrOperate_kinkon();
         break;

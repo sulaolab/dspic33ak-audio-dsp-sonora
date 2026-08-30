@@ -10,7 +10,7 @@ each port provides the backend-specific channel inventory, trigger mapping,
 addressing rules, and register access implementation.
 
 The current NORA DMA consumers are the SPI/I2S/TDM transport and the Classic
-app's PWM audio-DAC output (`apps/classic/classic_audio_pwm.c`, DMA4-7 via the
+app's PWM audio-DAC output (DMA4-7 via the
 `NORA_DMA_TRIGGER_PWM_GEN5..8` triggers). Both configure through
 `nora_dma_channel_config()`; ping-pong half-tracking and the DMA ISR vectors
 stay in each consumer (see the design-boundaries note in `nora_dma.h`).

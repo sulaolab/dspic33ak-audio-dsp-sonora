@@ -167,8 +167,7 @@ typedef enum {
 //       elements, so one sample IS one DMA element and there is nothing to pack.
 //   CK: struct { uint16_t wire[2]; }. The DMA element there is a 16-bit wire word; the
 //       struct is what keeps that visible. Hiding it behind an int32_t buffer is how a
-//       half-swap defect stayed hidden once already ([internal]
-//       ck_silicon_findings.md defect 7, from the dsPIC33CK lab tree).
+//       half-swap defect stayed hidden once already (observed on the dsPIC33CK backend).
 //
 // This is the DMA contract's typed-value rule (nora_dma_status_t) applied one level up: the
 // TYPE is shared, the LAYOUT is not, and a consumer touches the value only through the
@@ -622,7 +621,7 @@ extern nora_spi_i2s_tdm_clock_event_t nora_spi_i2s_tdm_consume_clock_event( void
 // legs CAN nest, so anything shared between two leg callbacks has to be safe against that --
 // on this core W0-W7/AccA/AccB/RCOUNT/CORCON are banked per IPL and so are F0-F7, but the
 // modulo-addressing registers are not, and neither is application state.
-// [internal] report_ak512_16ch_mixed_rate_margin_cause_2026-08-24.md sections 14 and 15.
+// Validated on an AK512 16-channel mixed-rate configuration.
 //
 // Returns false and changes nothing on a bad instance, or if the base priority leaves no
 // room below it.

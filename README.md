@@ -101,7 +101,7 @@ Three facts worth knowing before you debug silence:
 | --- | --- |
 | MPLAB X IDE | Any release that supports the XC-DSC toolchain (IDE is optional; see below) |
 | XC-DSC compiler | 3.31.01 |
-| Device pack | `dsPIC33AK-MP_DFP` 1.3.185 |
+| Device pack | `dsPIC33AK-MP_DFP` 1.5.269 |
 | PowerShell | 7 (`pwsh`) — the build scripts are PowerShell |
 | Python | 3.11+ — required by `build.ps1` to produce the delivery artifacts (`SERIAL_UPDATE_PACKAGE` / `FACTORY_IMAGE`), and used by the host-side analysis tools under `tools/` |
 

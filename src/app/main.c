@@ -139,7 +139,9 @@ enum
 // settings outright, so they are AK512-only.
 #if defined(__dsPIC33AK512MPS512__)
 #pragma config BTMODE  = SINGLE         // Device Boot Mode: Single Boot
-#pragma config NOBTSWP = OFF            // BOOTSWP is not used in single-panel mode
+// NOBTSWP's value names were renamed in dsPIC33AK-MP_DFP 1.4.260 (ON/OFF ->
+// BTSWP_ENABLED/BTSWP_DISABLED). The fuse bit is unchanged: bit15 = 1.
+#pragma config NOBTSWP = BTSWP_DISABLED // BOOTSWP is not used in single-panel mode
 #endif
 
 

@@ -402,10 +402,12 @@ foreach ($conf in $confNodes) {
 # Only delivery configurations are compared. A standalone configuration ships without
 # a resident boot image, so there is no second half for it to disagree with.
 #
-# The pins are deliberate, and both of them exist because newest-installed is wrong:
-# MC 1.5.263+ removed PLL1CON.OE, MP 1.5.269 stopped accepting NOBTSWP = OFF. So this
-# check never prefers the newer pack -- it only insists the two halves name the same
-# one. Raising a pin is a deliberate edit to boot_image.psd1 AND to the IDE project.
+# The pins are deliberate. This check never prefers the newer pack -- it only insists
+# the two halves name the same one. Raising a pin is a deliberate edit to
+# boot_image.psd1 AND to the IDE project; both were raised to the newest installed
+# pack on 2026-08-29 (MP 1.5.269, MC 1.6.272) once the two things that had held them
+# back were taken up in the sources: the PLLxCON.OE writes (a bit that does not exist)
+# and the NOBTSWP value rename.
 . (Join-Path $PSScriptRoot 'boot_image.ps1')
 $bootManifest = Get-BootImageManifest -RepoRoot $repoRoot
 $dfpMismatches = [System.Collections.Generic.List[object]]::new()
@@ -506,13 +508,13 @@ function Write-DfpMismatchExplanation {
     Write-Host '       edit src/boot/boot_image.psd1 and set DfpPackVersion for this device to'
     Write-Host '       the version you chose, then rebuild the resident boot image with'
     Write-Host '       buildtools/build_resident_bootloader.ps1 -Full.'
-    Write-Host '       Expect real work, not just an edit: the newer packs of both families'
-    Write-Host '       break this image for unrelated reasons --'
+    Write-Host '       Expect real work, not just an edit. Two examples already met, both'
+    Write-Host '       taken up in the sources on 2026-08-29 --'
     Write-Host '         dsPIC33AK-MC_DFP 1.5.263+ removed PLL1CON.OE / PLL2CON.OE, which'
-    Write-Host '           src/boot/hal_clock/nora_clock_dspic33ak_reg.c writes;'
-    Write-Host '         dsPIC33AK-MP_DFP 1.5.269 renamed the NOBTSWP values ON/OFF to'
-    Write-Host '           BTSWP_ENABLED/BTSWP_DISABLED, so the #pragma config in'
-    Write-Host '           src/boot/resident_de_boot_main.c is rejected.'
+    Write-Host '           src/boot/hal_clock/nora_clock_dspic33ak_reg.c used to write;'
+    Write-Host '         dsPIC33AK-MP_DFP 1.4.260+ renamed the NOBTSWP values ON/OFF to'
+    Write-Host '           BTSWP_ENABLED/BTSWP_DISABLED, which src/boot/resident_de_boot_main.c'
+    Write-Host '           and src/app/main.c now spell.'
     Write-Host '  b) You did NOT intend to change it -- MPLAB X can rewrite configurations.xml'
     Write-Host '     on its own whenever the IDE touches the project:'
     Write-Host '       in MPLAB X, right-click the project -> Properties -> Packs, and select the'

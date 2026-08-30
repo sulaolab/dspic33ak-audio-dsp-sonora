@@ -60,7 +60,8 @@ static void prof_clear_stats( void )
 // They live here, out of line, on purpose: an inlined hook needs more than the eight
 // hardware-banked working registers, which puts register pushes back into the prologue of every
 // `context` interrupt handler that calls it -- and on this part those pushes trap (see the header
-// note, and the DO-NOT-REVERT note above _CCP1Interrupt in asrc_clock_control.c). Called, the
+// note, and the DO-NOT-REVERT note above _CCP1Interrupt in the application-level ASRC clock
+// control). Called, the
 // register traffic happens in this function's own frame, where it is ordinary.
 //
 // Cost is a call, a masked timer read, and the arithmetic for one segment: tens of cycles, no

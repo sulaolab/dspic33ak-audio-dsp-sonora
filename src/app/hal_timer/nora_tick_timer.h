@@ -72,8 +72,7 @@ typedef enum {
      *
      * There is NO CLKGEN in Timer1's own path -- route 1 works by moving the system
      * clock, not by aiming a generator at the timer. (Claiming otherwise was a wrong
-     * answer given once during this investigation; see
-     * [internal] nora_tick_timer_ck_ak_parity_2026-08-11.md section 3.)
+     * answer given once during this investigation.)
      */
     NORA_TICK_TIMER_ERR_NOT_SUPPORTED
 } nora_tick_timer_status_t;

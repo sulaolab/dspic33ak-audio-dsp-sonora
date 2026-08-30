@@ -42,8 +42,11 @@
  *     Z(t) = sum_j A_j e^{i (2 pi (f_j - fc) t + p_j)}
  *
  * Z is band-limited to the cluster half-span (<= 100 Hz), so it does NOT need
- * to be evaluated at 48 kHz.  It is rebuilt every AVAS_TYPE_TY_DEC samples and
- * linearly interpolated in between; only the 11 carriers run at full rate.
+ * to be evaluated at 48 kHz.  Each cluster's Z is rebuilt every AVAS_TYPE_TY_DEC
+ * samples and linearly interpolated in between; only the 11 carriers run at full
+ * rate.  The rebuilds are STAGGERED: cluster k rebuilds at its own phase within
+ * the shared decimation period, so the per-sample cost is nearly flat instead of
+ * arriving as one burst every D-th sample (see WHY THE REBUILDS ARE STAGGERED).
  * Cost drops from 185 full-rate oscillators to 11 carriers plus 185/32
  * baseband oscillators per sample -- about 1/7, with the same output.
  *
@@ -51,7 +54,7 @@
  *   - The rebuild evaluates the envelope ONE BLOCK AHEAD and interpolates
  *     towards it.  Interpolating towards a value already reached delays the
  *     envelope by a whole block, and that delay alone drops accuracy from
- *     48.0 dB to 15.3 dB below signal.  See avas_type_ty_rebuild_envelope().
+ *     48.0 dB to 15.3 dB below signal.  See avas_type_ty_rebuild_cluster().
  *   - The carrier frequency is the cluster's AMPLITUDE-WEIGHTED centroid, not
  *     its geometric middle, so the strongest lines get the smallest baseband
  *     offset and therefore the smallest interpolation error.  Set by the
@@ -72,7 +75,43 @@
  *
  * RAM is 2 floats per line (baseband phase + step) plus 6 floats per cluster.
  * Amplitudes stay in flash; the uniform gains are applied once to the summed
- * output.  The rebuild burst lands inside one 32-sample block ISR.
+ * output.
+ *
+ * WHY THE REBUILDS ARE STAGGERED  (2026-08-29, AK128 Classic)
+ * ----------------------------------------------------------
+ * Rebuilding all 11 clusters on the same sample puts all 185 baseband
+ * oscillators inside ONE block ISR.  That is only affordable where the block is
+ * as long as the decimation period.  It is on AK512 (APP_BLOCK_FRAMES = 32 = D,
+ * 666.6 us window); it is NOT on AK128 Classic (APP_BLOCK_FRAMES = 4, 83.3 us),
+ * where the measured miss rate was EXACTLY 1 block in 8 = D/APP_BLOCK_FRAMES
+ * (13,275 misses in 106,194 blocks = 0.125000), each of those blocks taking
+ * 180.3 us against an 83.3 us deadline.  It was heard as a 6 kHz train of
+ * dropouts.  The load line read 70.8 %, i.e. inside budget, and that is exactly
+ * why it was not believed: a missed block is a HALF+DONE conflict, so one service
+ * pass in eight never ran and the average was measured over a system doing
+ * seven-eighths of the work.  With the stagger in place and nothing else changed,
+ * the same image measures 84.7 % and miss = 0.
+ *
+ * The clusters are mutually independent, so each one keeps a rebuild period of
+ * exactly D samples while starting at a different phase; accuracy is therefore
+ * unchanged (the interpolation interval is what sets it, and that is still D).
+ * The stagger is spaced by CUMULATIVE LINE COUNT, not by cluster index -- the
+ * clusters hold 25,27,27,19,13,19,28,10,9,6,2 lines, so spacing by index would
+ * put clusters 0 and 1 (52 lines between them) in the same 4-frame block, where
+ * balancing by line count caps the worst block at 32.  See
+ * avas_type_ty_cluster_slot(), and
+ * [internal] avas_type_ty_ak128_block_burst_2026-08-29.md.
+ *
+ * AK128 Classic then moved to APP_BLOCK_FRAMES = 32 as well, so the stagger is no
+ * longer what stands between this engine and a missed block there.  It stays
+ * because it is what makes the engine independent of the block length at all --
+ * and because it is worth 8.8 us of peak on a 4-frame block, which is more than
+ * that configuration had left.
+ *
+ * AVAS_TYPE_TY_DEC is NOT a lever against this: the burst is 185 lines whatever
+ * D is, so lowering D only makes it more frequent (D = APP_BLOCK_FRAMES means
+ * every block) and raising it leaves the same burst in 1 block out of
+ * D/APP_BLOCK_FRAMES.
  *
  * KNOWN APPROXIMATIONS vs THE EXACT MODEL
  * ---------------------------------------
@@ -140,6 +179,11 @@
 /* ratio = expf(cent * ln2/1200) */
 #define AVAS_TYPE_TY_CENT_TO_LN        (0.00057762265f)
 
+/* Every cluster still owes a step-table rewrite.  One bit per cluster because the
+ * rebuilds are staggered: see pitch_apply_mask in the header. */
+#define AVAS_TYPE_TY_PITCH_APPLY_ALL \
+    ((uint16_t)((1u << AVAS_TYPE_TY_L1_CLUSTERS) - 1u))
+
 
 //===========================================================
 // Local Function
@@ -186,27 +230,52 @@ static inline bool avas_type_ty_is_fully_gated_off(const avas_type_ty_synth_t *s
  * it twice with the same r is a no-op and no base copy of the tables is kept in
  * RAM.  Cost is AVAS_TYPE_TY_L1_CLUSTERS + AVAS_TYPE_TY_L1_TABLE_LINES multiply-divides,
  * once per accepted key press. */
-static void avas_type_ty_set_steps(avas_type_ty_synth_t *s, float ratio)
+static void avas_type_ty_set_cluster_steps(avas_type_ty_synth_t *s, uint16_t k,
+                                           float ratio)
 {
     const float w = (2.0f * F_M_PI * ratio) / s->fs;
+    const float carrier = s_type_ty_l1_cluster[k].carrier_hz;
+    const uint16_t first = s_type_ty_l1_cluster[k].first;
+    const uint16_t last  = (uint16_t)(first + s_type_ty_l1_cluster[k].count);
 
+    s->car_step[k] = w * carrier;
+
+    /* Baseband offsets are derived here rather than stored in flash. */
+    for (uint16_t i = first; i < last; i++)
+    {
+        s->bb_step[i] = w * (s_type_ty_l1_line[i].freq_hz - carrier)
+                          * (float)AVAS_TYPE_TY_DEC;
+    }
+}
+
+
+static void avas_type_ty_set_steps(avas_type_ty_synth_t *s, float ratio)
+{
     for (uint16_t k = 0; k < AVAS_TYPE_TY_L1_CLUSTERS; k++)
     {
-        const float carrier = s_type_ty_l1_cluster[k].carrier_hz;
-        const uint16_t first = s_type_ty_l1_cluster[k].first;
-        const uint16_t last  = (uint16_t)(first + s_type_ty_l1_cluster[k].count);
-
-        s->car_step[k] = w * carrier;
-
-        /* Baseband offsets are derived here rather than stored in flash. */
-        for (uint16_t i = first; i < last; i++)
-        {
-            s->bb_step[i] = w * (s_type_ty_l1_line[i].freq_hz - carrier)
-                              * (float)AVAS_TYPE_TY_DEC;
-        }
+        avas_type_ty_set_cluster_steps(s, k, ratio);
     }
 
     s->pitch_ratio = ratio;
+}
+
+
+/* Phase within the shared AVAS_TYPE_TY_DEC period at which cluster k rebuilds.
+ *
+ * Proportional to the CUMULATIVE line count, not to k: the clusters are of very
+ * different sizes, and spacing them by index lands the two largest in the same
+ * block on a short-block target.  s_type_ty_l1_cluster[k].first IS the cumulative
+ * count, so this is one table read and one divide -- paid once per cluster
+ * rebuild, never per sample.
+ *
+ * Monotone non-decreasing in k, and slot(0) is always 0 because first[0] is 0.
+ * Duplicates are possible only for a D smaller than the cluster count, which the
+ * caller's loop handles by rebuilding every cluster that shares the slot. */
+static inline uint16_t avas_type_ty_cluster_slot(uint16_t k)
+{
+    return (uint16_t)(((uint32_t)s_type_ty_l1_cluster[k].first
+                       * (uint32_t)AVAS_TYPE_TY_DEC)
+                      / (uint32_t)AVAS_TYPE_TY_L1_TABLE_LINES);
 }
 
 
@@ -257,32 +326,50 @@ static inline void avas_type_ty_eval_cluster(avas_type_ty_synth_t *s, uint16_t k
 }
 
 
-/* Rebuild the interpolation slopes for all clusters.
+/* Rebuild ONE cluster's interpolation slope, and hand its pitch trim over.
  *
- * Called once every AVAS_TYPE_TY_DEC samples.  env_i/env_q hold the envelope for the
- * sample that is about to be emitted; avas_type_ty_eval_cluster() returns the value
- * AVAS_TYPE_TY_DEC samples LATER (the baseband phase was left one step ahead by the
- * previous call), and the slope walks env_i/env_q onto it over exactly
- * AVAS_TYPE_TY_DEC per-sample increments -- so no explicit hand-over is needed.
+ * Called once every AVAS_TYPE_TY_DEC samples per cluster, at that cluster's own
+ * slot.  env_i/env_q hold the envelope for the sample that is about to be
+ * emitted; avas_type_ty_eval_cluster() returns the value AVAS_TYPE_TY_DEC samples
+ * LATER (the baseband phase was left one step ahead by the previous call), and
+ * the slope walks env_i/env_q onto it over exactly AVAS_TYPE_TY_DEC per-sample
+ * increments -- so no explicit hand-over is needed.
  *
  * Computing the target one block ahead is not a refinement, it is the whole
  * accuracy budget: interpolating from the previous target to the current one
  * delays the envelope by a block and measured only 15.3 dB below signal, versus
- * 48.0 dB this way. */
-static void avas_type_ty_rebuild_envelope(avas_type_ty_synth_t *s)
+ * 48.0 dB this way.
+ *
+ * The pitch hand-over sits here because a rebuild boundary is the only place a
+ * cluster's step tables may be rewritten: between two of its rebuilds its
+ * baseband phases are mid-flight against a slope computed from the OLD steps, so
+ * swapping the tables under them would put some of its lines at the new pitch
+ * and the rest at the old one.  Here the slope is about to be recomputed anyway.
+ * Clear the bit first, then read the request: a press landing between the two is
+ * seen at the next boundary instead of being dropped. */
+static void avas_type_ty_rebuild_cluster(avas_type_ty_synth_t *s, uint16_t k)
 {
     const float inv_dec = 1.0f / (float)AVAS_TYPE_TY_DEC;
+    float next_i;
+    float next_q;
 
-    for (uint16_t k = 0; k < AVAS_TYPE_TY_L1_CLUSTERS; k++)
+    if( s->pitch_apply_mask & (uint16_t)(1u << k) )
     {
-        float next_i;
-        float next_q;
+        s->pitch_apply_mask &= (uint16_t)~((uint16_t)(1u << k));
+        avas_type_ty_set_cluster_steps(s, k, s->pitch_ratio_apply);
 
-        avas_type_ty_eval_cluster(s, k, &next_i, &next_q);
-
-        s->env_di[k] = (next_i - s->env_i[k]) * inv_dec;
-        s->env_dq[k] = (next_q - s->env_q[k]) * inv_dec;
+        /* Only once every cluster has taken the new ratio do the tables as a
+         * whole hold it, which is what pitch_ratio reports. */
+        if( s->pitch_apply_mask == 0u )
+        {
+            s->pitch_ratio = s->pitch_ratio_apply;
+        }
     }
+
+    avas_type_ty_eval_cluster(s, k, &next_i, &next_q);
+
+    s->env_di[k] = (next_i - s->env_i[k]) * inv_dec;
+    s->env_dq[k] = (next_q - s->env_q[k]) * inv_dec;
 }
 
 
@@ -328,18 +415,50 @@ void avas_type_ty_synth_reset_phase(avas_type_ty_synth_t *s)
         s->bb_phase[i] = avas_type_ty_wrap_phase(s_type_ty_l1_line[i].phase_rad);
     }
 
-    /* Envelope at t = 0, which also leaves the baseband phases one decimated
-     * step ahead -- exactly what avas_type_ty_rebuild_envelope() expects to find. */
+    /* Envelope at cluster k's OWN slot, which also leaves its baseband phases one
+     * decimated step past that slot -- exactly what avas_type_ty_rebuild_cluster()
+     * expects to find at that slot.
+     *
+     * The pre-advance by slot/D of a step is what keeps the stagger free of a
+     * permanent envelope delay.  Priming every cluster at t = 0 instead would make
+     * cluster k's rebuild at sample slot(k) deliver Z(D) -- the value belonging to
+     * sample D -- so its whole envelope stream would run slot(k) samples late for
+     * as long as the engine sounds, tilting its lines' mutual phases by up to
+     * 2*pi*100Hz*0.65ms.  Sampling Z on a grid OFFSET by slot(k) is exact; sampling
+     * it late is not.  What is left is a hold of at most slot(k) samples (0.65 ms)
+     * at start-up, under a 4 s gate attack. */
     for (uint16_t k = 0; k < AVAS_TYPE_TY_L1_CLUSTERS; k++)
     {
+        const uint16_t first = s_type_ty_l1_cluster[k].first;
+        const uint16_t last  = (uint16_t)(first + s_type_ty_l1_cluster[k].count);
+        const float    pre   = (float)avas_type_ty_cluster_slot(k)
+                                   / (float)AVAS_TYPE_TY_DEC;
+
+        for (uint16_t i = first; i < last; i++)
+        {
+            s->bb_phase[i] = avas_type_ty_wrap_phase(s->bb_phase[i]
+                                                     + (s->bb_step[i] * pre));
+        }
+
         s->car_phase[k] = 0.0f;
         avas_type_ty_eval_cluster(s, k, &s->env_i[k], &s->env_q[k]);
         s->env_di[k] = 0.0f;
         s->env_dq[k] = 0.0f;
     }
 
-    /* Rebuild on the very first sample so the slopes are valid from sample 0. */
-    s->dec_count = 1u;
+    /* Start the staggered schedule at the top of its period.  Cluster 0's slot is
+     * always 0, so it rebuilds on the very first sample and the rest follow at
+     * their own slots inside the first AVAS_TYPE_TY_DEC samples.  Until a cluster's
+     * slot arrives its slope is 0, i.e. its envelope is HELD at the value primed
+     * above (which is Z at that slot, not at t = 0 -- see the loop).
+     *
+     * The priming loop above is the one place all 11 clusters are evaluated on the
+     * same call, and it is deliberately left that way: reset_phase() runs in the
+     * caller's context (the main loop, via app_avas_type_ty_set_enable()), not in
+     * the block ISR, so its cost cannot miss a deadline. */
+    s->dec_phase = 0u;
+    s->next_k    = 0u;
+    s->next_slot = avas_type_ty_cluster_slot(0u);
 }
 
 
@@ -381,9 +500,10 @@ float avas_type_ty_synth_process_sample(avas_type_ty_synth_t *s)
          * enable starts from the new pitch.  Both flags are honoured here --
          * the stop's reset, and any trim keyed while the engine was already
          * silent (which would otherwise wait for the next enable). */
-        if( s->pitch_req_pending || s->pitch_req_on_silence )
+        if( s->pitch_req_pending || s->pitch_apply_mask || s->pitch_req_on_silence )
         {
             s->pitch_req_pending    = 0u;
+            s->pitch_apply_mask     = 0u;
             s->pitch_req_on_silence = 0u;
             avas_type_ty_set_steps(s, s->pitch_ratio_req);
         }
@@ -393,29 +513,45 @@ float avas_type_ty_synth_process_sample(avas_type_ty_synth_t *s)
     alpha = (s->gate_target > s->gate) ? s->gate_attack_alpha : s->gate_release_alpha;
     s->gate += alpha * (s->gate_target - s->gate);
 
-    /* Envelope rebuild: 185 baseband oscillators once every AVAS_TYPE_TY_DEC
-     * samples.  The burst is absorbed inside one APP_BLOCK_FRAMES ISR. */
-    if( --s->dec_count == 0u )
+    /* Take a pending pitch request into the render context's own copies.  One
+     * flag test per sample, and it is what makes the per-cluster hand-over
+     * race-free: the caller only ever writes pitch_req_pending / pitch_ratio_req,
+     * and the mask that is read-modify-written below is private to this context.
+     * See pitch_apply_mask in the header. */
+    if( s->pitch_req_pending )
     {
-        s->dec_count = (uint16_t)AVAS_TYPE_TY_DEC;
+        s->pitch_req_pending = 0u;
+        s->pitch_ratio_apply = s->pitch_ratio_req;
+        s->pitch_apply_mask  = AVAS_TYPE_TY_PITCH_APPLY_ALL;
+    }
 
-        /* Pitch trim hand-over.  A rebuild boundary is the only place the step
-         * tables may be rewritten: between two rebuilds the baseband phases are
-         * mid-flight against the slopes computed from the OLD steps, and swapping
-         * the tables under them would put some lines at the new pitch and the
-         * rest at the old one for the remainder of the block.  Here the slopes
-         * are about to be recomputed anyway, so the new steps take effect
-         * consistently across all 185 lines.
-         *
-         * Clear the flag first, then read the request: a press landing between
-         * the two is seen at the next boundary instead of being dropped. */
-        if( s->pitch_req_pending )
+    /* Envelope rebuild, STAGGERED.  Each cluster is rebuilt once every
+     * AVAS_TYPE_TY_DEC samples, but at its own phase, so a handful of baseband
+     * oscillators land on this sample instead of all 185 landing on every D-th
+     * one.  See WHY THE REBUILDS ARE STAGGERED at the top of this file.
+     *
+     * A loop, not an if: for a D smaller than the cluster count several clusters
+     * share a slot.  The wrap breaks out because cluster 0's slot belongs to the
+     * NEXT period, which is also what keeps that degenerate D from spinning. */
+    while( s->dec_phase == s->next_slot )
+    {
+        const uint16_t k = s->next_k;
+
+        avas_type_ty_rebuild_cluster(s, k);
+
+        s->next_k    = (uint8_t)(((k + 1u) < AVAS_TYPE_TY_L1_CLUSTERS)
+                                     ? (k + 1u) : 0u);
+        s->next_slot = avas_type_ty_cluster_slot(s->next_k);
+
+        if( s->next_k == 0u )
         {
-            s->pitch_req_pending = 0u;
-            avas_type_ty_set_steps(s, s->pitch_ratio_req);
+            break;
         }
+    }
 
-        avas_type_ty_rebuild_envelope(s);
+    if( ++s->dec_phase >= (uint16_t)AVAS_TYPE_TY_DEC )
+    {
+        s->dec_phase = 0u;
     }
 
     y = avas_type_ty_process_carriers(s);
@@ -514,6 +650,7 @@ static void avas_type_ty_reset_pitch_after_stop(void)
     s_avas_type_ty_pitch_cent            = 0.0f;
     g_avas_type_ty.pitch_ratio_req       = 1.0f;
     g_avas_type_ty.pitch_req_pending     = 0u;   /* not at the next rebuild ... */
+    g_avas_type_ty.pitch_apply_mask      = 0u;   /* ... nor mid hand-over ... */
     g_avas_type_ty.pitch_req_on_silence  = 1u;   /* ... but once the fade is done */
 }
 

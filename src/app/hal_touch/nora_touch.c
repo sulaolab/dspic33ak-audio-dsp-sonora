@@ -33,7 +33,8 @@
  * and depth is worth less than it first reported -- ~3x from 2^4 to 2^8, not ~40x,
  * because the absolute tail grows 5x while the count grows 16x.
  *
- * Two corrections, 2026-08-15 ([internal] itc_hardware_reference.md §12), because the text
+ * Two corrections, 2026-08-15, after re-reading the ITC hardware documentation,
+ * because the text
  * above was wrong in a way that closed off real levers:
  *
  *  - 2^8 is NOT "the maximum". ACCCNT[3:0] accepts up to 15, and ITCRESx is
@@ -282,6 +283,20 @@
  * the pair and outranks the learner. */
 #define NORA_TOUCH_LEARN_FLOOR_MIN  (700)
 #define NORA_TOUCH_LEARN_FLOOR_MULT  (6)
+/* Cap on the relative half, and the reason it exists is measured, 2026-08-29:
+ * idle_ref is not "this pad's noise", it is "how close a hand is to the board".
+ * A hand near the pads lifts every pad's quiet magnitude -- CVDAN8 read mag 163
+ * while only CVDAN10 was being tapped, and both fell back to 110 / 73 two minutes
+ * after the hand left -- so idle_ref runs 140..240 for as long as somebody is
+ * operating the board and 60..120 when nobody is. Multiplied by MULT that made
+ * the floor 840..1440 during use, against real presses of 931..2610: the pad went
+ * unresponsive exactly while it was being used, the operator pressed harder, and
+ * the harder press raised idle_ref again. The gate in nora_touch_update_key()
+ * (all pads quiet, s_all_quiet) is the fix for the cause; this cap bounds the
+ * damage if some other common-mode source lifts idle_ref anyway. 900 is under the
+ * weakest press measured on this board (931) and above the 798 that the
+ * 2026-08-16 soak needed on CVDAN10, so it keeps that pad's protection intact. */
+#define NORA_TOUCH_LEARN_FLOOR_MAX  (900)
 
 /* Release as a fraction of press, so hysteresis scales with a learned-down pad
  * instead of being lost by it. Learning it separately is what A.6 got wrong: a
@@ -368,6 +383,13 @@ static bool                 s_initialized;
 static bool                 s_scan_in_flight;
 static uint32_t             s_stall_polls;
 static uint32_t             s_scans;
+/* True when every key was quiet on the previous scan, which is the only condition
+ * under which idle_ref is allowed to move. A hand near the board is a common-mode
+ * lift on all pads at once (see NORA_TOUCH_LEARN_FLOOR_MAX for the measurement),
+ * so "all pads quiet" is the cheapest available test for "nobody is there" -- and
+ * what the floor is meant to protect against is the noise present when nobody is.
+ * One scan of lag (5 ms) against a quantity whose time constant is 320 ms. */
+static bool                 s_all_quiet;
 static uint32_t             s_rejected;
 static uint32_t             s_implausible;
 
@@ -554,6 +576,7 @@ bool nora_touch_init( const uint8_t *cvdan, uint8_t key_count,
     }
 
     s_scans       = 0u;
+    s_all_quiet   = false;
     s_rejected    = 0u;
     s_implausible = 0u;
     s_initialized = true;
@@ -659,6 +682,9 @@ static void nora_touch_learn_apply( nora_touch_key_t *k )
     press = (sorted[i] * NORA_TOUCH_LEARN_NUM) / NORA_TOUCH_LEARN_DEN;
 
     floor_thr = k->idle_ref * NORA_TOUCH_LEARN_FLOOR_MULT;
+    /* Cap the relative half before the absolute one, so FLOOR_MIN still wins on a
+     * quiet pad and FLOOR_MAX only ever bites a noisy one -- see FLOOR_MAX. */
+    if( floor_thr > NORA_TOUCH_LEARN_FLOOR_MAX ) { floor_thr = NORA_TOUCH_LEARN_FLOOR_MAX; }
     if( floor_thr < NORA_TOUCH_LEARN_FLOOR_MIN ) { floor_thr = NORA_TOUCH_LEARN_FLOOR_MIN; }
 
     /* Ceiling first, floor last, and the order is the whole point: the floor is a
@@ -885,7 +911,10 @@ static void nora_touch_update_key( nora_touch_key_t *k )
              * carry the touch that just ended. Wait for the window to flush, then
              * follow the quiet magnitude slowly in *both* directions -- see
              * NORA_TOUCH_IDLE_SHIFT for the run this cost. */
-            if( k->quiet_run >= NORA_TOUCH_IDLE_QUIET_RUN )
+            /* ...and only while *no* pad is active: quiet_run alone clears 40 ms
+             * after this pad's own touch, which is still inside the window where a
+             * hand hovering over the board lifts every pad. See s_all_quiet. */
+            if( (k->quiet_run >= NORA_TOUCH_IDLE_QUIET_RUN) && s_all_quiet )
             {
                 k->idle_ref += (k->mag - k->idle_ref) >> NORA_TOUCH_IDLE_SHIFT;
             }
@@ -1010,6 +1039,25 @@ void nora_touch_process( void )
     {
         s_keys[i].raw = results[i];
         nora_touch_update_key( &s_keys[i] );
+    }
+
+    /* One AND over the pads, for the next scan to use. A key that has no baseline
+     * yet counts as quiet: it carries no evidence either way, and treating it as
+     * active would freeze idle_ref on every other pad for as long as it is
+     * re-seeding. */
+    {
+        bool all_quiet = true;
+
+        for( i = 0u; i < s_key_count; i++ )
+        {
+            if( s_keys[i].baseline_valid &&
+                (s_keys[i].quiet_run < NORA_TOUCH_IDLE_QUIET_RUN) )
+            {
+                all_quiet = false;
+                break;
+            }
+        }
+        s_all_quiet = all_quiet;
     }
 
     /* Trace after the keys are updated, so what is recorded is the same delta the
@@ -1314,6 +1362,7 @@ bool nora_touch_set_acquisition( uint32_t charge_ns, uint32_t balance_ns,
     }
 
     s_scans          = 0u;
+    s_all_quiet      = false;
     s_rejected       = 0u;
     s_implausible    = 0u;
     s_scan_in_flight = false;

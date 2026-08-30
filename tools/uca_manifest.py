@@ -18,8 +18,56 @@ split, which now lives outside this repo.)
 """
 
 DEVICE = "dsPIC33AK512MPS512"
+# Deliberately a CONSTANT, unlike everywhere else that now reads the pack the
+# application project pins. This is not "which pack to build with" -- it is a
+# record of which atdf the bit offsets above were read out of BY HAND. If the
+# project moves to another pack, the right answer is for a human to re-read the
+# atdf and update this line, not for the line to follow along quietly and keep
+# claiming a verification that was never redone.
+#
+# provision.ps1 passes its own copy of this string as --expect-dfp and
+# verify_dual_partition_hex.py fails unless it matches: an intentional
+# double entry, so a bundle records which pack its config words were derived
+# from. Do not collapse the two into one source.
 DFP = "dsPIC33AK-MP_DFP/1.3.185"
 XCDSC = "3.31.01"
+
+
+def _check_dfp_against_project():
+    """Complain if the project has moved off the pack these bits were read from.
+
+    A mismatch means the offsets/masks above are a claim about a pack this repo
+    no longer builds with -- silent until a config word is written to the wrong
+    place. Hard error, because there is nothing safe to do with a stale record.
+
+    Unreadable project (this file copied out of the tree, a partial checkout) is
+    NOT an error: it makes the check impossible, not failed.
+    """
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import dfp_packs
+        pinned = dfp_packs.pins().get(DEVICE)
+    except Exception:
+        return
+    if pinned is None:
+        return
+    project = "%s/%s" % pinned
+    if project != DFP:
+        raise RuntimeError(
+            "tools/uca_manifest.py records its bit definitions as verified "
+            "against %s, but the application project now pins %s for %s.\n"
+            "The UCA offsets and masks in this file were read out of that "
+            "pack's atdf by hand, so they are a claim about %s and nothing "
+            "here can tell whether they still hold.\n"
+            "Re-read <packs>/Microchip/%s/atdf/%s.atdf, confirm the FDEVOPT / "
+            "FICD / FWDT offsets and bit masks, then update DFP in this file "
+            "and $expectDfp in buildtools/provision.ps1 together."
+            % (DFP, project, DEVICE, DFP, project, DEVICE))
+
+
+_check_dfp_against_project()
 
 # UCA (per physical partition) region bases; each word at base+offset below.
 # UCA is NOT remapped by NVMCON.P2ACTIV (unlike program flash) — fixed addresses.

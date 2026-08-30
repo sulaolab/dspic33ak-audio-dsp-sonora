@@ -402,7 +402,16 @@ static nora_clock_status_t configure_pll1(
      * cycle to become visible and finish. A cold path may not assert DIVSWEN,
      * so absence during the short observation window is also valid. */
     PLL1CONbits.ON = 1u;
-    PLL1CONbits.OE = 1u;
+    /* No OE write here, and do not add one back: PLLxCON HAS NO OE BIT.
+     * Data sheet DS70005591 (rev C and rev D alike) leaves PLLxCON bit 12
+     * unnamed, with no bit description; only CLKxCON bit 12 is OE, and it
+     * means "clock output is enabled to be an output on a device pin" -- a
+     * PLL output never reaches a pin. The DFP declared it anyway up to
+     * MC 1.4.172 / MP 1.3.185, copied from the CLKGEN CON template, and
+     * MC 1.5.263 / MP 1.4.260 removed it. The write was also measured
+     * non-causal for the warm-entry PLL hang (v71-v72), so nothing here
+     * depended on it. See [internal] report_dfp_pack_change_2026-08-29.md.
+     * It was already re-added once by a merge; that is why this note is long. */
     start_poll = 10000u;
     while ((PLL1CONbits.DIVSWEN == 0u) && (--start_poll != 0u)) {
     }
@@ -436,7 +445,7 @@ static nora_clock_status_t configure_pll2(
     const dspic33ak_clock_reg_pll_config_t *config)
 {
     PLL2CONbits.ON = 1;
-    PLL2CONbits.OE = 1;
+    /* No OE write: see configure_pll1() -- PLLxCON has no OE bit. */
 
     PLL2DIVbits.PLLFBDIV = config->feedback_div;
     PLL2DIVbits.PLLPRE = config->pre_div;

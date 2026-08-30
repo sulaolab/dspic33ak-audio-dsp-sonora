@@ -68,8 +68,8 @@ stops the run.
 | T0.7 | Naming / terminology gate | maintainer-side tool, outside this repository | zero findings; its exclusion list is maintainer-side too and does not ship | maintainer step |
 
 Two of these are maintainer-side. `check_separation.ps1` is itself
-`export-ignore`d (`.gitattributes`), same as the `docs_internal/` tree its
-baseline lives under, so it does not ship to a public checkout; the naming gate
+`export-ignore`d (`.gitattributes`), same as the development-only documentation
+tree its baseline lives under, so it does not ship to a public checkout; the naming gate
 never shipped in this repository at all either. A public consumer's T0 is
 therefore T0.1 and T0.3 – T0.6. State which variant a run was.
 
@@ -402,9 +402,10 @@ silently:
   the firmware, can dominate the result. Compare like with like, and prefer the
   procedure the baseline was taken with.
 
-Lab baselines and raw captures are development records: they live in
-`docs_internal/` and `notes_private/`, never in `docs_public/`. A public consumer
-running T5 supplies their own baseline and states it.
+Lab baselines and raw captures are development records: they live in the
+development tree's private documentation and notes directories, never in
+`docs_public/`. A public consumer running T5 supplies their own baseline and
+states it.
 
 ## 11. T6 — listening test
 
@@ -420,12 +421,12 @@ coexisted with audible defects, so T5 passing does not stand in for T6.
 
 ## 12. Evidence and record-keeping
 
-One directory per run, in the development tree, under `docs_internal/` — which
-is `export-ignore`d, so a public consumer keeps the equivalent outside the
-published tree:
+One directory per run, in the development tree's private documentation
+directory — which is `export-ignore`d, so a public consumer keeps the
+equivalent outside the published tree:
 
 ```
-docs_internal/shared/fulltest_runs/<YYYY-MM-DD>_<short-sha>/
+<private-docs>/shared/fulltest_runs/<YYYY-MM-DD>_<short-sha>/
   summary.md          one page: fixtures (§3) + one row per tier with PASS/FAIL
   t0.log              command, exit code, summary line, seconds
   t1/summary.tsv      one row per selection (§6)
@@ -477,7 +478,7 @@ reason to weaken a criterion.
    "no worse than baseline" depends on reading the right baseline.
 6. A public consumer's T0 is two gates short of the maintainer's: the naming gate
    (T0.7) never shipped here, and the separation ratchet (T0.2) is
-   `export-ignore`d along with the `docs_internal/` tree its baseline lives in.
+   `export-ignore`d along with the development-only tree its baseline lives in.
    Run it from a development clone instead.
 7. **No verb enumerates individual console commands.** A bare `?` now prints a
    console-grammar/module-letter legend (2026-08-16), so a tester gets some

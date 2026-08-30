@@ -10,7 +10,7 @@
 #include "pinger_synth.h"
 #include "clickclack_synth.h"
 #include "kinkon_synth.h"
-#include "engine_synth.h"
+#include "engine_select.h"
 
 
 #include "fx_domain_48k.h"

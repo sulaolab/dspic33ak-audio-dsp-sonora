@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""One-shot evidence extractor for the dsPIC-owner 2026-07-31 run.
+"""Evidence extractor for the dsPIC-owner 2026-07-31 run.
 
-Reads the sonora_monitor capture (a file on disk -- never the COM port) and
-emits the compact artifacts the measurement commit needs: the fill histogram
-that backs section 10.6, representative telemetry lines, and SHA-256 of every
-raw log so the bulk captures can stay out of Git.
+Reads a serial capture (a file on disk -- never the COM port) and emits the
+compact artifacts the measurement commit needs: the fill histogram that backs
+section 10.6, representative telemetry lines, and SHA-256 of every raw log so
+the bulk captures can stay out of Git.
+
+Both paths are ARGUMENTS, not constants.  The capture and the evidence directory
+live outside this working tree -- the bulk logs are not committed -- so a
+hardcoded path to either goes stale the moment a tree is reorganised, and this
+script carried exactly that: a capture path under a tools directory that has
+since moved to a repository of its own.
 """
 import hashlib
 import os
@@ -15,17 +21,14 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\(B|\x0f")
 RE_POLY = re.compile(r"\[poly x16ch\](AB|BA) fill=(\d+)/(\d+) set=(\d+)(!?) step=([\d.]+) pull=([\d.]+)us")
 RE_CCP = re.compile(r"CCP\s+fsA=([\d.]+)\s+fsB=([\d.]+)\s+Hz\s+ratioAB=([\d.]+)\s+recover=(\d+)")
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CAPTURE = os.path.join(ROOT, "tools", "sonora_monitor", "monitor_logs", "COM7-20260731.log")
-OUTDIR = os.path.join(ROOT, "docs_internal", "asrc", "meas", "dspic_owner_2026-07-31")
+USAGE = """usage: dspic_owner_extract_evidence.py CAPTURE OUTDIR [RAW_LOG ...]
 
-RAW_LOGS = [
-    "_build_dspic_owner.log",
-    "_flash_dspic_owner.log",
-    "_monitor.log",
-    "tools/asrc/_probe.log",
-    "tools/sonora_monitor/monitor_logs/COM7-20260731.log",
-]
+  CAPTURE   serial capture to read
+  OUTDIR    where to write fill_histogram.txt, telemetry_excerpt.txt and
+            RAW_LOG_SHA256.txt
+  RAW_LOG   further logs to hash into RAW_LOG_SHA256.txt; CAPTURE is always
+            hashed, listed first, and need not be repeated
+"""
 
 
 def sha256(path):
@@ -36,7 +39,16 @@ def sha256(path):
     return h.hexdigest(), os.path.getsize(path)
 
 
-def main():
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stdout.write(USAGE)
+        return 0 if argv else 2
+    if len(argv) < 2:
+        sys.stdout.write(USAGE)
+        return 2
+    CAPTURE, OUTDIR = argv[0], argv[1]
+    RAW_LOGS = [CAPTURE] + list(argv[2:])
+
     os.makedirs(OUTDIR, exist_ok=True)
     with open(CAPTURE, "r", encoding="utf-8", errors="replace") as f:
         lines = [ANSI.sub("", l.rstrip("\n")) for l in f]
@@ -105,12 +117,11 @@ def main():
     with open(os.path.join(OUTDIR, "RAW_LOG_SHA256.txt"), "w", encoding="utf-8") as f:
         f.write("# Source log hashes.  NOT a backup -- a hash proves identity only while\n")
         f.write("# you still hold the file.\n")
-        f.write("#   omitted from Git (bulk): COM7-20260731.log, _build_dspic_owner.log\n")
-        f.write("#   copied into this directory: _flash_dspic_owner.log, _monitor.log,\n")
-        f.write("#                               _probe.log\n")
-        f.write("# Precedent: meas/pll1_frc_2026-07-30/MANIFEST.md\n\n")
-        for rel in RAW_LOGS:
-            p = os.path.join(ROOT, rel.replace("/", os.sep))
+        f.write("#   the bulk capture is not committed; the smaller logs are\n")
+        f.write("#   copied into this directory beside these hashes.\n")
+        f.write("# Precedent: the pll1_frc 2026-07-30 run's [internal] MANIFEST.md\n\n")
+        for p in RAW_LOGS:
+            rel = os.path.basename(p)
             if not os.path.exists(p):
                 f.write("MISSING  %s\n" % rel)
                 continue
@@ -136,4 +147,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

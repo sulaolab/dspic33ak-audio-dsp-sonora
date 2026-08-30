@@ -20,7 +20,7 @@
 #include "timer_app.h"
 #include "board/devices/pot_drv.h"
 #include "app_utils.h"   // biquad_t / biquad_mono_t (needed by engine_synth.h / bass_enhancer.h)
-#include "engine_synth.h"
+#include "engine_select.h"
 #include "avas_synth_type_ty.h"    // app_avas_type_ty_is_active    (POT ownership vs the engine synth)
 #include "avas_synth_type_lb.h"   // app_avas_type_lb_is_active (same)
 #include "bass_enhancer.h"
@@ -235,10 +235,6 @@ bool sonora_app_service( void )
     return false;
 }
 
-/* POT reading above which the engine-synth monitor treats the pot as active.
- * (Distinct from main.c's LED_POT_OFF_VAL RGB-off threshold; same magnitude.) */
-#define ENG_SYNTH_POT_ACTIVE_VAL   (50)
-
 void sonora_app_debug_print( void )
 {
     /* Classic-owned periodic monitors (moved from main.c dbg_print). The
@@ -256,9 +252,10 @@ void sonora_app_debug_print( void )
      * the update status is the last thing on the wire, and an ungated monitor interleaves with it --
      * and with the XMODEM protocol during a transfer.
      *
-     * NOT a blanket early return. The 400 ms block below also drives app_engine_synth_enable() from
-     * the pot, which is audio CONTROL, not output -- silencing the console must not disable a
-     * feature. So the gate is applied to each printf, and the control path runs either way. */
+     * NOT a blanket early return. The 400 ms block below still drives app_engine_synth_enable(false)
+     * for the AVAS hand-over, which is audio CONTROL, not output -- silencing the console must not
+     * change a feature's state. So the gate is applied to each printf, and the control path runs
+     * either way. */
     const bool dbg_on = audio_transport_dbg_enabled();
 
     if( (uint32_t)(cur - last_prt_2) >= 200 )
@@ -286,17 +283,24 @@ void sonora_app_debug_print( void )
         (void)mon_on;   /* both users below are behind compile-time gates */
 
 #if defined(ENA_ENGINE_SYNTH)
-        static uint8_t cnt_adc_up = 0;
-
+        /* The POT no longer switches the engine synth on and off -- SW2 (treble)
+         * long press does, in classic_controls.c. The POT is the throttle only.
+         *
+         * The threshold version had to go for the reason a threshold always has
+         * to: POT 0 % was OFF and "a little way up" was ON, so the knob could not
+         * ask for the idle -- the one rpm the model is judged at (900 rpm, its
+         * lowest measured bin). Now POT 0 % IS the idle. */
         uint16_t adc = POT_Read();   // 0x0000..0x0FFF
 
         /* While either AVAS engine is sounding, the POT is ITS pitch knob, not the
-         * engine throttle. Without this the two fight over one control and AVAS
-         * always loses: the engine synth takes priority in fx_domain_48k (they
-         * are exclusive because their loads would add up), so any knob movement
-         * past ENG_SYNTH_POT_ACTIVE_VAL would silence AVAS and start the engine
-         * sound instead -- and every usable pitch position is above that
-         * threshold.
+         * engine throttle, and the two cannot both be heard anyway: the engine
+         * synth takes priority in fx_domain_48k (they are exclusive because their
+         * loads would add up). So AVAS forces the engine off rather than sharing.
+         *
+         * It stays off after AVAS releases -- a long press turns it back on. That
+         * is deliberate: re-arming it would mean remembering a pre-AVAS state and
+         * restoring it, i.e. one more thing that can be wrong, for a case the user
+         * can resolve with the same button they used to start it.
          *
          * Gated on is_active() rather than the UI on-flag so the release fade is
          * covered too: handing the POT back mid-fade would cut the tail off.
@@ -312,28 +316,18 @@ void sonora_app_debug_print( void )
 #endif
           )
         {
-            cnt_adc_up = 0;
-            app_engine_synth_enable(false);
+            app_engine_synth_enable(false);          /* control: runs even when output is off */
         }
         else
 #endif //defined(ENA_AVAS_TYPE_TY_SYNTH)
-        if( adc > ENG_SYNTH_POT_ACTIVE_VAL )
+        /* Ask the model. This used to recompute the rpm here from the raw POT with
+         * engine_v8's own ENGINE_V8_IDLE_RPM / _MAX_RPM / _POT_FULL_SCALE, which put
+         * a second copy of one model's POT -> rpm map on the platform side -- it
+         * would not compile against a model that maps the knob differently, and it
+         * reported what the knob asked for rather than what was playing. */
+        if( mon_on && app_engine_synth_is_enable() )
         {
-            float    adc_f = (float)adc * ENG_SYNTH_POT_SCALE_FACTOR;
-            uint16_t rpm   = (uint16_t)adc_f;
-
-            if( cnt_adc_up < 255 ) cnt_adc_up++;
-
-            if( cnt_adc_up > 3 )
-            {
-                app_engine_synth_enable(true);       /* control: runs even when output is off */
-                if( mon_on ) { printf(" rpm=%4d | ", rpm); }
-            }
-        }
-        else
-        {
-            cnt_adc_up = 0;
-            app_engine_synth_enable(false);
+            printf(" rpm=%4d | ", (int)app_engine_synth_rpm());
         }
 #endif //defined(ENA_ENGINE_SYNTH)
 

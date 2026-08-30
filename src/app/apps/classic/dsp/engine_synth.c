@@ -16,7 +16,12 @@
 #include "engine_synth.h"
 
 
-#if defined(ENA_ENGINE_SYNTH)
+/* The model engine_v8 replaced, kept selectable. Compiles ONLY when
+ * ENA_ENGINE_SYNTH_LEGACY is defined: this file and engine_v8.c define the same
+ * app_engine_synth_* entry points, so without this guard the two collide at link
+ * time. That collision is why this file used to be ex="true" in the MPLAB project
+ * rather than gated in the source; it is registered now. See engine_select.h. */
+#if defined(ENA_ENGINE_SYNTH) && defined(ENA_ENGINE_SYNTH_LEGACY)
 //===========================================================
 // Definition
 //===========================================================
@@ -956,6 +961,23 @@ void app_engine_synth_blip_start( void )
 {
     printf("\n blipping start!!!\n");
     Start_Blip = true;
+}
+
+
+/* This model has no bring-up ladder and no telemetry report -- it predates both --
+ * so it implements none of the engine's own "*cy" subcodes and the console reports
+ * ERR_UNSUPPORTED. Present rather than absent so the platform needs no #ifdef. */
+bool app_engine_synth_console_subcode( uint8_t subcode )
+{
+    (void)subcode;
+    return false;
+}
+
+/* The core's own current speed, so the monitor line reads the same field for either
+ * model. rpm_cur is post-slew, i.e. what is being rendered. */
+float app_engine_synth_rpm( void )
+{
+    return app_engine_synth_is_enable() ? s_eng.core.rpm_cur : 0.0f;
 }
 
 #endif //defined(ENA_ENGINE_SYNTH)

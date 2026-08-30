@@ -747,8 +747,8 @@ nora_itc_status_t nora_itc_irq_disable(nora_itc_list_t list)
  * on dsPIC33A, so each nesting level gets its own bank and this thunk needs no prologue
  * push -- and a prologue push at an ISR's first instruction is the documented trigger of
  * the A1 silicon STACK ERROR. Rationale in full above the vectors in
- * src/app/hal_i2c/nora_i2c_dspic33ak_device.c; the DO-NOT-REVERT case is above
- * _CCP1Interrupt in src/app/apps/asrc/asrc_clock_control.c.
+ * nora_i2c_dspic33ak_device.c; the DO-NOT-REVERT case is in the application-level
+ * ASRC clock control.
  */
 void __attribute__((interrupt, context)) _ITCInterrupt(void)
 {

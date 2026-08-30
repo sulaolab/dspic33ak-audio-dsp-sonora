@@ -8,7 +8,7 @@ This note records the safe stopping point for the ADC HAL cleanup branch.
 - The current HAL covers the validated CH0 polling use case:
   - dsPIC33AK512: ADC5 CH0, positive input AN0.
   - dsPIC33AK128: ADC1 CH0, positive input AN6.
-- `src/board/devices/pot_drv.c` is the current consumer of `hal_adc`.
+- The board's POT driver is the current consumer of `hal_adc`.
 - Legacy MCC-style polling files for ADC1/ADC5 and the unused common ADC headers were removed.
 - The former `src/adc/` ADC3/ADC4 audio-in DMA path was removed (2026-07-25): it was
   compile-dead everywhere (its `APP_USE_ADC_INOUT` gate was a hard `0`) and its only

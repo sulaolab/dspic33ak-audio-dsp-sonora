@@ -66,8 +66,8 @@ needs.
   count, optional SPI3/4 rows or explicit SPI34 bank selection, per-instance DMA channels, and
   per-leg `SYNC_DOMAIN` defaults. `*.h_example` is never compiled.
 - The template is self-contained (no app-config dependency). A project MAY instead derive
-  the `NORA_TDM_*` macros from its own app config (Sonora does this in
-  `src/board/audio/nora_spi_i2s_tdm_conf.h`); that is the integrator's choice and does not make
+  the `NORA_TDM_*` macros from its own app config (Sonora does this in its own board-level
+  `nora_spi_i2s_tdm_conf.h`); that is the integrator's choice and does not make
   the HAL core app-dependent (dependency is app → conf.h → HAL, never HAL → app).
 
 ## 4. Required sibling HALs
@@ -79,7 +79,11 @@ needs.
   not initialized, `get_load()` / `inst_get_load()` returns `false` and zeroes the supplied
   load struct. Standalone repo:
   [nora-hal-dspic33ak-timer](https://github.com/sulaolab/nora-hal-dspic33ak-timer) (the
-  Timer2 high-resolution counter).
+  high-resolution counter, Timer2 or an SCCP on parts without Timer2).
+- `nora_cpu_load_prof` -- compile/link sibling dependency, in the same timer HAL. The RX-block
+  ISR calls the profiler's enter/exit hooks unconditionally (`nora_cpu_load_prof_fast.h`), so
+  the include path must reach it and `nora_cpu_load_prof_dspic33ak.c` must be in the build.
+  Build with `-D NORA_CPU_LOAD_PROF=0` and the hooks compile to nothing.
 - The SPI register-mask helper (`nora_spi_i2s_tdm_dspic33ak_reg.h`) ships inside this HAL folder.
 
 ## 5. Supported devices
@@ -214,9 +218,10 @@ CK is aligned **to** this contract rather than the two targets meeting in the mi
   its own buffer ownership, and a common envelope smaller than the native one) was implemented
   on AK and then removed before it reached `main`. Reason: it added a second public API for the
   same peripheral, its common envelope could only ever be the intersection of both targets, and
-  it had no callers on either target. See `docs_public/nora_hal_public_api.md` and, for the full
-  history including the earlier decision to keep it, the review record in
-  `[internal] review_nora_hal_merge_2026-08-07.md` (M3 → §12.1 → §13).
+  it had no callers on either target. See
+  https://github.com/sulaolab/dspic33ak-audio-dsp-sonora/blob/main/docs_public/nora_hal_public_api.md
+  and, for the full history including the earlier decision to keep it, the consuming project's
+  HAL merge review record.
 - **Do not re-add a portability facade here.** If AK and CK genuinely cannot share a call,
   express that as a capability query or an unsupported return in this API.
 
@@ -260,6 +265,6 @@ It documents, in full:
 - **Co-clocked block** — `inst_tx_fill_mirror()` (typed `mirror_result_t` + `nora_tdm_slot_t** dst`
   out-param) and the `tx_active_half()` / `tx_active_pos()` probes. Not part of the minimal
   single-leg surface, but **required in every backend that can co-clock two legs** — a consumer here
-  not calling them is not a reason to omit them (see
-  `[internal] nora_spi_i2s_tdm_contract_declaration_2026-08-10.md`, D3).
+  not calling them is not a reason to omit them (this is a declared part of the contract,
+  not an optional extra).
 - **Diagnosing a failed call** — every `bool`-returning API sets `get_last_error()` on `false`.

@@ -237,6 +237,25 @@ extern void  app_engine_synth_enable( bool enable );
 extern bool  app_engine_synth_is_enable( void );
 extern void  app_engine_synth_blip_start( void );
 
+/* ---- the model-neutral pair the Classic platform calls -------------------
+ *
+ * Both models declare these, so the platform needs no #ifdef on WHICH model is
+ * compiled. That is the point: model-specific knowledge belongs to the model.
+ *
+ * app_engine_synth_console_subcode() owns every "*cy" subcode that is the engine's
+ * and is not one of the shared four (04 blip / 05 on / 06 off). The model returns
+ * true if it handled the subcode and false if it does not implement it, and the
+ * console maps that to OK / ERR_UNSUPPORTED without knowing what any subcode means.
+ *
+ * app_engine_synth_rpm() is the rpm being sounded right now, 0 when the engine is
+ * off. The monitor line used to recompute this from the raw POT with the model's own
+ * ENGINE_V8_* constants, which put a second copy of the POT -> rpm map on the
+ * platform side; asking the model removes the copy and reports what is actually
+ * playing rather than what the knob asks for. */
+extern bool  app_engine_synth_console_subcode( uint8_t subcode );
+extern float app_engine_synth_rpm( void );
+
+
 
 
 

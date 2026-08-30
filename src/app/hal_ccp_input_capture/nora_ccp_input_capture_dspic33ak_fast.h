@@ -17,7 +17,7 @@
  * nora_ccp_dspic33ak_hot_regs() below -- keep the chip in their name.
  *
  * WHY THIS FILE EXISTS AT ALL
- *   apps/asrc/asrc_clock_control.c hand-writes _CCP1Interrupt/_CCP2Interrupt and
+ *   An application-level ASRC clock control hand-writes _CCP1Interrupt/_CCP2Interrupt and
  *   drained the FIFO itself for speed. With no fast path to call it reached for
  *   CCP1STAT / CCP1BUF / IFS1 directly, which made it the ONE application file in
  *   the tree that included <xc.h> and a backend register header -- a port site

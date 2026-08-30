@@ -68,7 +68,7 @@ typedef struct {
 
 typedef struct {
     uint32_t ON;
-    uint32_t OE;
+    /* No OE: PLLxCON has no OE bit -- only CLKxCON does. */
     uint32_t NOSC;
     uint32_t OSWEN;
     uint32_t DIVSWEN;

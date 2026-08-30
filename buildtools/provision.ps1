@@ -143,7 +143,18 @@ foreach ($s in @($genScript, $verifyScript)) {
     if (-not (Test-Path -LiteralPath $s)) { throw "Provisioning tool not found: $s" }
 }
 
-# Device / DFP expectations pinned from the manifest (single source of truth).
+# What this script EXPECTS tools/uca_manifest.py to say -- deliberately stated here
+# rather than read from it. verify_dual_partition_hex.py fails unless the manifest
+# matches, so these two lines are a double entry: the bundle report then records
+# which pack the config words were derived from, asserted by two files that had to
+# be changed together. Reading the manifest here would make that check vacuous.
+#
+# The old comment called this "from the manifest (single source of truth)", which it
+# never was -- it is a copy, and before 2026-08-29 nothing noticed if the project
+# moved off that pack. That hole is closed on the manifest's side: uca_manifest.py
+# now hard-errors when the application project pins a different pack than the one
+# its bit offsets were hand-verified against. So a stale pin here surfaces as that
+# error, with the re-verification steps, rather than as a wrong config word.
 $expectDevice = 'dsPIC33AK512MPS512'
 $expectDfp    = 'dsPIC33AK-MP_DFP/1.3.185'
 

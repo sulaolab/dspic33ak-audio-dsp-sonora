@@ -13,6 +13,7 @@ void UsrOperate_clickclack( void );
 void UsrOperate_clickclack_toggle( void );
 void UsrOperate_kinkon( void );
 void UsrOperate_pinger( void );
+void UsrOperate_engine_synth( void );      /* SW2 (treble) long press: on/off toggle */
 void UsrOperate_avas_synth( void );        /* TYPE_TY       ('a', *cy00) */
 void UsrOperate_avas_synth_type_lb( void );  /* LAMB  ('A') */
 void UsrOperate_avas_synth_button( void ); /* Mute long press: start alternates TY/Type_LB */

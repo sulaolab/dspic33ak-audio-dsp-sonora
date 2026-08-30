@@ -448,7 +448,7 @@ bool nora_i2c_device_tx_irq_enable(nora_i2c_instance_t inst, bool enable)
  * nothing beyond the argument registers and `context` takes their prologues to ZERO
  * pushes. That matters beyond code size: prologue pushes at an ISR's first instruction
  * are the documented trigger of the A1 silicon STACK ERROR -- see the DO-NOT-REVERT
- * note above _CCP1Interrupt in src/app/apps/asrc/asrc_clock_control.c, and the
+ * note in the application-level ASRC clock control, and the
  * per-vector noinline bodies in nora_spi_i2s_tdm_dspic33ak.c for the case where the
  * pushes are W8+ and `context` cannot remove them.
  *

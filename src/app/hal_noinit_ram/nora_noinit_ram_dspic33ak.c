@@ -2,8 +2,8 @@
 // nora_noinit_ram_dspic33ak.c -- the one no-init RAM block.
 //
 // There is no logic here, and that is the design: this HAL reserves RAM and knows
-// nothing about what goes in it. See nora_noinit_ram.h for the contract and
-// [internal] resident_serial_bootloader.md part 3 for the linker-script side.
+// nothing about what goes in it. See nora_noinit_ram.h for the contract, and the
+// consuming project's linker script for the reservation side.
 //===========================================================
 
 #include "nora_noinit_ram.h"
