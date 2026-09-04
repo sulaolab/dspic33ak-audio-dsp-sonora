@@ -45,6 +45,39 @@
  * therefore resolves APP_USE_I2S_FORMAT=1 / APP_SLOTS_PER_FS=2 in the shared
  * config, and three #errors there enforce it.
  *
+ * >>> THE 2-SLOT I2S FRAME IS AN OPERATIONAL ESCAPE FROM TODAY'S CODEC, NOT AN
+ * >>> ASRC REQUIREMENT.  READ THIS BEFORE TREATING ANY OF IT AS A SPECIFICATION.
+ *
+ * Everything narrow about this preset -- 2 slots, one-way A->B, no BIDIR -- is a
+ * property of the WM8904 that happens to be on this evaluation board.  None of it
+ * is a property of the ASRC, of the DSP, or of the product.  Concretely:
+ *
+ *   - 2 slots exist because THIS codec's SYSCLK is a 12.288 MHz crystal.  A codec
+ *     that can clock a 24.576 MHz BCLK carries TDM8 at 96 kHz with no ASRC change.
+ *   - A->B only exists because THIS codec cannot run its own ADC and DAC together
+ *     at or above 88.2 kHz.  A codec without that boundary is bidirectional at
+ *     96 kHz with no ASRC change.
+ *
+ * So when a codec with a bidirectional TDM8 96 kHz mode is adopted, BOTH limits are
+ * simply REMOVED -- they are not relaxed, negotiated or migrated.  Nothing in the
+ * ASRC has to be redesigned for that to happen, and that is exactly the property
+ * this comment exists to protect.
+ *
+ * WHAT THIS FORBIDS, therefore:
+ *   - Do not design, size, measure or specify any ASRC stage against "2 channels",
+ *     "one direction" or "96 kHz is A->B".  Those are transport facts with a
+ *     shelf life, and an ASRC written against them is wrong the day the codec
+ *     changes -- silently, because it will still build and still pass.
+ *   - Do not let APP_SLOTS_PER_FS or the transport's rate gate reach any stage
+ *     between asrc_push and asrc_pull.  See THE CHANNEL-WIDTH AUTHORITY in
+ *     asrc_app_config.h; the physical width is confined to the two mapping ends.
+ *   - Do not record a number measured at 2 slots as an ASRC capability figure
+ *     without saying which of the three constraint families -- codec/HW, ASRC
+ *     algorithm, or CPU budget -- produced it.
+ *
+ * The ASRC's own answer to "how many channels" is ASRC_CH, and it is 8 here for a
+ * CPU-budget reason stated below -- deliberately NOT for a codec reason.
+ *
  * Internal ASRC width stays 8 channels: the physical L/R pair is replicated
  * across all ASRC_CH channels by the established mechanism (asrc_push writes
  * p[c & 1u]) and only channels 0/1 are emitted to the 2 physical slots (asrc_pull
@@ -66,7 +99,14 @@
   #endif
   /* Internal compute width.  8 is what the halved 96 kHz block window can carry:
    * the shipping 16-channel bidirectional 48 kHz build measures 76.6 % of a
-   * 333.3 us window, and at 96 kHz that window is 166.7 us. */
+   * 333.3 us window, and at 96 kHz that window is 166.7 us.
+   *
+   * THIS 8 IS A CPU BUDGET, NOT A CODEC CONSEQUENCE.  It is unrelated to the 2
+   * physical slots above: a rate may set workload, never channel count.  Raising it
+   * is a block-design and CPU question to be answered on its own evidence -- ON HOLD
+   * as of 2026-09-03 by owner decision, behind the 48 kHz Nyquist-region work.
+   * EXIT CONDITION: reconsider once the 48 kHz leg's Nyquist-region handling is
+   * closed.  Until then do not cite this 8 as an ASRC limit anywhere. */
   #ifndef ASRC_CH
     #define ASRC_CH  (8u)
   #endif
@@ -87,6 +127,18 @@
   #ifndef APP_ASRC_RUNTIME_48K_TO_8
     #define APP_ASRC_RUNTIME_48K_TO_8 (1)
   #endif
+  /* NOTE ON THE LOW-RATE ROWS THIS PRESET ENABLES.  A 96 kHz leg composes the 96 -> 48 kHz
+   * pre-stage in front of one of the 48 kHz chains, and since 2026-09-03 that pre-stage is a Q31
+   * cascade stage inside the ASRC_CH-wide front end.  So every 96 kHz row this preset publishes is
+   * served at the full logical width, and the pair gate accepts them.
+   *
+   * It was NOT so until then, and the reason is worth keeping: the pre-stage existed only in the
+   * legacy float family, which carries ASRC_DECIMATOR_FLOAT_MAX_CHANNELS = 2 -- fewer than this
+   * preset's ASRC_CH -- so that family was DISQUALIFIED as a front end and the pairs needing one
+   * (leg B at 16 kHz and below, plus the 22.05/24 kHz rows) were refused by the pair gate with a
+   * reason.  Refused, not narrowed: filtering two channels while the resampler converts ASRC_CH is
+   * a missing anti-alias stage, not a narrower feature.  Porting the pre-stage was the fix, exactly
+   * as recorded here; lowering ASRC_CH was never one, and still is not. */
   /* Bring-up needs the load/deadline telemetry that the standard BIDIR preset
    * enables, since confirming CPU load and block-deadline margin is the point. */
   #define APP_ASRC_HEADROOM_INSTRUMENT  (1)
@@ -251,9 +303,15 @@
    *
    * Deepening the ring instead is not available here: 64 -> 128 frames costs
    * 64 x ASRC_CH x 4 B x 2 engines = 4096 B of data memory and only ~3.5 KB is free.
-   * A decimating front end (the AK512 answer, APP_ASRC_RUNTIME_48K_TO_8) is not either:
-   * ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS is 2 and this build is 8-channel TDM one-to-one,
-   * so both its history and its ISR time would be 4x what that path was priced at.
+   * A decimating front end (the AK512 answer, APP_ASRC_RUNTIME_48K_TO_8) was ALSO ruled out here,
+   * and that reasoning has since been corrected -- it is kept visible because it is the exact
+   * mistake the channel-width authority in asrc_audio_path.c now forbids.  It read: "the float
+   * decimator family carries 2 channels and this build is 8-channel TDM one-to-one, so both its
+   * history and its ISR time would be 4x what that path was priced at."  A legacy
+   * implementation's capacity is not a reason to drop a feature: the Q31 front end carries ASRC_CH
+   * by construction at ~1 cycle/MAC, so the 4x was a property of the implementation that was
+   * looked at, never of the feature.  Whether the front end fits AK128 is a question to be
+   * re-priced against the Q31 family, not one already answered here.
    *
    * MEASURED on an AK512 board, 2026-08-20, this build at L=128/M=30 (block 8 built
    * with -Define APP_BLOCK_FRAMES=8; see the study report):
@@ -524,6 +582,31 @@
     (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_B_TO_A)
   #ifndef APP_ASRC_MEAS
     #define APP_ASRC_MEAS  (1)
+  #endif
+  /* F1(a), 2026-09-04: the *ag / ?ag control-variable trace is OFF BY DEFAULT in every MEAS
+   * preset, and has to be asked for.
+   *
+   * WHY THE DEFAULT MOVED.  asrc_app_config.h defaults it to 1 because every AK512 MEAS preset
+   * has always carried it, so every MEAS image paid for its Q34 buffer -- 16,384 B of X space,
+   * the single largest allocation in the image -- plus ~4.4 KB of program for the two
+   * printf-heavy trace bodies.  Nothing in a DR or THD+N run reads it: those go through
+   * s_cap[] via *ac / ?ac.  It is a SERVO diagnostic.  The bill came due on the Q31 MEAS arm,
+   * which does not link at all until the buffer is gone -- every Q31 measurement so far had to
+   * be driven with an explicit -Define APP_MEAS_CTRL_TRACE=0 on the command line, which is a
+   * default in the wrong place, not a build option.
+   *
+   * NOTHING IS LOST, AND NOTHING IS SILENT.  The exported symbols stay as stubs
+   * (audio_app_meas.c's !APP_MEAS_CTRL_TRACE arm), so the console still answers *ag / ?ag, and
+   * a servo-trace session is one flag away:
+   *
+   *     buildtools/build.ps1 -Full -Define APP_MEAS_CTRL_TRACE=1
+   *
+   * Say so in the report when a measurement needed that flag -- an image built with it is 16 KB
+   * of X space away from the one every other measurement used, and on the Q31 arm it does not
+   * build at all.  This is a measurement-only diagnostic, so it follows the same rule as the
+   * rest of them: opt-in, never resident by default. */
+  #ifndef APP_MEAS_CTRL_TRACE
+    #define APP_MEAS_CTRL_TRACE  (0)
   #endif
 #endif
 

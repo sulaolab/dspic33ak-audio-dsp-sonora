@@ -411,6 +411,67 @@ static bool asrc_fill_slack_fits( uint32_t fs_in_hz, uint32_t num,
     return ( scale % eff_den ) == 0u;   // exact step: floor == ceil, ASRC_FILL_JITTER is enough
 }
 
+#if !( APP_ASRC_RUNTIME_48K_TO_8 || APP_ASRC_48K_TO_8_INTEGRATION )
+/*
+ * F1(b), 2026-09-04: does this pair contain a down-conversion that NEEDS the anti-alias front end?
+ *
+ * WARNING-ONLY MIRROR, and it says so because a mirror of a rate table is exactly the kind of
+ * duplicate that drifts.  The AUTHORITY is asrc_audio_path_frontend_plan()'s table.
+ *
+ * Why a mirror is needed at all, stated precisely (the first write-up of this said "the plan
+ * function is compiled out", which is NOT true -- corrected 2026-09-04):
+ *   - asrc_audio_path_frontend_plan() itself is always compiled.  What is compiled out in this
+ *     build is the front-end IMPLEMENTATION, and with it the CALL: the pair gate below only asks
+ *     the plan under #if APP_ASRC_RUNTIME_48K_TO_8 || APP_ASRC_48K_TO_8_INTEGRATION, because a
+ *     plan for stages that do not exist cannot be applied.
+ *   - and the table could not answer this question even if it were asked, because several of its
+ *     rows are themselves conditional on APP_ASRC_RUNTIME_48K_TO_8 (the 2/3 chain rows: 48 -> 32
+ *     and the composed 96 -> 32).  In a front-end-less build those rows fall through to num 1 /
+ *     den 1 -- the same answer a pair that needs nothing gets.  The table encodes "what this
+ *     build will put in front of the resampler", so it structurally cannot express "a stage is
+ *     NEEDED here and this build has none".  That distinction is what this mirror carries.
+ *
+ * Nothing here refuses anything.  Some presets measure the unfiltered path ON PURPOSE (the
+ * HEADROOM studies do), and a MEAS image that could not reach the bad case would be less useful,
+ * not safer.  What must not happen is measuring it BY ACCIDENT and recording the number as if a
+ * front end had been in the path.  So this prints, once per pair commit, and the log carries the
+ * sentence instead of the reader having to know that `fe=direct` is ambiguous.
+ *
+ * DRIFT IS NOT HYPOTHETICAL: this mirror had already drifted by the time it was first reviewed --
+ * it was missing 96 -> 44.1 and 96 -> 48 kHz, both of which took a den 2 pre-stage-only row on
+ * 2026-09-03.  When a row is added to the plan table, add it here.  The rate menu is per producer,
+ * because the two producer legs do not cover the same set: 44.1 kHz has NO 48 kHz row (declined on
+ * purpose -- its fold is inaudible) but it DOES have a 96 kHz one (its 25950 Hz fold edge is not).
+ */
+static bool asrc_pair_wants_absent_frontend( uint32_t rate_a_hz, uint32_t rate_b_hz,
+                                             uint32_t* producer_hz, uint32_t* consumer_hz )
+{
+    uint32_t hi = ( rate_a_hz > rate_b_hz ) ? rate_a_hz : rate_b_hz;
+    uint32_t lo = ( rate_a_hz > rate_b_hz ) ? rate_b_hz : rate_a_hz;
+    const bool low_rate_row = ( lo == 8000u ) || ( lo == 11025u ) || ( lo == 12000u ) ||
+                              ( lo == 16000u ) || ( lo == 22050u ) || ( lo == 24000u ) ||
+                              ( lo == 32000u );
+    bool wants;
+    if( hi == 48000u )
+    {
+        wants = low_rate_row;                       // 48 kHz table: 8 .. 32 kHz
+    }
+    else if( hi == 96000u )
+    {
+        // 96 kHz table: the same low rates PLUS the two pre-stage-only rows added 2026-09-03.
+        wants = low_rate_row || ( lo == 44100u ) || ( lo == 48000u );
+    }
+    else
+    {
+        wants = false;                              // no producer leg has rows for this rate
+    }
+    if( !wants ) { return false; }
+    if( producer_hz != NULL ) { *producer_hz = hi; }
+    if( consumer_hz != NULL ) { *consumer_hz = lo; }
+    return true;
+}
+#endif  /* no front end compiled in -- the helper has no other caller */
+
 bool audio_app_asrc_rate_pair_is_supported( uint32_t rate_a_hz, uint32_t rate_b_hz,
                                             const char** reason )
 {
@@ -433,6 +494,33 @@ bool audio_app_asrc_rate_pair_is_supported( uint32_t rate_a_hz, uint32_t rate_b_
     plan.low_rate_hz = 0u; plan.in_rate_hz = 0u;
 #if APP_ASRC_RUNTIME_48K_TO_8 || APP_ASRC_48K_TO_8_INTEGRATION
     asrc_audio_path_frontend_plan( rate_a_hz, rate_b_hz, &plan );
+
+    /*
+     * Refuse a pair that NEEDS a front end when the implementation this build compiled cannot
+     * carry the ASRC logical width.  The narrow implementation is disqualified rather than used:
+     * an anti-alias stage that filters fewer channels than the resampler converts is a MISSING
+     * stage, and down-conversion without one is not correct at any channel count -- so serving the
+     * pair anyway would be the "reduce the width until it fits" answer, wearing a different hat.
+     *
+     * Only pairs that ask for one are affected, which is why this is here and not an #error: a
+     * unity ratio, an up-conversion, or any ratio the resampler serves directly needs no front end
+     * and is untouched.  Checked before the burst and slack bounds so the reason names the real
+     * cause instead of whatever those would have said about the direct step.
+     */
+    if( ( ( plan.den_ab != 1u ) || ( plan.num_ab != 1u )
+#if APP_B_ROUTE_USES_BA
+          || ( plan.den_ba != 1u ) || ( plan.num_ba != 1u )
+#endif
+        ) && !asrc_audio_path_frontend_can_serve_logical_width() )
+    {
+        if( reason != NULL )
+        {
+            *reason = "this pair needs the anti-alias front end, and the front-end implementation "
+                      "in this build processes fewer channels than ASRC_CH (it is disqualified, "
+                      "not narrowed)";
+        }
+        return false;
+    }
 #endif
 
     if( !asrc_burst_ratio_fits( rate_a_hz, plan.num_ab, plan.den_ab, rate_b_hz )
@@ -461,6 +549,35 @@ bool audio_app_asrc_rate_pair_is_supported( uint32_t rate_a_hz, uint32_t rate_b_
         }
         return false;
     }
+
+#if !( APP_ASRC_RUNTIME_48K_TO_8 || APP_ASRC_48K_TO_8_INTEGRATION )
+    /*
+     * NO FRONT END IS COMPILED INTO THIS BUILD.  Say it here, where a human just asked for the
+     * pair, instead of letting `fe=direct` in the telemetry carry two opposite meanings:
+     * "no filter is needed" and "a filter is needed and is not there".  The pair is still
+     * ALLOWED -- see asrc_pair_wants_absent_frontend() for why refusing would be wrong.
+     *
+     * LAST, after every gate has passed, and that placement is the point: the sentence says "the
+     * pair is allowed and will run band-unlimited", which would be a LIE on any path that then
+     * returns false.  Printing it before the burst/slack bounds produced an "allowed" line
+     * immediately followed by a refusal (found in review, 2026-09-04).  A function whose whole
+     * purpose is to stop a log from being misread must not be the thing that misleads.
+     */
+    {
+        uint32_t producer_hz = 0u, consumer_hz = 0u;
+        if( asrc_pair_wants_absent_frontend( rate_a_hz, rate_b_hz, &producer_hz, &consumer_hz ) )
+        {
+            printf( " ASRC front end: %lu -> %lu Hz NEEDS an anti-alias stage and this build has"
+                    " NONE compiled in (APP_ASRC_RUNTIME_48K_TO_8=0). The pair is allowed and the"
+                    " resampler will run it band-unlimited: `fe=direct` below therefore means"
+                    " UNPROTECTED, not 'not needed'. Any alias / DR / THD+N number taken here is"
+                    " the DIRECT path -- do not record it as a filtered one. Rebuild with"
+                    " -Define APP_ASRC_RUNTIME_48K_TO_8=1 to measure the filtered path.\n",
+                    (unsigned long)producer_hz, (unsigned long)consumer_hz );
+        }
+    }
+#endif
+
     return true;
 }
 
@@ -869,7 +986,34 @@ static uint8_t  s_q16_freeze_latched = 0u;
 #define ASRC_ENGINE_COUNT  (1u)
 #endif
 
+/*
+ * THE ENGINE STATE IS PINNED TO X SPACE IN THE Q31 ARM, NOT LEFT WHERE IT LANDS.
+ *
+ * mchp_asrc_q31_row16 reads this history through one AGU and the blended coefficient
+ * row (s_ceff_q31, space(ymemory)) through the other, so the two MUST be in different
+ * spaces or every MAC costs an extra cycle with no other symptom.  buildtools/build.ps1
+ * (Assert-Q31ResamplerPlacement) gates exactly that: s_asrc entirely below
+ * __YDATA_BASE.
+ *
+ * The gate used to be a coin flip.  This object is ~20 KB and the Q31 BiDir build sits
+ * at 92 % of data, so whether the linker put it low in X or straddling 0xC000 depended
+ * on allocation order -- nothing the source controlled.  Measured 2026-09-04: two builds
+ * of the SAME configuration with the IDENTICAL total (60,508 B) placed it at
+ * 0xBFD8..0xE7FC (REFUSED, recorded as F2 on 2026-09-03) and at 0x4590..0x95B0 (PASS).
+ * So F2 was never "X is ~10.2 KB short" -- the bytes fit either way; the ADDRESS was
+ * luck.  space(xmemory) removes the luck: the operand contract is now a link-time
+ * constraint, and if X genuinely cannot hold it the linker says so instead of the build
+ * passing on some machines and failing on others.
+ *
+ * Only the Q31 arm is pinned.  The float kernel has no AGU-pair contract (both operands
+ * come through the same bus), so constraining a 20 KB object there would buy nothing and
+ * could refuse a build that is otherwise fine.
+ */
+#if ASRC_SAMPLE_Q31
+static asrc_t s_asrc[ASRC_ENGINE_COUNT] __attribute__(( space(xmemory) ));
+#else
 static asrc_t s_asrc[ASRC_ENGINE_COUNT];
+#endif
 
 #if APP_ASRC_LOAD_TEST
 static volatile uint8_t s_load_mult = 1u;       // bench: emulate mult*ASRC_CH channels of interp load
@@ -3870,7 +4014,18 @@ float    audio_app_asrc_get_ff_frozen_ratio_ba( void )  { return s_asrc[ASRC_ENG
 // Trailing `fe=` field of an AB/BA telemetry line: which fixed decimator, if any, runs ahead
 // of the resampler in that direction. `fe=direct` means none -- the poly stage resamples the
 // full band and its cutoff is ASRC_POLY_FC of the *input* rate, so any output whose Nyquist is
-// below that cutoff aliases. `fe=/4` / `fe=/6` name the divider, and the intermediate ring's
+// below that cutoff aliases.
+//
+// `fe=direct` IS AMBIGUOUS ON PURPOSE, AND THAT IS WHY IT IS ANNOUNCED ELSEWHERE.  It says only
+// that no stage ran; it does NOT say whether one was WANTED.  The two cases it covers are:
+//   (1) nothing was needed -- unity, an up-conversion, or a ratio the resampler serves directly;
+//   (2) something was needed and this build has none compiled in
+//       (APP_ASRC_RUNTIME_48K_TO_8 == 0), so the output IS aliased.
+// The field cannot tell them apart, because in case (2) the plan table -- which is compiled, but
+// is not consulted and has its 2/3 rows disabled -- answers den 1 for both cases alike.
+// audio_app_asrc_rate_pair_is_supported() therefore prints the sentence at pair-commit time (see
+// asrc_pair_wants_absent_frontend()).  Read a `fe=direct` line together with that announcement
+// before recording an alias / DR / THD+N figure from it -- F1(b), 2026-09-04. `fe=/4` / `fe=/6` name the divider, and the intermediate ring's
 // ovf/udf counters follow: those are the evidence that the stage is really in the path and
 // keeping up, so the divider identity and the counters both stay in the line (a bare 0/1 flag
 // would drop them). Printed as a continuation of the line above -- no leading newline.
@@ -3879,8 +4034,10 @@ float    audio_app_asrc_get_ff_frozen_ratio_ba( void )  { return s_asrc[ASRC_ENG
 // both 11.025 kHz and 12 kHz with different band edges, so the number alone cannot tell a
 // correctly selected set from a silently wrong one. The tag is a SUFFIX on the divider token,
 // which keeps `^/(\d+)` parses (tools/asrc/lowrate_sweep.py) working unchanged.
-// `num` is 1 for every divider chain and 2 for the 48 -> 32 kHz AUDIO MODE front end, which is a
-// 2/3 polyphase resampler rather than a decimator and prints as `fe=2/3:audio`.
+// `num` is 1 for every divider chain and 2 for the 32 kHz AUDIO MODE front end, which is a 2/3
+// polyphase resampler rather than a decimator: it prints as `fe=2/3:audio` from a 48 kHz leg and
+// `fe=2/6:audio` from a 96 kHz one, where den is the COMPOSED ratio of the /2 pre-stage and the
+// same 2/3 rear stage.  Both are the same partially-protecting filter and the same tag.
 static void asrc_dbg_print_frontend_field( uint32_t num, uint32_t den, const char* tag,
                                            uint32_t ovf, uint32_t udf )
 {

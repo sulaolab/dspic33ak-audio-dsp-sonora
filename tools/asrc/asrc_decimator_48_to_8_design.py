@@ -251,19 +251,61 @@ HALFRATE22K_STOPBAND_HZ = 11025.0
 # where energy would fold into it after the remaining decimation, at 48000 - final_Nyquist.  That
 # is an enormous transition width, and 21 taps clear the same stage-alone -100 dB bar (17.2 us).
 #
-# ONE SHARED SET COVERS ALL FOUR RATES -- no variant enum, no coefficient pointer, no `fe=` tag,
+# ONE SHARED SET COVERS THE WHOLE MENU -- no variant enum, no coefficient pointer, no `fe=` tag,
 # which is a genuine simplification over the /4 and /2 stages it sits in front of.  Designed
-# against the TIGHTEST case of the four: passband 6400 Hz (16 kHz needs it flat) and stopband from
-# 48000 - 8000 = 40000 Hz (16 kHz's edge, the lowest of the four).  Measured stage-alone at each
-# rate's own stopband edge, with the resulting passband-edge loss:
-#    8000 -> edge 44000 -> -107.50 dB, pb edge -0.0001 dB
-#   11025 -> edge 42488 -> -107.50 dB, pb edge -0.0000 dB
-#   12000 -> edge 42000 -> -107.50 dB, pb edge -0.0000 dB
-#   16000 -> edge 40000 -> -104.28 dB, pb edge -0.0000 dB   <- the binding case
+# against the TIGHTEST case: passband 15000 Hz (the 48 -> 32 kHz `:audio` stage's own passband
+# edge, and the widest second-stage passband in the menu) and stopband from 48000 - 16000 =
+# 32000 Hz (32 kHz's fold edge, the lowest).  Measured stage-alone at each rate's own stopband
+# edge, with the resulting passband-edge loss:
+#    8000 -> edge 44000 -> -124.22 dB, pb edge -0.0001 dB
+#   11025 -> edge 42488 -> -119.43 dB, pb edge -0.0001 dB
+#   12000 -> edge 42000 -> -119.43 dB, pb edge -0.0001 dB
+#   16000 -> edge 40000 -> -115.88 dB, pb edge -0.0001 dB
+#   22050 -> edge 36975 -> -112.77 dB, pb edge -0.0001 dB
+#   24000 -> edge 36000 -> -110.23 dB, pb edge -0.0001 dB
+#   32000 -> edge 32000 -> -108.38 dB, pb edge -0.0001 dB   <- the binding case
+#
+# WIDENED 21 -> 27 TAPS ON 2026-09-02, and the reason is a gate, not a filter.  The original set
+# was designed for four rates only (passband 6400 / stopband 40000) because 22.05 and 24 kHz were
+# deliberately left on the direct path: their R+jitter of 85 and 80 fitted the cap of 104, so a
+# front end bought them nothing.  ASRC_FILL_SLACK_REQUIRED (added 2026-08-24 from a 100-pair
+# hardware sweep) changed that criterion: the servo needs 8 frames of slack ABOVE R, and at
+# step 4.3537 (96/22.05) the setpoint clamps to R + ASRC_FILL_JITTER = 4, so
+# audio_app_asrc_rate_pair_is_supported() now REFUSES 96 k -> 22.05 kHz.  24 kHz survives only
+# because its step is exactly 4 and floor == ceil earns the exact-step exemption.  Giving 22.05 kHz
+# a composed /4 puts the resampler back at step 1.0884 (R 32, set 64, slack 32) and the pair is
+# accepted.  The old 21-tap set could NOT be reused for it: at the 36975 Hz fold edge it reads only
+# -58.09 dB (and -50.42 dB at 24 kHz's 36000 Hz), i.e. adding the row with the old coefficients
+# would have traded a refused pair for an aliased one.
+#
+# The set is designed to cover 24 kHz as well even though the routing gate does not yet publish a
+# den for it (that rate still resamples directly and is unprotected -- a separate decision).  The
+# cost of covering it is 2 taps, and it means enabling that row later needs no filter work at all.
 # Full-cascade check over each chain's own designed passband: ripple 0.0001 dB, min -0.0001 dB,
-# i.e. the pre-stage is transparent in band and adds no droop.  RAM cost +336 B (21 taps of
-# mirrored, channel-interleaved history); it does NOT share the union with the stages behind it,
-# because a composed chain runs both at once.
+# i.e. the pre-stage is transparent in band and adds no droop.  It does NOT share the history
+# union with the stages behind it, because a composed chain runs both at once.
+#
+# WIDENED AGAIN 27 -> 41 TAPS ON 2026-09-03, to admit the 96 -> 32 kHz row.  Same shape of reason
+# as the 21 -> 27 step: a new final rate moves the TIGHTEST case, and the old set does not merely
+# lose margin at it, it fails outright.  32 kHz is now the lowest fold edge in the menu
+# (48000 - 16000 = 32000 Hz, below 24 kHz's 36000) and its second stage -- the L=2/M=3 `:audio`
+# polyphase -- needs the pre-stage flat to 15000 Hz, the widest passband in the menu.  Swept at
+# that pair, the 27-tap set reads only -47.95 dB at the 32000 Hz fold edge: composing it would
+# have shipped an audible alias, not a thin margin.  41 taps is the minimum that clears the same
+# stage-alone -100 dB bar used everywhere in this file, at -108.38 dB.
+#
+# WHY THIS IS STILL ONE SHARED SET AND NOT A FOURTH VARIANT.  Widening to the 32 kHz case raises
+# the margin of ALL SIX existing rows -- uniformly -107.46 dB before, -110.23 .. -124.22 dB after
+# (table above) -- because every one of them has a fold edge above 32000 Hz and a passband below
+# 15000 Hz, so the new design dominates the old one pointwise.  A variant would buy nothing and
+# cost a selector.  The two WIDE variants below are different: their stopbands (25950 / 24000 Hz)
+# sit BELOW 32000, so no shared set can reach them.
+#
+# COST OF THE WIDENING.  14 more taps: RAM +112 B/ch of mirrored history (DEC_Q31_PRE_RING 41 ->
+# 55, so DEC_Q31_HIST_PER_CH 250 -> 264, ~ +448 B at 8 channels), and 14 more MACs per pre-stage
+# output.  Under the units = taps * (output_rate / 48000) model the pre-stage costs 41 units, i.e.
+# it is still a fraction of the 107 units a stand-alone /2 would need, which is the whole reason
+# the composed topology exists (see the 21 TAPS, NOT 107 paragraph above).
 #
 # DO NOT re-litigate the -99.78 dB reading at the 12 kHz cascade's 6000 Hz band edge: it is a
 # sampling artifact, not a defect.  It sits exactly ON the existing /4 chain's own stopband edge,
@@ -273,9 +315,39 @@ HALFRATE22K_STOPBAND_HZ = 11025.0
 # /4 chain alone would pass 12 kHz aliases at 0.00 dB, so the correct verdict is a ~100 dB
 # improvement (study section 6.7).
 PRESTAGE_INPUT_HZ = 96000.0
-PRESTAGE_PASSBAND_HZ = 6400.0
-PRESTAGE_STOPBAND_HZ = 40000.0
-PRESTAGE_TAPS = 21
+PRESTAGE_PASSBAND_HZ = 15000.0
+PRESTAGE_STOPBAND_HZ = 32000.0   # 48000 - 16000: the fold edge of a 32 kHz output
+PRESTAGE_TAPS = 41
+
+# TWO WIDE PRE-STAGE VARIANTS, for the only two 96 kHz rows the shared set above cannot serve
+# (2026-09-03).  Everything the shared set covers keeps using it; these do not replace it.
+#
+# WHY A VARIANT AND NOT A WIDER SHARED SET.  The pre-stage must remove whatever would fold into
+# the FINAL band, so its stopband edge is 48000 - final_Nyquist and its passband has to reach the
+# final band edge.  For a 48 kHz final rate that is a 20000 -> 24000 Hz transition at a 96 kHz
+# input -- 4.3x narrower than the shared set's 15000 -> 32000 Hz -- so the tap count goes
+# 41 -> 169 (the shared set reads only -7.48 dB at that fold edge, and -15.54 dB at the
+# 44.1 kHz one).  Running 169 taps on the rows that need 41 would cost every composed chain 4x the
+# MACs for attenuation none of them uses: stage-alone, the 169-tap set reads -111.39 dB at the
+# 44.1 kHz fold edge where 113 taps already give -100.68 dB, and the shared set reads -110.23 dB
+# at 24 kHz.  Hence three sets, selected by the FINAL rate.
+#
+# TAP COUNTS ARE MINIMA, swept against the same -100 dB stage-alone bar as the sets above:
+# 111 taps reads -91.92 dB and 167 taps -98.72 dB, so neither is "nearly enough".  Passband
+# ripple is 0.0001 dB and |H| at the 20 kHz band edge -0.0000 dB for both, i.e. these buy their
+# stopband without giving up the top of the audio band.
+#
+# NOT COMPOSED WITH ANYTHING.  Both variants serve a chain whose second stage is empty (96 ->
+# 48 kHz, and then the resampler pulls 48 -> 44.1 kHz or runs at step 1.0).  That is what lets
+# the Q31 front end hand them the whole history arena instead of the pre-stage reserve -- see
+# DEC_Q31_PRE_RING_WIDE in asrc_decimator_q31.inc.  A composed chain always takes the 27-tap set,
+# so no chain in the file ever needs a wide ring AND a second stage's rings at the same time.
+PRESTAGE44K1_PASSBAND_HZ = 20000.0
+PRESTAGE44K1_STOPBAND_HZ = 25950.0   # 48000 - 22050: the fold edge of a 44.1 kHz output
+PRESTAGE44K1_TAPS = 113
+PRESTAGE48K_PASSBAND_HZ = 20000.0
+PRESTAGE48K_STOPBAND_HZ = 24000.0    # 48000 - 24000: the fold edge of a 48 kHz output
+PRESTAGE48K_TAPS = 169
 
 # 48 kHz -> 32 kHz "Audio mode": the L=2/M=3 rational polyphase front end.
 #
@@ -453,18 +525,44 @@ def render_midrate(coeff: np.ndarray, crc: int) -> str:
     return "\n".join(lines)
 
 
-def render_prestage(coeff: np.ndarray, crc: int) -> str:
+def render_prestage(coeff: np.ndarray, crc: int,
+                    coeff_44k1: np.ndarray, crc_44k1: int,
+                    coeff_48k: np.ndarray, crc_48k: int) -> str:
     lines = [
         "/* Generated by tools/asrc_decimator_48_to_8_design.py.  Do not edit. */",
         "#ifndef ASRC_DECIMATOR_96_TO_48_COEFFS_INC",
         "#define ASRC_DECIMATOR_96_TO_48_COEFFS_INC",
         "",
+        "/* THREE coefficient sets and -- unlike the /2 and /4 variant pairs elsewhere in this",
+        " * generator -- their TAP COUNTS DIFFER.  That is the design, not an oversight: the",
+        " * shared set serves every chain that has a second stage behind it, and the two wide",
+        " * sets serve the two rows where the pre-stage IS the whole chain (96 -> 48 kHz, then",
+        " * the resampler).  Each variant's stopband sits on ITS final rate's fold edge,",
+        " * 48000 - final_Nyquist, which is what makes 41 taps enough for one and 169 necessary",
+        " * for another.  The sweep behind each count is in the PRESTAGE_ blocks of the",
+        " * generator; how a caller selects one is in asrc_decimator_48_to_8.h. */",
         f"#define ASRC_DECIMATOR_96_TO_48_COEFF_TAPS ({PRESTAGE_TAPS}u)",
+        f"#define ASRC_DECIMATOR_96_TO_48_OUT44K1_COEFF_TAPS ({PRESTAGE44K1_TAPS}u)",
+        f"#define ASRC_DECIMATOR_96_TO_48_OUT48K_COEFF_TAPS ({PRESTAGE48K_TAPS}u)",
         f"#define ASRC_DECIMATOR_96_TO_48_GENERATED_CRC32 (0x{crc:08X}UL)",
+        f"#define ASRC_DECIMATOR_96_TO_48_OUT44K1_GENERATED_CRC32 (0x{crc_44k1:08X}UL)",
+        f"#define ASRC_DECIMATOR_96_TO_48_OUT48K_GENERATED_CRC32 (0x{crc_48k:08X}UL)",
         f"#define ASRC_DECIMATOR_96_TO_48_KAISER_BETA ({KAISER_BETA:.1f}f)",
         "",
+        "/* Variant SHARED (every composed chain): passband "
+        f"{PRESTAGE_PASSBAND_HZ:.0f} Hz, stopband {PRESTAGE_STOPBAND_HZ:.0f} Hz */",
     ]
     lines.extend(format_array("s_96_to_48_coeff", coeff))
+    lines.append("")
+    lines.append("/* Variant FOR_44100: passband "
+                 f"{PRESTAGE44K1_PASSBAND_HZ:.0f} Hz, stopband "
+                 f"{PRESTAGE44K1_STOPBAND_HZ:.0f} Hz */")
+    lines.extend(format_array("s_96_to_48_out44k1_coeff", coeff_44k1))
+    lines.append("")
+    lines.append("/* Variant FOR_48000: passband "
+                 f"{PRESTAGE48K_PASSBAND_HZ:.0f} Hz, stopband "
+                 f"{PRESTAGE48K_STOPBAND_HZ:.0f} Hz */")
+    lines.extend(format_array("s_96_to_48_out48k_coeff", coeff_48k))
     lines.extend(["", "#endif /* ASRC_DECIMATOR_96_TO_48_COEFFS_INC */", ""])
     return "\n".join(lines)
 
@@ -616,6 +714,18 @@ def main() -> int:
         PRESTAGE_PASSBAND_HZ,
         PRESTAGE_STOPBAND_HZ,
     )
+    prestage_44k1 = design(
+        PRESTAGE44K1_TAPS,
+        PRESTAGE_INPUT_HZ,
+        PRESTAGE44K1_PASSBAND_HZ,
+        PRESTAGE44K1_STOPBAND_HZ,
+    )
+    prestage_48k = design(
+        PRESTAGE48K_TAPS,
+        PRESTAGE_INPUT_HZ,
+        PRESTAGE48K_PASSBAND_HZ,
+        PRESTAGE48K_STOPBAND_HZ,
+    )
     poly32_phase0, poly32_phase1, poly32_proto = design_32k_polyphase()
     crc = coefficient_crc32(stage1, stage2)
     midrate_crc = coefficient_crc32(midrate)
@@ -624,6 +734,8 @@ def main() -> int:
     quarter_crc = coefficient_crc32(quarter1, quarter2)
     quarter12k_crc = coefficient_crc32(quarter12k_1, quarter12k_2)
     prestage_crc = coefficient_crc32(prestage)
+    prestage_44k1_crc = coefficient_crc32(prestage_44k1)
+    prestage_48k_crc = coefficient_crc32(prestage_48k)
     poly32_crc = coefficient_crc32(poly32_phase0, poly32_phase1)
     expected_poly32 = render_poly32(poly32_phase0, poly32_phase1, poly32_crc)
     expected = render(stage1, stage2, crc)
@@ -632,7 +744,9 @@ def main() -> int:
                                         halfrate22k, halfrate22k_crc)
     expected_quarter = render_quarter(quarter1, quarter2, quarter_crc,
                                       quarter12k_1, quarter12k_2, quarter12k_crc)
-    expected_prestage = render_prestage(prestage, prestage_crc)
+    expected_prestage = render_prestage(prestage, prestage_crc,
+                                        prestage_44k1, prestage_44k1_crc,
+                                        prestage_48k, prestage_48k_crc)
     expected_tone = render_tone()
     r1, s1 = response(stage1, STAGE1_INPUT_HZ, PASSBAND_HZ, STAGE1_STOPBAND_HZ)
     r2, s2 = response(stage2, STAGE2_INPUT_HZ, PASSBAND_HZ, STAGE2_STOPBAND_HZ)
@@ -741,9 +855,9 @@ def main() -> int:
         f"pass={PRESTAGE_PASSBAND_HZ:.0f} stop={PRESTAGE_STOPBAND_HZ:.0f} "
         f"ripple={rp:.6f} dB stop={sp:.2f} dB"
     )
-    # One shared set serves four final rates, so the binding number is the worst attenuation in
-    # EACH rate's own fold band (48000 - its Nyquist), not just at the designed 40000 Hz edge.
-    for final_hz in (8000.0, 11025.0, 12000.0, 16000.0):
+    # One shared set serves every final rate, so the binding number is the worst attenuation in
+    # EACH rate's own fold band (48000 - its Nyquist), not just at the designed stopband edge.
+    for final_hz in (8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0):
         edge_hz = 48000.0 - (final_hz * 0.5)
         _, worst = response(prestage, PRESTAGE_INPUT_HZ, PRESTAGE_PASSBAND_HZ, edge_hz)
         print(
@@ -751,6 +865,24 @@ def main() -> int:
             f"worst={worst:.2f} dB"
         )
     print(f"prestage_crc32=0x{prestage_crc:08X} dc={float(np.sum(prestage)):.9f}")
+
+    # The two wide variants.  Each is reported at ITS OWN fold edge only: one variant serves one
+    # final rate, so there is no shared-set style sweep over rates to do here.
+    for label, taps_w, coeff_w, pb_w, sb_w in (
+        ("prestage44k1", PRESTAGE44K1_TAPS, prestage_44k1,
+         PRESTAGE44K1_PASSBAND_HZ, PRESTAGE44K1_STOPBAND_HZ),
+        ("prestage48k", PRESTAGE48K_TAPS, prestage_48k,
+         PRESTAGE48K_PASSBAND_HZ, PRESTAGE48K_STOPBAND_HZ),
+    ):
+        rw, sw = response(coeff_w, PRESTAGE_INPUT_HZ, pb_w, sb_w)
+        print(
+            f"{label}: taps={taps_w} fs={PRESTAGE_INPUT_HZ:.0f} pass={pb_w:.0f} "
+            f"stop={sb_w:.0f} ripple={rw:.6f} dB stop={sw:.2f} dB"
+        )
+    print(f"prestage44k1_crc32=0x{prestage_44k1_crc:08X} "
+          f"dc={float(np.sum(prestage_44k1)):.9f}")
+    print(f"prestage48k_crc32=0x{prestage_48k_crc:08X} "
+          f"dc={float(np.sum(prestage_48k)):.9f}")
 
     # 48 -> 32 kHz Audio mode.  The stopband figure below is the PROTOTYPE's own attenuation
     # above the 16 kHz output Nyquist on the 96 kHz axis; it is NOT the chain's worst alias,

@@ -31,11 +31,13 @@ HALFRATE_TONES = (1000, 8000, 8800, 13000, 18000, 23000)
 # identical ground.
 HALFRATE22K_TONES = (1000, 7000, 7800, 11500, 13000, 18000, 23000)
 FS_IN_96 = 96000
-# The 96 -> 48 kHz pre-stage, measured at ITS input rate.  6300 Hz sits just inside the 6400 Hz
-# passband edge (the 16 kHz chain needs it flat).  The rest are fold sources against the tightest
-# final rate, 16 kHz: 40000/44000/48000 Hz all land in or below the 8000 Hz final band after the
-# remaining /3, and 41000 Hz is the designed stopband edge plus a margin.  1000 Hz pins the gain.
-PRESTAGE_TONES = (1000, 6300, 41000, 44000, 48000)
+# The 96 -> 48 kHz pre-stage, measured at ITS input rate.  8700 Hz sits just inside the 8850 Hz
+# passband edge (the 48 -> 24 kHz `:24k` stage, the widest second-stage passband, needs it flat).
+# The rest are fold sources against the tightest final rate, 24 kHz, whose fold edge is
+# 48000 - 12000 = 36000 Hz: 37000 Hz is that edge plus a margin and is also above 22.05 kHz's
+# 36975 Hz edge, and 41000/44000/48000 Hz all fold into the final band of the lower rates.
+# 1000 Hz pins the gain.
+PRESTAGE_TONES = (1000, 8700, 37000, 41000, 44000, 48000)
 
 
 class StreamingReference:
@@ -315,6 +317,18 @@ def main() -> int:
         design.PRESTAGE_PASSBAND_HZ,
         design.PRESTAGE_STOPBAND_HZ,
     )
+    hpre44 = design.design(
+        design.PRESTAGE44K1_TAPS,
+        design.PRESTAGE_INPUT_HZ,
+        design.PRESTAGE44K1_PASSBAND_HZ,
+        design.PRESTAGE44K1_STOPBAND_HZ,
+    )
+    hpre48 = design.design(
+        design.PRESTAGE48K_TAPS,
+        design.PRESTAGE_INPUT_HZ,
+        design.PRESTAGE48K_PASSBAND_HZ,
+        design.PRESTAGE48K_STOPBAND_HZ,
+    )
 
     failures: list[str] = []
     if not np.array_equal(hpre, hpre[::-1]):
@@ -501,11 +515,11 @@ def main() -> int:
         )
     if abs(pre_levels[1000] - (-1.0)) > 0.05:
         failures.append(f"96-to-48 1 kHz gain is {pre_levels[1000]:.3f} dBFS")
-    # 6300 Hz is just inside the passband edge and must survive: a pre-stage that ate the top of
-    # the 16 kHz chain's band would be a regression the alias checks below cannot see.
-    if abs(pre_levels[6300] - (-1.0)) > 0.1:
-        failures.append(f"96-to-48 6300 Hz passband edge is {pre_levels[6300]:.3f} dBFS")
-    for freq in (41000, 44000, 48000):
+    # 8700 Hz is just inside the passband edge and must survive: a pre-stage that ate the top of
+    # the 24 kHz chain's band would be a regression the alias checks below cannot see.
+    if abs(pre_levels[8700] - (-1.0)) > 0.1:
+        failures.append(f"96-to-48 8700 Hz passband edge is {pre_levels[8700]:.3f} dBFS")
+    for freq in (37000, 41000, 44000, 48000):
         if pre_levels[freq] > -90.0:
             failures.append(
                 f"96-to-48 {freq} Hz alias {pre_levels[freq]:.2f} dBFS exceeds -90 dBFS"
@@ -523,6 +537,7 @@ def main() -> int:
     # Stage rates are explicit because they differ per chain -- /3 and the /6's and /4's first
     # stages run at 48 kHz, the /6's second stage at 16 kHz and the /4's at 24 kHz.
     prestage_chains = (
+        (22050.0, "/2 +/2", design.HALFRATE22K_PASSBAND_HZ, ((h22, 48000.0),)),
         (16000.0, "/2 +/3", design.MIDRATE_PASSBAND_HZ, ((h16, 48000.0),)),
         (12000.0, "/2 +/4", design.QUARTER12K_PASSBAND_HZ, ((hq12_1, 48000.0), (hq12_2, 24000.0))),
         (11025.0, "/2 +/4", design.QUARTER_PASSBAND_HZ, ((hq_1, 48000.0), (hq_2, 24000.0))),
@@ -539,7 +554,7 @@ def main() -> int:
             f"{final_hz:.0f}Hz({label},pb{passband_hz:.0f}) ripple={c_ripple:.4f} "
             f"added={added_droop:+.6f}"
         )
-        # The pre-stage is designed flat to 6400 Hz, above every chain's passband, so any real
+        # The pre-stage is designed flat to 8850 Hz, at or above every chain's passband, so any real
         # in-band droop it introduced would show up here as a negative number.
         if added_droop < -0.01 or float(np.max(added)) > 0.01:
             failures.append(
@@ -551,6 +566,54 @@ def main() -> int:
                 f"96k cascade to {final_hz:.0f} Hz has {c_ripple:.4f} dB ripple over its own "
                 f"0..{passband_hz:.0f} Hz passband"
             )
+
+    # THE TWO WIDE PRE-STAGE VARIANTS (96 -> 44.1 kHz and 96 -> 48 kHz).  Each runs ALONE -- no
+    # second stage -- so there is no cascade to check; what has to hold is that the variant
+    # protects its OWN fold band while leaving the whole audio band intact, and that the shared
+    # set could not have done the job.  The last part is the one worth automating: "reuse the set
+    # we already have" is the change someone will try, and at these fold edges it reads -40 dB.
+    wide_report: list[str] = []
+    for label, coeff_w, taps_w, pb_w, sb_w, fold_tones in (
+        ("FOR_44100", hpre44, design.PRESTAGE44K1_TAPS,
+         design.PRESTAGE44K1_PASSBAND_HZ, design.PRESTAGE44K1_STOPBAND_HZ,
+         (25950, 30000, 38000, 48000)),
+        ("FOR_48000", hpre48, design.PRESTAGE48K_TAPS,
+         design.PRESTAGE48K_PASSBAND_HZ, design.PRESTAGE48K_STOPBAND_HZ,
+         (24000, 30000, 38000, 48000)),
+    ):
+        if coeff_w.size != taps_w:
+            failures.append(f"96-to-48 {label} has {coeff_w.size} taps, expected {taps_w}")
+        if not np.array_equal(coeff_w, coeff_w[::-1]):
+            failures.append(f"96-to-48 {label} coefficients are not exactly float32 symmetric")
+        w_ripple, w_stop = design.response(coeff_w, design.PRESTAGE_INPUT_HZ, pb_w, sb_w)
+        if w_ripple > 0.01 or w_stop > -100.0:
+            failures.append(
+                f"96-to-48 {label} response ripple={w_ripple:.6f} stop={w_stop:.2f} dB")
+        # The audio band must survive to 20 kHz: these variants exist to serve a 44.1/48 kHz
+        # OUTPUT, so a variant that bought its stopband by rolling off at 16 kHz would be the
+        # partial-protection option, which is not what is being built here.
+        edge_level = prestage_tone_level(20000, coeff_w)
+        if abs(edge_level - (-1.0)) > 0.1:
+            failures.append(f"96-to-48 {label} 20 kHz passband edge is {edge_level:.3f} dBFS")
+        w_levels = {freq: prestage_tone_level(freq, coeff_w) for freq in fold_tones}
+        for freq, level in w_levels.items():
+            if level > -90.0:
+                failures.append(
+                    f"96-to-48 {label} {freq} Hz alias {level:.2f} dBFS exceeds -90 dBFS")
+        # Why the variant exists at all, as a number rather than as a comment.  Probed 1 kHz
+        # INSIDE the fold band rather than on the edge: a tone exactly at 24000 Hz lands on the
+        # decimated stream's own Nyquist, where the RMS measurement collapses to -218 dBFS and
+        # would read as "the shared set already handles this".
+        probe_hz = int(sb_w) + 1000
+        shared_at_edge = prestage_tone_level(probe_hz, hpre)
+        if shared_at_edge <= -90.0:
+            failures.append(
+                f"the shared 27-tap set already buries {probe_hz} Hz at {shared_at_edge:.2f} "
+                f"dBFS -- the {label} variant would be redundant")
+        wide_report.append(
+            f"{label}(taps{taps_w},pb{pb_w:.0f},sb{sb_w:.0f}) ripple={w_ripple:.6f} "
+            f"stop={w_stop:.2f} 20kHz={edge_level:.2f} shared@{probe_hz}={shared_at_edge:.2f}"
+        )
 
     dc = cascade(np.ones(FS_IN, dtype=np.float64), h1, h2)[4096:]
     dc_error = float(abs(np.mean(dc) - 1.0))
@@ -601,6 +664,9 @@ def main() -> int:
         + " ".join(f"{freq}Hz={level:.2f}dBFS" for freq, level in pre_levels.items())
     )
     print("prestage_cascade: " + "  ".join(cascade_report))
+    print(f"prestage44k1_crc32=0x{design.coefficient_crc32(hpre44):08X} "
+          f"prestage48k_crc32=0x{design.coefficient_crc32(hpre48):08X}")
+    print("prestage_wide: " + "  ".join(wide_report))
 
     if failures:
         for failure in failures:

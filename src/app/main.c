@@ -1049,7 +1049,32 @@ static void init_ports( void )
         .initial_high = false,
     };
     (void)nora_gpio_config(BOARD_DBG_PIN_H0, &dbg_cfg);
+#if defined(ENA_TOUCH_SHIELD_PHASE)
+    /* The ITC owns RE4 in this build: it is CVDTX23, selected into group A by
+     * ITCTXA and driven in phase with each CVD sample by the commands' PCA field
+     * (nora_itc_dspic33ak.c). Configuring it as a GPIO output here would fight
+     * the peripheral for the pin, so the static-Low shield is deliberately not
+     * applied -- digital input, driver off, and the ITC drives it.
+     *
+     * shield_cfg is still the *control* configuration: build without this switch
+     * to get the grounded static shield back, which is the A of the A/B. Do not
+     * leave the pin as an analog input; ANSEL is cleared here for the same reason
+     * every other pin sets its own mode. */
+    {
+        static const nora_gpio_config_t shield_itc_cfg =
+        {
+            .dir          = NORA_GPIO_DIR_INPUT,
+            .pull         = NORA_GPIO_PULL_NONE,
+            .analog       = false,
+            .open_drain   = false,
+            .initial_high = false,
+        };
+        (void)nora_gpio_config(BOARD_DBG_PIN_E4, &shield_itc_cfg);
+        (void)shield_cfg;
+    }
+#else
     (void)nora_gpio_config(BOARD_DBG_PIN_E4, &shield_cfg);
+#endif
 
 #endif //APP_TARGET == APP_TARGET_AK512
 }

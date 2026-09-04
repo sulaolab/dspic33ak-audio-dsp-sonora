@@ -237,6 +237,15 @@ void touch_console_onmsg( app_console_msg_t* msg )
     case 'i':   /* ?ki : print state.  *ki <cvdan>... : configure list 0 */
         if( msg->kind == '?' )
         {
+            /* Sync first: s_charge_ns / s_balance_ns are this console's copies, and
+             * when nora_touch owns the list they start at this file's defaults and
+             * never see what nora_touch actually asked for. Without this, ?ki
+             * printed "charge 250 TAD (2000 ns asked)" after the HAL's default was
+             * changed to 5,000 ns -- the TAD is read from the register and was
+             * right, the "asked" was this file's stale 2,000. Measured 2026-08-30,
+             * and it is the worst possible field to be wrong: the whole point of
+             * printing both is to show a request that rounded badly. */
+            touch_console_sync_from_owner();
             touch_console_print_info();
             msg->status = APP_CONSOLE_OK;
             break;

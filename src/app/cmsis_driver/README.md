@@ -193,7 +193,7 @@ Driver_I2Cx.Control(ARM_I2C_BUS_SPEED, ARM_I2C_BUS_SPEED_STANDARD);
 `ARM_DRIVER_OK` and the WM8904 device ID read / init succeeded at the new speed.
 
 Verified at 100 kHz, 150 kHz, 200 kHz, 300 kHz and 400 kHz. The 100 kHz case in
-particular depends on the upstream HAL STOP-completion fix: STOP waits for
+particular depends on the HAL STOP-completion behaviour: STOP waits for
 `CON1.PEN` to clear, not just `STAT2.STOPE`.
 
 ---
@@ -204,7 +204,7 @@ particular depends on the upstream HAL STOP-completion fix: STOP waits for
 
 `Driver_SAI_dsPIC33AK.{c,h}` maps the ARM CMSIS-Driver SAI API onto the
 `nora_spi_i2s_tdm` HAL and is integrated into the opt-in Sonora validation
-routes. The canonical public wrapper specification is maintained in
+routes. Its public API reference is
 [dspic33ak-sai-cmsis-driver](https://github.com/sulaolab/dspic33ak-sai-cmsis-driver).
 The official ARM `Driver_SAI.h` (Apache-2.0, API v1.2) is vendored under
 `src/third_party/arm_cmsis_driver/Include/`.

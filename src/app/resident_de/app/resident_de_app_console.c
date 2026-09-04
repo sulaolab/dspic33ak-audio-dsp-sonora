@@ -9,6 +9,9 @@
 
 #include "hal_nvm/nora_nvm.h"
 #include "audio_transport/audio_transport.h"
+/* Same-side sibling: the resident-presence oracle lives with the handoff code that owns the
+ * boot banner, so the banner and this refusal can never disagree. */
+#include "resident_de/app/resident_de_app_handoff.h"
 /* App-side console plumbing: which port the command in flight arrived on. This is a
  * same-side dependency (both this file and app_debug.c are application code); the
  * bootloader image compiles neither. */
@@ -144,6 +147,43 @@ void resident_de_app_console_onmsg(app_console_msg_t *msg)
          * *feaa55 below; 0xA5 here is now simply rejected. */
         if ((msg->data_len != 1u) || (msg->data[0] != 0x5Au))
         {
+            msg->data_len = 0u;
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            return;
+        }
+        /* REFUSE when no compatible resident engine is there to receive the request.
+         *
+         * Placed ahead of everything else on purpose: past this point the handler mutes the
+         * analog output, stops the telemetry and resets the CPU. With no engine in Flash the
+         * reset lands straight back in this application about 14 ms later -- measured
+         * 2026-09-02 -- and the operator is left with a silent, telemetry-dead board and no
+         * hint why. Nothing is armed and nothing is muted on this path.
+         *
+         * resident_de_app_resident_is_present() is the oracle -- a programmed boot region
+         * AND a cross-reset container of this generation. NOT the container alone: it lives
+         * in no-init RAM, so after the engine is erased and the board merely reset it still
+         * reads established and would answer "present" (measured 2026-09-02). The pipe's
+         * cause record is not consulted either: it was added without a layout-version bump,
+         * so a compatible older engine does not write one and would be judged absent.
+         *
+         * This is not the "never refuse an arm" case argued below for *ts. That warning
+         * exists so a doubtful mute cannot strand an operator who still has a working way
+         * in; here the arm is guaranteed to fail, and the refusal names the real way in. */
+        if (!resident_de_app_resident_is_present())
+        {
+            printf(" resident update: REFUSED -- no usable resident bootloader detected"
+                   " (boot region empty, or a cross-reset layout this build cannot use)."
+                   " Nothing was armed, the transport was NOT muted and the board was"
+                   " NOT reset\n");
+            printf(" resident update: this is what an image built and programmed from"
+                   " MPLAB X looks like -- the IDE flashes the application ONLY and never"
+                   " pairs the resident bootloader, so the serial downloader cannot run."
+                   " Build and flash with buildtools instead: switch_config.ps1, then"
+                   " build.ps1, then program"
+                   " dist/<conf>/production/*.factory.production.hex once over"
+                   " PKOB4/PICkit. See buildtools/README.md \"Support scope\"\n");
+            printf(" resident update: other ways in -- Button 3 held at reset, or *feaa55"
+                   " to erase the manifest page\n");
             msg->data_len = 0u;
             msg->status = APP_CONSOLE_ERR_BAD_DATA;
             return;

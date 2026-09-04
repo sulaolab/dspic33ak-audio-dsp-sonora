@@ -54,21 +54,90 @@
 
 // Which front-end implementation this build uses.
 //
-// Q31 16ch is the shipping front end: same chains, same coefficients, same band edges as the
-// float one, with the arithmetic in Q31 and the width at ASRC_CH.  It is selected for every build
-// EXCEPT a 96 kHz one, because a 96 kHz leg composes a 21-tap 96 -> 48 kHz pre-stage in front of
-// these chains and that pre-stage is still stereo float.  96 kHz and BIDIR are mutually exclusive
-// (asrc_app_validate.h #errors on the pair), so the shipping BIDIR image never compiles the float
-// arm at all.
+// Q31 is the front end, for every rate: same chains, same coefficients, same band edges as the
+// float family, with the arithmetic in Q31 and the width at ASRC_CH.  The 96 -> 48 kHz pre-stage a
+// 96 kHz leg composes in front of those chains is a Q31 cascade stage inside it, so nothing here
+// selects on a rate any more.
 //
-// Follow-up, deliberately NOT done here: the 96 kHz down-conversion front end remains stereo and
-// the current 21-tap 96 -> 48 pre-stage is designed only as the first stage of deeper decimation;
-// Nyquist-safe 96 -> 48/44.1/etc. requires a separate 16ch audit.
-#if APP_USE_96K_RATE
-#define PATH_FRONTEND_Q31 (0)
-#else
+// THIS DEFINITION USED TO BE `#if APP_USE_96K_RATE -> 0`, and the shape of that arm is worth
+// keeping on record because it is the shape to refuse if it is ever proposed again.  It read a RATE
+// and picked an IMPLEMENTATION, which then imposed ITS capacity as the processing width:
+//
+//     rate == 96 kHz  ->  float implementation  ->  2 channels  ->  front end narrower than ASRC_CH
+//
+// The correct direction is the opposite one -- state the requirement (this rate, ASRC_CH channels,
+// this band limit), then select an implementation that MEETS it, or fail.  Both halves of that are
+// still here: the conformance check below is the failure, made explicit, and the pair gate refuses
+// the pairs that would need a disqualified front end.  They now pass rather than being vacuous,
+// which is the point -- they are a conformance test kept live against a future narrow
+// implementation, not scaffolding to delete once it goes green.
+//
+// No build selects 0 today.  The float arms below are kept as the documented alternative (and as
+// what the boot selftest's oracle compares against), not as a reachable configuration.
 #define PATH_FRONTEND_Q31 (1)
+
+/* CHANNEL-WIDTH AUTHORITY.  Read this before touching any channel count in this file.
+ *
+ * `ASRC_CH` is the ASRC LOGICAL width and the only authority over how many channels the front end,
+ * the history and the resampler process.  `APP_SLOTS_PER_FS` is the PHYSICAL I/O width and is
+ * confined to the two mapping ends (replicate into ASRC_CH on the way in, narrow to slots on the
+ * way out).  An implementation's own capability -- ASRC_DECIMATOR_FLOAT_MAX_CHANNELS -- may only
+ * select or VALIDATE an implementation; it may not set a width, and one that cannot carry ASRC_CH
+ * is disqualified rather than used narrow.
+ *
+ * These arrows are forbidden, and each of them has been a real bug here:
+ *   APP_SLOTS_PER_FS  --X-->  front-end width      (a 2-slot bus is not a 2-channel filter)
+ *   float capacity    --X-->  ASRC_CH              (a legacy limit is not a product spec)
+ *   sample rate       --X-->  logical width        (see the selection above, and below)
+ *   test width        --X-->  shipping width
+ *
+ * This is rate-independent on purpose.  It is not a 96 kHz rule: the same three concepts and the
+ * same forbidden arrows apply at 8 kHz, on AK128, and at 24 channels.  The point of the ASRC is
+ * that the codec on the evaluation board is one possible endpoint, not the specification.
+ *
+ * PATH_FRONTEND_CH is the width the SELECTED implementation actually processes.  The check below is
+ * a conformance test, not a limit. */
+#if PATH_FRONTEND_Q31
+#define PATH_FRONTEND_CH  (ASRC_CH)
+#else
+#define PATH_FRONTEND_CH  (ASRC_DECIMATOR_FLOAT_MAX_CHANNELS)
 #endif
+
+/* Every channel count in this file now derives from one of exactly three named quantities, so a
+ * reader can tell which concept a number belongs to without tracing it:
+ *
+ *   PATH_DECIMATED_STRIDE   the second stage's output width   = the selected implementation's
+ *   PRESTAGE_STRIDE         the pre-stage's output width      = the selected implementation's
+ *   PATH_SOURCE_REAL_CH     how many channels the SOURCE really carries -- PHYSICAL, and the one
+ *                           place a small number is correct.  The front end repeats it up to its
+ *                           own width internally, so this is an input fact, never a width.
+ *
+ * Both strides follow PATH_FRONTEND_CH rather than a literal, which is what makes porting the
+ * pre-stage to the Q31 front end widen the whole chain by changing one selection. */
+#define PATH_DECIMATED_STRIDE (PATH_FRONTEND_CH)
+#define PRESTAGE_STRIDE       (PATH_FRONTEND_CH)
+#define PATH_SOURCE_REAL_CH   (2u)
+
+/* DISQUALIFICATION, and there is no override.  An implementation that cannot carry ASRC_CH does
+ * not get to serve a narrower path: it is simply not usable as a front end.  There is deliberately
+ * no acknowledgement macro, no -Define escape and no "the codec is 2 ch anyway" exemption --
+ * every one of those is a way of writing "reduce the width until it fits", and a width reduced to
+ * fit measures nothing.  For an anti-alias stage it is worse: filtering fewer channels than the
+ * resampler converts is a MISSING stage, and down-conversion without one is not correct at any
+ * channel count.
+ *
+ * What this must NOT do is fail a build that never asks for a front end.  Whether a front end is
+ * needed is a property of the RATE PAIR, and rate pairs are runtime here (`*ar` moves either leg).
+ * So the compile-time statement is only "this implementation is/is not usable", and the pairs that
+ * need one are refused at the pair gate, with a reason, before any stream teardown -- see
+ * audio_app_asrc_rate_pair_is_supported().  A pair that needs no front end (unity, up-conversion,
+ * any ratio the resampler serves directly) is unaffected and keeps working. */
+#define PATH_FRONTEND_SERVES_LOGICAL_WIDTH  ((PATH_FRONTEND_CH) >= (ASRC_CH))
+
+bool asrc_audio_path_frontend_can_serve_logical_width( void )
+{
+    return PATH_FRONTEND_SERVES_LOGICAL_WIDTH;
+}
 
 // Scratch capacity for one block of decimated frames.  A /den front end emits at most
 // ceil(APP_BLOCK_FRAMES / den) frames per block, so the SMALLEST divider the routing gate can
@@ -153,6 +222,7 @@ _Static_assert( PRESTAGE_BLOCK_CAPACITY * PRESTAGE_DEN >= (uint32_t)APP_BLOCK_FR
 _Static_assert( DECIMATED_BLOCK_CAPACITY * 6u >= PRESTAGE_BLOCK_CAPACITY, "/2+/6 block overflow" );
 _Static_assert( DECIMATED_BLOCK_CAPACITY * 4u >= PRESTAGE_BLOCK_CAPACITY, "/2+/4 block overflow" );
 _Static_assert( DECIMATED_BLOCK_CAPACITY * 3u >= PRESTAGE_BLOCK_CAPACITY, "/2+/3 block overflow" );
+_Static_assert( DECIMATED_BLOCK_CAPACITY * 2u >= PRESTAGE_BLOCK_CAPACITY, "/2+/2 block overflow" );
 // The float front ends, one per divider, overlaid because only one is ever live.  The Q31 front
 // end owns its own storage (Y history, X coefficients) and needs none of this.
 #if !PATH_FRONTEND_Q31
@@ -164,21 +234,21 @@ static union
     asrc_decimator_48_to_12_t to_12;
 } s_path_decimator;
 #endif
-#if APP_USE_96K_RATE
-// Deliberately OUTSIDE the union: on a composed 96 kHz chain the pre-stage and one union member
-// are both live within the same block, so they cannot overlay each other.  +336 B of history.
-// Gated on APP_USE_96K_RATE so a 48 kHz build carries neither the history nor the scratch.
+#if APP_USE_96K_RATE && !PATH_FRONTEND_Q31
+// The FLOAT pre-stage's own state, and its intermediate 48 kHz scratch.  Deliberately OUTSIDE the
+// union: on a composed 96 kHz chain the pre-stage and one union member are both live within the
+// same block, so they cannot overlay each other.  +336 B of history plus the scratch.
+//
+// The Q31 front end needs neither: its pre-stage is a cascade stage with a reserve inside the one Y
+// history arena it already owns, and the intermediate frames live in its own inter-stage buffer.
+// So this pair exists only for the float arm, and a Q31 96 kHz build allocates none of it.
 static asrc_decimator_96_to_48_t s_path_prestage;
-static int32_t s_path_prestage_out[PRESTAGE_BLOCK_CAPACITY * 2u];
+static int32_t s_path_prestage_out[PRESTAGE_BLOCK_CAPACITY * PRESTAGE_STRIDE];
 #endif
-// Channels in the decimated block.  The Q31 front end computes ASRC_CH of them (the extra ones
-// are the 16ch workload, not audio -- see asrc_decimator_q31.inc), so the scratch has to be wide
-// enough to RECEIVE them even though the push below only ever reads channels 0 and 1.
-#if PATH_FRONTEND_Q31
-#define PATH_DECIMATED_STRIDE (ASRC_CH)
-#else
-#define PATH_DECIMATED_STRIDE (2u)
-#endif
+// The decimated block carries PATH_DECIMATED_STRIDE channels (defined with the width authority
+// above): the front end computes that many -- the extra ones beyond the physical slots are the
+// multi-channel workload, not audio -- so the scratch has to be wide enough to RECEIVE them even
+// though the push below only ever reads channels 0 and 1.
 static int32_t s_path_decimated[DECIMATED_BLOCK_CAPACITY * PATH_DECIMATED_STRIDE];
 #if PATH_FRONTEND_Q31
 // The 16ch isolation selftest below borrows this buffer instead of putting a second 16ch block on
@@ -252,6 +322,17 @@ static volatile uint8_t s_path_frontend_second_den;
 // telemetry printer; a pointer store is atomic on this core.
 static const char* s_path_frontend_tag = "";
 
+/* The pre-stage set that a COMPOSED chain always uses: a second stage behind the pre-stage means
+ * the shared 27-tap set by construction (a wide variant is designed for a 44.1/48 kHz final band
+ * and is refused with anything behind it -- see asrc_decimator_q31_init()).  Spelled as a macro
+ * because it is also the argument that must VANISH in a build with no 96 kHz leg, where
+ * path_stage_init() has no vpre parameter at all. */
+#if APP_USE_96K_RATE
+#define PATH_PRESTAGE_COMPOSED  ASRC_DECIMATOR_96_TO_48_SHARED,
+#else
+#define PATH_PRESTAGE_COMPOSED
+#endif
+
 // One stage init for an already-resolved divider and its coefficient variants.  The Q31 front end
 // takes them all at once (its chain table is internal, and the variant arguments it does not need
 // are ignored); each float front end takes its own struct instead.  So the divider dispatch lives
@@ -260,18 +341,35 @@ static const char* s_path_frontend_tag = "";
 // is identical for both arithmetics: this swap is Q31-for-float, not a filter redesign.
 static bool path_stage_init( uint32_t num, uint32_t den,
                             asrc_decimator_48_to_24_variant_t v24,
-                            asrc_decimator_48_to_12_variant_t v12 )
+                            asrc_decimator_48_to_12_variant_t v12,
+#if APP_USE_96K_RATE
+                            asrc_decimator_96_to_48_variant_t vpre,
+#endif
+                            bool with_prestage )
 {
 #if PATH_FRONTEND_Q31
-    return asrc_decimator_q31_init( num, den, (uint8_t)ASRC_CH, v24, v12 );
+    return asrc_decimator_q31_init( num, den, (uint8_t)ASRC_CH, v24, v12,
+#if APP_USE_96K_RATE
+                                   vpre,
+#endif
+                                   with_prestage );
 #else
+    // The float family's pre-stage is a SEPARATE object driven by the caller (see
+    // path_decimator_process()), not a stage of this chain, so a composed request has no meaning
+    // here.  Refuse it rather than return a chain that is silently missing its first stage.
+    if( with_prestage ) { return false; }
+#if APP_USE_96K_RATE
+    (void)vpre;   // the float pre-stage is the shared set only; its caller refuses the rest
+#endif
     // No float front end is rational, so a num != 1 request has no implementation here and must
     // fail CLOSED rather than quietly running the 1/den chain at the wrong output rate.
     if( num != 1u ) { return false; }
-    if( den == 6u ) { return asrc_decimator_48_to_8_init( &s_path_decimator.to_8, 2u ); }
-    if( den == 4u ) { return asrc_decimator_48_to_12_init( &s_path_decimator.to_12, 2u, v12 ); }
-    if( den == 3u ) { return asrc_decimator_48_to_16_init( &s_path_decimator.to_16, 2u ); }
-    if( den == 2u ) { return asrc_decimator_48_to_24_init( &s_path_decimator.to_24, 2u, v24 ); }
+    /* PATH_DECIMATED_STRIDE, not a literal: these stages must run at exactly the width their
+     * output scratch is strided by, and both follow the implementation the build selected. */
+    if( den == 6u ) { return asrc_decimator_48_to_8_init( &s_path_decimator.to_8, PATH_DECIMATED_STRIDE ); }
+    if( den == 4u ) { return asrc_decimator_48_to_12_init( &s_path_decimator.to_12, PATH_DECIMATED_STRIDE, v12 ); }
+    if( den == 3u ) { return asrc_decimator_48_to_16_init( &s_path_decimator.to_16, PATH_DECIMATED_STRIDE ); }
+    if( den == 2u ) { return asrc_decimator_48_to_24_init( &s_path_decimator.to_24, PATH_DECIMATED_STRIDE, v24 ); }
     return false;
 #endif
 }
@@ -281,7 +379,7 @@ static bool path_stage_init( uint32_t num, uint32_t den,
 // leg (fed only what the pre-stage emitted) share one implementation and one set of coefficient
 // choices -- the stage does not care which produced its input, only how many frames it gets.
 static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rate_hz,
-                                   uint32_t stage_in_frames )
+                                   uint32_t stage_in_frames, bool with_prestage )
 {
     // Guard 3: fail CLOSED on a divider the scratch buffer cannot hold.  Returning false leaves
     // s_path_decimator_ready clear, so the owning block ISR drops its block instead of calling
@@ -312,7 +410,10 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
         // PARTIAL PROTECTION, not strict: this design protects 0-13 kHz and leaves residual alias
         // in 13-16 kHz by design.  Measured on the host by
         // tools/asrc/asrc_48_to_32_audio_gate.py -- 0-13 kHz worst -107.02 dB, 13-16 kHz worst
-        // -25.50 dB.  The tag says `audio` for exactly that reason: a log line reading `fe=2/3`
+        // -25.50 dB.  Confirmed on hardware 2026-09-03: -107.03 dBc and -22.52 dBc worst (the
+        // shipping specification is `0-13 kHz protected / 13-16 kHz relaxed`, and this chain is
+        // officially supported as of that date -- see asrc_decimator_48_to_8.h for the CPU
+        // evidence).  The tag says `audio` for exactly that reason: a log line reading `fe=2/3`
         // alone would not distinguish this from a full-band 48 -> 32 front end, which this is not.
         if( ( den != ASRC_DECIMATOR_48_TO_32_M ) || ( low_rate_hz != 32000u ) )
         {
@@ -322,7 +423,8 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
         s_path_frontend_tag = ":audio";
         return path_stage_init( ASRC_DECIMATOR_48_TO_32_L, ASRC_DECIMATOR_48_TO_32_M,
                                ASRC_DECIMATOR_48_TO_24_FOR_24000,
-                               ASRC_DECIMATOR_48_TO_12_FOR_11025 );
+                               ASRC_DECIMATOR_48_TO_12_FOR_11025,
+                               PATH_PRESTAGE_COMPOSED with_prestage );
     }
     if( num != 1u )
     {
@@ -335,7 +437,8 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
         s_path_frontend_tag = "";
         // /6 has one coefficient set, so neither variant argument applies to it.
         return path_stage_init( 1u, 6u, ASRC_DECIMATOR_48_TO_24_FOR_24000,
-                               ASRC_DECIMATOR_48_TO_12_FOR_11025 );
+                               ASRC_DECIMATOR_48_TO_12_FOR_11025,
+                               PATH_PRESTAGE_COMPOSED with_prestage );
     }
     if( den == 4u )
     {
@@ -358,7 +461,8 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
             s_path_frontend_tag = "";
             return false;
         }
-        return path_stage_init( 1u, 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, variant );
+        return path_stage_init( 1u, 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, variant,
+                               PATH_PRESTAGE_COMPOSED with_prestage );
     }
     if( den == 3u )
     {
@@ -366,7 +470,8 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
         // coefficient set exists for this divider, so no tag is needed to disambiguate it.
         s_path_frontend_tag = "";
         return path_stage_init( 1u, 3u, ASRC_DECIMATOR_48_TO_24_FOR_24000,
-                               ASRC_DECIMATOR_48_TO_12_FOR_11025 );
+                               ASRC_DECIMATOR_48_TO_12_FOR_11025,
+                               PATH_PRESTAGE_COMPOSED with_prestage );
     }
     if( den == 2u )
     {
@@ -391,7 +496,8 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
             s_path_frontend_tag = "";
             return false;
         }
-        return path_stage_init( 1u, 2u, variant, ASRC_DECIMATOR_48_TO_12_FOR_11025 );
+        return path_stage_init( 1u, 2u, variant, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+                               PATH_PRESTAGE_COMPOSED with_prestage );
     }
     s_path_frontend_tag = "";
     return false;
@@ -404,13 +510,27 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
 static bool path_decimator_init( uint32_t num, uint32_t den, uint32_t low_rate_hz,
                                 uint32_t in_rate_hz )
 {
+    /* Second line of defence behind the pair gate: an implementation narrower than ASRC_CH is
+     * disqualified, so it never arms.  The caller leaves s_path_decimator_ready clear and prints
+     * the refusal, which is a stated failure rather than a path that quietly filters two of N. */
+    if( !PATH_FRONTEND_SERVES_LOGICAL_WIDTH )
+    {
+        s_path_frontend_tag = "";
+        return false;
+    }
+
 #if APP_USE_96K_RATE
     if( in_rate_hz == 96000u )
     {
-        // No rational chain is reachable from a 96 kHz leg: the gate publishes num == 1 for every
-        // 96 kHz row, and composing 2/3 behind the /2 pre-stage is a chain that has never been
-        // designed, let alone measured.  Refuse rather than compose something untested.
-        if( num != 1u )
+        // TWO NUMERATORS ARE REACHABLE FROM A 96 kHz LEG (num == 2 added 2026-09-03).  The
+        // composed ratio is num / (PRESTAGE_DEN * second_den), so num == 1 puts an integer 1/den
+        // chain behind the /2 pre-stage and num == ASRC_DECIMATOR_48_TO_32_L puts the 2/3 `:audio`
+        // chain there -- which is the only way 96 -> 32 kHz is reachable at all, because 32 kHz is
+        // not an integer divisor of 96 kHz any more than of 48 kHz.  Composing the two was gated
+        // on filter work, not on plumbing: the shared pre-stage set had to widen 27 -> 41 taps to
+        // reach -108.38 dB at 32 kHz's 32000 Hz fold edge (it read -47.95 dB before).  Any other
+        // numerator has no implementation, so refuse rather than compose something untested.
+        if( ( num != 1u ) && ( num != ASRC_DECIMATOR_48_TO_32_L ) )
         {
             s_path_frontend_tag = "";
             return false;
@@ -420,26 +540,92 @@ static bool path_decimator_init( uint32_t num, uint32_t den, uint32_t low_rate_h
             s_path_frontend_tag = "";
             return false;
         }
-        if( !asrc_decimator_96_to_48_init( &s_path_prestage, 2u ) )
+        // `den` here is the COMPOSED ratio; what goes behind the pre-stage is den/2.
+        const uint32_t second_den = den / PRESTAGE_DEN;
+#if PATH_FRONTEND_Q31
+        // The pre-stage is a STAGE of the Q31 chain, so there is one init and one object -- no
+        // separate pre-stage state to arm here, and no intermediate buffer for the caller to route
+        // between two front ends.  `with_prestage` is what composes it.
+        if( second_den == 1u )
+        {
+            // THE PRE-STAGE IS THE WHOLE CHAIN: 96 -> 48 kHz, and then the resampler runs at
+            // step 1.00000 (a 48 kHz output) or pulls 48 -> 44.1 kHz at step 1.08844.  Which
+            // coefficient set that needs is decided by the FINAL rate, not by the ratio -- the
+            // pre-stage's own ratio is /2 either way, while its stopband has to sit on the fold
+            // edge of the rate actually being served (24000 Hz for 48 kHz, 25950 Hz for
+            // 44.1 kHz).  The shared 41-tap set reads only -7.48 dB at the first of those, which
+            // is why these two rows waited for a variant rather than reusing it.
+            //
+            // Name the rate rather than defaulting, the same rule the /2 and /4 arms follow: a
+            // rate added to the gate above without a set here fails CLOSED instead of being
+            // filtered for the wrong band.  And tag it -- `fe=/2` alone cannot tell these two
+            // apart, they are both composed den 2, and they are audibly different filters.
+            // Both wide variants are integer /2 filters; neither has a rational partner, and
+            // there is no second stage here to carry one.  Refuse a rational request on this arm
+            // specifically rather than letting the shared num check above imply it.
+            if( num != 1u )
+            {
+                s_path_frontend_tag = "";
+                return false;
+            }
+            asrc_decimator_96_to_48_variant_t vpre;
+            if( low_rate_hz == 48000u )
+            {
+                vpre = ASRC_DECIMATOR_96_TO_48_FOR_48000;
+                s_path_frontend_tag = ":48k";
+            }
+            else if( low_rate_hz == 44100u )
+            {
+                vpre = ASRC_DECIMATOR_96_TO_48_FOR_44100;
+                s_path_frontend_tag = ":44k1";
+            }
+            else
+            {
+                s_path_frontend_tag = "";
+                return false;
+            }
+            return path_stage_init( 1u, 1u, ASRC_DECIMATOR_48_TO_24_FOR_24000,
+                                   ASRC_DECIMATOR_48_TO_12_FOR_11025, vpre, true );
+        }
+        // The second stage sees the pre-stage's output, not the block, so its capacity check has
+        // to be made against that -- passing APP_BLOCK_FRAMES here would reject composed /12.
+        // `num` is forwarded, not hardcoded to 1: that is what lets the 2/3 chain sit behind the
+        // pre-stage, and it keeps ONE resolver deciding which coefficient set each rate gets.
+        return path_second_stage_init( num, second_den, low_rate_hz, PRESTAGE_BLOCK_CAPACITY,
+                                      true );
+#else
+        // No float front end is rational (see path_stage_init()), so a composed rational chain has
+        // no implementation in this build at all -- refuse it here where the reason is legible,
+        // rather than three calls down where the failure reads as a missing divider.
+        if( num != 1u )
         {
             s_path_frontend_tag = "";
             return false;
         }
-        const uint32_t second_den = den / PRESTAGE_DEN;
         if( second_den == 1u )
         {
-            // 96 -> 48 kHz with nothing behind it: the resampler then runs at step 1.00000.
+            // The two rows where the pre-stage is the whole chain need the WIDE 113/169-tap sets,
+            // and this implementation has only the shared 41-tap one (see the type's comment in
+            // asrc_decimator_48_to_8.h: 113/169 taps do not fit the float front end's CPU budget,
+            // so no build would select them here).  Refuse rather than run a 48 kHz output
+            // through a filter designed to protect 24 kHz.
             s_path_frontend_tag = "";
-            return true;
+            return false;
         }
-        // The second stage sees the pre-stage's output, not the block, so its capacity check has
-        // to be made against that -- passing APP_BLOCK_FRAMES here would reject composed /12.
-        return path_second_stage_init( 1u, second_den, low_rate_hz, PRESTAGE_BLOCK_CAPACITY );
+        // The float family's pre-stage is a separate object the caller drives per block.
+        if( !asrc_decimator_96_to_48_init( &s_path_prestage, PRESTAGE_STRIDE ) )
+        {
+            s_path_frontend_tag = "";
+            return false;
+        }
+        return path_second_stage_init( 1u, second_den, low_rate_hz, PRESTAGE_BLOCK_CAPACITY,
+                                      false );
+#endif
     }
 #else
     (void)in_rate_hz;   // no 96 kHz leg in this build; the gate can only publish 48 kHz rows
 #endif
-    return path_second_stage_init( num, den, low_rate_hz, (uint32_t)APP_BLOCK_FRAMES );
+    return path_second_stage_init( num, den, low_rate_hz, (uint32_t)APP_BLOCK_FRAMES, false );
 }
 
 static bool path_second_stage_process( uint32_t den, const int32_t* src, size_t src_frames,
@@ -451,32 +637,32 @@ static bool path_second_stage_process( uint32_t den, const int32_t* src, size_t 
     // the front end repeats it up to ASRC_CH internally.
     (void)den;
     return asrc_decimator_q31_process_s24_left(
-        src, src_frames, src_stride, 2u,
+        src, src_frames, src_stride, PATH_SOURCE_REAL_CH,
         s_path_decimated, DECIMATED_BLOCK_CAPACITY, PATH_DECIMATED_STRIDE, produced );
 #else
     if( den == 6u )
     {
         return asrc_decimator_48_to_8_process_s24_left(
             &s_path_decimator.to_8, src, src_frames, src_stride,
-            s_path_decimated, DECIMATED_BLOCK_CAPACITY, 2u, produced );
+            s_path_decimated, DECIMATED_BLOCK_CAPACITY, PATH_DECIMATED_STRIDE, produced );
     }
     if( den == 4u )
     {
         return asrc_decimator_48_to_12_process_s24_left(
             &s_path_decimator.to_12, src, src_frames, src_stride,
-            s_path_decimated, DECIMATED_BLOCK_CAPACITY, 2u, produced );
+            s_path_decimated, DECIMATED_BLOCK_CAPACITY, PATH_DECIMATED_STRIDE, produced );
     }
     if( den == 3u )
     {
         return asrc_decimator_48_to_16_process_s24_left(
             &s_path_decimator.to_16, src, src_frames, src_stride,
-            s_path_decimated, DECIMATED_BLOCK_CAPACITY, 2u, produced );
+            s_path_decimated, DECIMATED_BLOCK_CAPACITY, PATH_DECIMATED_STRIDE, produced );
     }
     if( den == 2u )
     {
         return asrc_decimator_48_to_24_process_s24_left(
             &s_path_decimator.to_24, src, src_frames, src_stride,
-            s_path_decimated, DECIMATED_BLOCK_CAPACITY, 2u, produced );
+            s_path_decimated, DECIMATED_BLOCK_CAPACITY, PATH_DECIMATED_STRIDE, produced );
     }
     return false;
 #endif
@@ -492,7 +678,17 @@ static bool path_second_stage_process( uint32_t den, const int32_t* src, size_t 
 static bool path_decimator_process( uint32_t den, uint32_t second_den, const int32_t* src,
                                     const int32_t** out, size_t* produced )
 {
-#if !APP_USE_96K_RATE
+#if PATH_FRONTEND_Q31
+    // ONE call, whatever the chain.  The Q31 front end resolved the whole cascade in init(), the
+    // 96 kHz pre-stage included, so a composed chain and a plain 48 kHz one look identical from
+    // here: no intermediate buffer to route between two implementations, and -- the reason this
+    // arm is worth having -- no `second_den` load and branch in the per-block leg callbacks that
+    // inline this.  That branch is exactly what the `#if !APP_USE_96K_RATE` arm below existed to
+    // remove for a 48 kHz build; making the pre-stage a stage removes it for a 96 kHz build too.
+    (void)second_den;
+    *out = s_path_decimated;
+    return path_second_stage_process( den, src, APP_BLOCK_FRAMES, APP_SLOTS_PER_FS, produced );
+#elif !APP_USE_96K_RATE
     // No 96 kHz leg is reachable in this build, so the routing gate can never publish a pre-stage
     // and second_den is always 0.  Compiled out rather than left as a runtime test, because this
     // function inlines into both per-block leg callbacks: at 48 kHz the test would cost a volatile
@@ -518,7 +714,7 @@ static bool path_decimator_process( uint32_t den, uint32_t second_den, const int
     size_t pre_frames = 0u;
     if( !asrc_decimator_96_to_48_process_s24_left(
             &s_path_prestage, src, APP_BLOCK_FRAMES, APP_SLOTS_PER_FS,
-            s_path_prestage_out, PRESTAGE_BLOCK_CAPACITY, 2u, &pre_frames ) )
+            s_path_prestage_out, PRESTAGE_BLOCK_CAPACITY, PRESTAGE_STRIDE, &pre_frames ) )
     {
         return false;
     }
@@ -530,7 +726,8 @@ static bool path_decimator_process( uint32_t den, uint32_t second_den, const int
     }
     // The intermediate is already channel-packed at stride 2, unlike the raw TDM/I2S source.
     *out = s_path_decimated;
-    return path_second_stage_process( second_den, s_path_prestage_out, pre_frames, 2u, produced );
+    return path_second_stage_process( second_den, s_path_prestage_out, pre_frames,
+                                      PRESTAGE_STRIDE, produced );
 #endif // APP_USE_96K_RATE
 }
 #endif
@@ -671,17 +868,82 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
         //               worth fixing; deferred purely on cost (every option priced out of budget).
         //   44.1 kHz -- worst alias -4.99 dB over a 270 Hz band at 21.78-22.05 kHz, i.e. inaudible.
         //               Not a to-do at all: nothing to fix, not merely unaffordable.
+        //               LOWERING ASRC_POLY_FC TO BUY ALIAS REJECTION HERE WAS CONSIDERED AND
+        //               DECLINED (owner, 2026-09-04).  The CPU cost really is zero -- fc is just
+        //               another constant in the same 30-tap generation loop -- but zero CPU is not
+        //               zero cost, and that framing is what made the first write-up unreadable:
+        //                 - fc is ONE per-BUILD #define, not a per-rate value, so 0.465 -> 0.440
+        //                   also costs the 48 kHz THROUGH path 1.81 dB at 20 kHz and 3.41 dB at
+        //                   21 kHz (host-measured).  Below 16 kHz the change is 0.00 dB either way.
+        //                 - so the trade is -5.7 dB of alias at 21.78-22.05 kHz against 1.8-3.4 dB
+        //                   of flatness at 20-21 kHz.  Same top octave edge, near-equivalent swap,
+        //                   not a free improvement in one direction.
+        //                 - making it per-rate is not free either: the shipping preset is
+        //                   ASRC_COEFF_STORAGE == FLASH, so each distinct fc needs its own baked
+        //                   table (129 x 30 x 4 B = 15,480 B) and rows would have to be rebuilt on
+        //                   every rate change.  RAM generation is not available to that preset.
+        //               Do not re-propose this on its own.  Revisit only if per-rate fc becomes
+        //               necessary for some OTHER reason.  Numbers: [internal]
+        //               [internal] survey_ak512_48k_nyquist_coverage_2026-09-04.md section 3.1.
         // Priced per rate in [internal] study_asrc_lowpass_per_rate_2026-07-29.md.
         // 96 kHz leg A joined on 2026-08-02, and is the first row set whose front end is a CASCADE: a
-        // fixed 21-tap 96 -> 48 kHz pre-stage, then the existing 48 kHz chain for the target rate, so
-        // the published denominator is the COMPOSED ratio (12 / 8 / 6) rather than one stage's.  From
+        // fixed 96 -> 48 kHz pre-stage (shared set, 21 taps then, 41 today), then the existing 48 kHz
+        // chain for the target rate, so the published RATIO is the COMPOSED one (num 1 over den 12 /
+        // 8 / 6 / 4 / 2, or num 2 over den 6 for 32 kHz) rather than one stage's.  From
         // 96 kHz the direct step is up to 12, which needs R+jitter of 200 against a cap of 104 -- the
         // clamp that produces the audible break-up.  The pre-stage puts the resampler back at step
         // ~1.0.  See [internal] asrc_96k.md part 3.
         //
-        // 22.05 and 24 kHz are deliberately ABSENT here: their R+jitter from 96 kHz is 85 and 80, both
-        // already inside the cap, so they resample directly and pay nothing for a stage they do not
-        // need.  32 and 48 kHz likewise fit (65 and 50).  Only 16 kHz and below are clamped.
+        // 22.05 kHz JOINED ON 2026-09-02 (composed den 4), and the sentence it replaces was true when
+        // written: "22.05 and 24 kHz are deliberately ABSENT here: their R+jitter from 96 kHz is 85 and
+        // 80, both already inside the cap, so they resample directly and pay nothing for a stage they
+        // do not need."  R+jitter against ASRC_FILL_TARGET_MAX is the HARD bound and still fits.  What
+        // changed is the SOFT bound: ASRC_FILL_SLACK_REQUIRED (2026-08-24, 100-pair hardware sweep) needs
+        // 8 frames of slack above R, and at step 4.3537 the setpoint clamps to R + ASRC_FILL_JITTER = 4,
+        // so audio_app_asrc_rate_pair_is_supported() REFUSES 96 k -> 22.05 kHz outright.  A /2 + /2 puts
+        // the resampler at step 1.0884 (R 32, set 64, slack 32) and it is accepted.  The pre-stage
+        // coefficients were widened 21 -> 27 taps for this row -- the old four-rate set reads only
+        // -58.09 dB at 22.05 kHz's 36975 Hz fold edge, so the row without them would have swapped a
+        // refused pair for an aliased one.
+        // 24 kHz JOINED IN THE SAME CHANGE (composed den 4), for a different reason than 22.05 kHz:
+        // the gate never refused it -- its step is exactly 4, so floor == ceil earns the exact-step
+        // exemption -- but it was running on FOUR frames of slack (the exemption's whole purpose is to
+        // allow that) and with no band limit at all but ASRC_POLY_FC of 96 kHz, i.e. 12-44.64 kHz
+        // folding into its band.  den 4 takes it to step 1.00000 (R 31, set 64, slack 33), so it stops
+        // depending on the exemption AND gains the `:24k` stage's anti-aliasing.  The pre-stage was
+        // already designed against 24 kHz as its binding case, so this row cost no filter work.
+        // 44.1 AND 48 kHz JOINED ON 2026-09-03 (composed den 2 -- the pre-stage alone, with nothing
+        // behind it).  Neither was refused by the gate and neither had a fold to spare: they ran
+        // directly at step 2.17687 and 2.00000 with no band limit but ASRC_POLY_FC, so everything
+        // from their band edge up to 44.64 kHz folded in.  What kept them waiting was the FILTER, not
+        // the routing: their fold edges are 25950 and 24000 Hz, below the shared set's 32000 Hz
+        // stopband, where the shared set reads only -15.54 and -7.48 dB.  They now take their own wide pre-stage variants (113
+        // and 169 taps, stage-alone -100.68 and -106.77 dB), which is affordable only in Q31 -- 36.2
+        // and 54.1 us against 92.5 and 138.4 us in float, on a 140 us budget.  den 2 also puts the
+        // resampler at step 1.08844 / 1.00000 instead of 2.17687 / 2.00000, so 48 kHz stops leaning
+        // on the exact-step exemption and 44.1 kHz stops running on 18 frames of soft-bound slack.
+// 32 kHz JOINED ON 2026-09-03 (composed num 2 / den 6), and it is the FIRST composed row whose
+        // second stage is not a divider: /2 then the L=2/M=3 `:audio` chain, i.e. 96 -> 48 -> 32 kHz.
+        // 32 kHz is not an integer divisor of 96 kHz any more than of 48 kHz, so a rational second
+        // stage is the only way this rate gets a front end at all.  It waited on the 48 -> 32 kHz
+        // N=97 AUDIO MODE decision (closed 2026-09-03: `0-13 kHz protected / 13-16 kHz relaxed`,
+        // officially supported), because that same partially-protecting filter is what runs behind
+        // the pre-stage here -- publishing the row before the decision would have meant changing two
+        // places if the split had not been accepted.
+        //
+        // Its INHERITED SPECIFICATION IS THE SAME PARTIAL ONE, not a stronger claim: the pre-stage is
+        // transparent over 0-15 kHz and removes what would fold from 32-48 kHz, so the residual in
+        // 13-16 kHz is the 2/3 chain's own and this row is `0-13 kHz protected / 13-16 kHz relaxed`
+        // exactly like the 48 kHz one.  A composed row cannot be better than its rear stage.
+        //
+        // Before this row it ran DIRECT and unprotected: step 3.0 clears the hard bound (R 61) but
+        // only by leaning on the exact-step exemption, so it also ran on 4 frames of slack, and it
+        // was observed starving on hardware (`hr=-12 set=64 step=3.00000 starve=4 fe=direct`).  den 6
+        // puts the resampler at step 1.00000, which is the stability half of the reason for the row.
+        // Unlike the 44.1 and 48 kHz rows it needs NO pre-stage variant: widening the shared set
+        // 27 -> 41 taps covers every rate at once, and 32 kHz's 32000 Hz fold edge -- the lowest in
+        // the menu -- becomes the set's binding case at -108.38 dB.  It read -47.95 dB at 27 taps,
+        // which is why the row could not simply have reused them.
         // 32 kHz joined on 2026-08-23 and is the FIRST row whose front end is not 1/den: L=2/M=3,
         // num 2 / den 3, N=97, a polyphase resampling front end rather than a decimator.  It exists
         // because 48/32 = 1.5 has no integer divider, so before this row 32 kHz resampled directly
@@ -718,7 +980,29 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
             den_ab = ( b_rate_hz == 8000u )  ? 12u :
                      ( b_rate_hz == 11025u ) ? 8u :
                      ( b_rate_hz == 12000u ) ? 8u :
-                     ( b_rate_hz == 16000u ) ? 6u : 1u;
+                     ( b_rate_hz == 16000u ) ? 6u :
+                     ( b_rate_hz == 22050u ) ? 4u :
+                     ( b_rate_hz == 24000u ) ? 4u :
+#if APP_ASRC_RUNTIME_48K_TO_8
+                     // The COMPOSED ratio of a /2 pre-stage and the 2/3 chain: 2 * 3 = 6, the same
+                     // published denominator 16 kHz uses, which is exactly why the NUMERATOR has to
+                     // ride with it -- 2/6 and 1/6 are different front ends at different output
+                     // rates, and only the pair names this one.
+                     ( b_rate_hz == 32000u ) ? ( PRESTAGE_DEN * ASRC_DECIMATOR_48_TO_32_M ) :
+#endif
+                     ( b_rate_hz == 44100u ) ? 2u :
+                     ( b_rate_hz == 48000u ) ? 2u : 1u;
+#if APP_ASRC_RUNTIME_48K_TO_8
+            // Rides with the denominator, as in the 48 kHz table below: 32 kHz is the only 96 kHz
+            // row that sets it, path_decimator_init() accepts exactly num 1 or L on this leg, and
+            // path_second_stage_init() cross-checks the pair against the output rate -- so a row
+            // that sets one without the other fails closed instead of running the wrong filter.
+            num_ab = ( b_rate_hz == 32000u ) ? ASRC_DECIMATOR_48_TO_32_L : 1u;
+#else
+            // No runtime low-rate front end in this build, so there is no 2/3 chain to compose and
+            // 32 kHz stays on the direct path here, same as in the 48 kHz table below.
+            num_ab = 1u;
+#endif
             low_rate_hz = b_rate_hz;
             if( den_ab != 1u ) { in_rate_hz = a_rate_hz; }
         }
@@ -931,6 +1215,18 @@ void asrc_audio_path_reset( void )
 
     const uint32_t active_den = ( den_ab != 1u ) ? den_ab : den_ba;
     const uint32_t active_num = ( den_ab != 1u ) ? num_ab : num_ba;
+    /* Say it out loud when a needed front end is refused for its width.  The pair gate already
+     * turns this pair away at `*ar`, so reaching here means the pair was committed some other way
+     * (a boot-time rate, a rollback); without this line the disqualification would present as
+     * blocks being dropped, which reads like a transport fault instead of a stated refusal. */
+    if( ( active_den != 1u ) && !PATH_FRONTEND_SERVES_LOGICAL_WIDTH )
+    {
+        printf( " ASRC front end: /%lu needed, but this build's implementation carries %lu of %lu"
+                " channels -- DISQUALIFIED, front end NOT armed (no override exists)"
+                ASRC_PRIO_EOL,
+                (unsigned long)active_den,
+                (unsigned long)PATH_FRONTEND_CH, (unsigned long)ASRC_CH );
+    }
     s_path_decimator_ready =
         ( ( active_den != 1u ) &&
           path_decimator_init( active_num, active_den, low_rate_hz, in_rate_hz ) ) ? 1u : 0u;

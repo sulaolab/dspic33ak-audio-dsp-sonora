@@ -2,9 +2,7 @@
 
 `buildtools/` is the complete command-line build and flash toolset. It shares the
 same "active selection" as MPLAB X IDE, and a bare `build.ps1` / `flashauto.ps1`
-follows that selection. **No environment variables are involved** (the older
-scheme made `MPLABX_CONF` the source of truth, and a single `-Configuration`
-leaked into every later unqualified build in that shell — so it was retired).
+follows that selection. **No environment variables are involved.**
 
 | Script | Role |
 | --- | --- |
@@ -46,6 +44,19 @@ and release route.** Deliverables can only be produced from this side.
 | Program and run from the debugger | (`flashauto.ps1`) | yes |
 | Breakpoints / stepping / watching variables | — | yes |
 
+**What the unsupported row above looks like on the bench.** Build a
+`*_SERIAL_UPDATE` configuration in MPLAB X and program it from the IDE and the
+board gets the **application only** — the resident bootloader is not rebuilt and
+not paired into a FACTORY_IMAGE, so **the serial downloader does not run**:
+`*fu5A` never enters the update wait, and the board is back in the application
+about 14 ms later with no `BL` line on UART1 (observed 2026-09-02). Nothing is
+broken; there is simply no engine in Flash to receive the request. **Build and
+flash with buildtools** (`switch_config.ps1` → `build.ps1`, then program
+`dist/<conf>/production/*.factory.production.hex` once over PKOB4/PICkit).
+Since 2026-09-02 the application detects this state itself: the boot banner says
+`Delivery: application ONLY -- resident bootloader ABSENT` and `*fu5A` refuses
+instead of muting the transport and resetting.
+
 ### The resident boot image: `resident_bootloader.X` is GENERATED, and debug-only
 
 The boot image has its own project, and the same line applies to it more sharply,
@@ -64,7 +75,7 @@ because the image is pinned at fixed addresses under a hard 32 KiB cap.
 - **Never let MPLAB X add `..\app` to the include list.** It offers to, whenever a
   header is not found, and accepting makes the build succeed while undoing the
   isolation the boot image depends on. The gate fails on it by name. The correct
-  fix is to vendor the file into `src/boot/`.
+  fix is to add the required source to `src/boot/`.
 
 Written by hand instead of generated, that project would have been a second copy
 of those lists, in a file the IDE rewrites — and the two would have diverged
@@ -841,61 +852,23 @@ It checks per configuration (per `<conf>`, not by total string counts):
   until 2026-08-14: a non-existent `-I` path contributes nothing, so nothing
   complains, and the list stops being a statement about the tree)
 
-Unlike the separation ratchet (a maintainer-side tool that is not part of this
-distribution), it **generates no baseline**. A ratchet is the right method for a
-monotonically decreasing metric, but the expectations here are design intent
-(5 configurations, 2 delivery modes), and a regenerable baseline would simply absorb
-the very MPLAB X rewrite we want to catch. Changing an
-expectation means deliberately editing the table at the top of the script, which
-is a reviewable act.
+The configuration expectations are design intent: changing one requires an
+intentional update to the table at the top of the script.
 
-### Single-application tree — the orthogonality test
-
-```powershell
-# generate one application's tree and build it standalone (this is the test)
-pwsh buildtools/make_single_app_tree.ps1 -App Asrc -Out ../_gen_sonora_asrc -Force -Build
-```
-
-Copies the app-agnostic core plus ONE application, drops the other application's
-source and its per-app auxiliary subtrees (documentation, host tools, build
-scripts), prunes `configurations.xml` to the kept application's configurations,
-and — with
-`-Build` — builds the result. **A failing build means a cross-application
-coupling leaked and belongs fixed here**, not in the generated tree, which is
-disposable. It is not a publication path: publication is a `git archive` of one
-commit, so this tool has no scrub switch and produces nothing publishable.
-
-It catches what the separation ratchet structurally cannot: that gate reads
-includes statically and leaves `uart_app/` outside its regexes, so a missing
-feature gate there shows up only as a standalone build failure.
-
-Every app and configuration fact is derived — applications from the directories
-under `src/app/apps/`, ownership of each configuration from the macro the
-configuration itself sets — and a drop that removes **zero** files fails instead
-of reporting success. Its predecessor did exactly that for months after a source
-reorganisation moved the path its table named. See
-[internal] `single_app_tree_tool.md`.
-
-### HAL drift — a report, deliberately not a gate
+### Boot/application HAL copies
 
 ```powershell
 pwsh buildtools/check_hal_drift.ps1        # add -All to list the identical files too
 ```
 
-The resident boot image compiles its **own** copy of the six HAL modules it needs,
-`src/boot/hal_*`, vendored from `src/app/hal_*`. Before 2026-08-14 both images compiled one
-copy out of one working tree, which is how the boot image once quietly grew 208
-bytes: an application-side HAL change reached a 32 KiB image pinned at fixed
-addresses with nothing in between.
+The resident boot image compiles its **own** copy of the six HAL modules it needs
+under `src/boot/hal_*`. The application and boot implementations are independent
+because the boot image has its own fixed memory budget.
 
 `check_hal_drift.ps1` compares the two copies path for path and byte for byte and
-**always exits 0**. Nothing gates on it, and that is the design: divergence is not a
-defect. The boot copy is allowed to be older, smaller, or deliberately different.
-Failing a build on a difference would mean the two copies must move together —
-precisely the coupling the copy removed — and the report would become pressure to
-re-merge them. Read it when you touch an `src/app/hal_*` file that `src/boot/` also has (does
-this fix need to travel?), and when the boot image's size moves for a reason you
-cannot name.
+**always exits 0**. A difference is not necessarily a defect: the boot copy may
+be older, smaller, or deliberately different. Use the report when a change to an
+application HAL may also be needed by the boot image.
 
 Its counterpart is `Assert-StandaloneMapLayout` /
 `Assert-SerialUpdateMapLayout` in `build.ps1`, which check the **link result**

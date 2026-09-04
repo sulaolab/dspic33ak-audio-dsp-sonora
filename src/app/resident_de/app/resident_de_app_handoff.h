@@ -55,6 +55,22 @@ void resident_de_app_launch_ack_tick(void);
  * every boot pay the pre-shutdown, and boot_banner_hold_if_requested() never triggers. */
 bool resident_de_app_latch_forwarded_reset_cause(void);
 
+/* True only if a resident download engine is actually installed AND speaks this build's
+ * cross-reset layout -- i.e. an update request published by *fu5A can be picked up.
+ *
+ * This exists because the delivery mode is a compile-time fact and the pairing is not:
+ * building this configuration in MPLAB X and programming it from the IDE puts the
+ * application in Flash with NO engine behind it (buildtools/README.md "Support scope"),
+ * and every compile-time answer is then wrong. Ask this instead of assuming.
+ *
+ * Two conditions, because neither alone is sound:
+ *   - a programmed boot region, which is the only evidence that survives a warm reset;
+ *   - resident_boot_pipe_ready(), which rejects an engine of an incompatible generation.
+ * See the implementation for why the SRAM container alone gives a false "present".
+ *
+ * Costs one Flash page scan; call it from console verbs and banners, not from a hot path. */
+bool resident_de_app_resident_is_present(void);
+
 /* Boot-banner lines owned by the delivery mode. */
 void resident_de_app_launch_banner(void);
 void resident_de_app_delivery_banner(void);
@@ -71,6 +87,10 @@ static inline void resident_de_app_launch_banner(void) { }
 /* No engine ran before this image, so RCON still holds the real cause and the caller's
  * own capture is the right answer. */
 static inline bool resident_de_app_latch_forwarded_reset_cause(void) { return false; }
+
+/* A standalone image is not built to be paired with one, and its own console has no
+ * update verb to guard. */
+static inline bool resident_de_app_resident_is_present(void) { return false; }
 
 static inline void resident_de_app_delivery_banner(void)
 {

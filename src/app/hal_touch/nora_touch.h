@@ -157,16 +157,17 @@ typedef struct {
      * 5 scans once the 4-scan magnitude window has eaten each end. So the length
      * of the excursion cannot separate them, and the amplitude has to.
      *
-     * It can, because there is a gap. The same board's real taps fired at
-     * magnitudes 826..1,520 and its lightest measured touch was 780, against the
-     * 705 the noise reached: 900 sits above every idle excursion seen and below
-     * every press but the very lightest.
+     * The 900 value was measured at charge 2,000 ns. At the default 5,000 ns charge,
+     * idle_ref rests at 90..97 and real presses measure 994..1,408, while the
+     * measured idle magnitude is 81..119. The shipped value is therefore 800: it
+     * leaves about 8x over idle while remaining below the observed taps. The full
+     * measurement and its rationale are beside the default in the .c.
      *
      * This costs the learner nothing, which is the reason it is worth doing. The
      * candidate gate (NORA_TOUCH_LEARN_CAND_MIN in the .c) is what records press
      * amplitudes, it is separate from detection, and it never fires an event -- so
      * a pad still gathering evidence there while refusing to report anything under
-     * 900 calibrates at exactly the speed it always did. The whole price is paid by
+     * 800 calibrates at exactly the speed it always did. The whole price is paid by
      * the first touch, which may not register: already the accepted trade for
      * self-calibration (operator, 2026-08-14).
      *

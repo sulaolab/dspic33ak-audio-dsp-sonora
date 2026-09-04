@@ -59,5 +59,5 @@ Codec B, or an expansion connector. For example, an AK Sonora board may choose
 one pair of instances while a CK board chooses another. That selection belongs
 outside this HAL and is supplied as a `nora_i2c_instance_t` argument.
 
-The optional CMSIS I2C adapter is separate from this HAL and remains a
-dsPIC33AK-specific adapter until it is swept in its own NORA migration.
+The optional CMSIS I2C adapter is separate from this HAL and is
+dsPIC33AK-specific.

@@ -1,7 +1,7 @@
 # NORA-HAL public API naming
 
 NORA-HAL means **Native On-chip Resource Assistant**.  It is the public HAL
-brand for the on-chip resource layer shared by dsPIC33AK (**dsPIC33A** family)
+brand for the on-chip resource layer used by dsPIC33AK (**dsPIC33A** family)
 and dsPIC33CK (**dsPIC33C** family) projects.  The brand spans the two families;
 it is not a synonym for either one, and NORA is not "the dsPIC33A HAL".  It is
 also not a claim that the API is portable to arbitrary processor families: RP
@@ -39,8 +39,7 @@ actually written and validated against.  It is deliberately not `_dspic33a`:
 nothing validates a family-wide dsPIC33A backend, and the code itself is
 per-part where it has to be (`NORA_SPI_I2S_TDM_DSPIC33AK_DEV_AK512` /
 `..._DEV_AK128`).  There is likewise no `_dspic33c` backend to pair with it —
-the CK project keeps its own `dspic33ck_*` implementation naming as a **declared
-divergence**, normalised by tooling for comparison rather than renamed.  Since
+the CK project keeps its own `dspic33ck_*` implementation naming. Since
 the tag never appears in a public name, adding a further backend later costs
 nothing on the public surface.
 
@@ -82,35 +81,25 @@ must contain no `call`/`rcall`.
 
 ## Migration rule
 
-The migration replaces the old public `dspic33ak_` / `DSPIC33AK_` and
-`dspic33ck_` / `DSPIC33CK_` namespaces.  Compatibility aliases are not added
-by default, because they would leave the deprecated processor-prefixed API
-public.  If a released downstream product requires a transition alias, it must
-be an explicit, time-bounded compatibility decision.
+The public API uses the `nora_` / `NORA_` namespaces. Compatibility aliases for
+the older processor-prefixed namespaces are not added by default, because they
+would keep deprecated names public. A downstream product that needs a transition
+alias requires an explicit, time-bounded compatibility decision.
 
 ## Canonical transport contract for NORA SPI/I2S/TDM
 
-**Scope: this section is about the SPI/I2S/TDM transport only.**  It is not a
-blanket NORA-HAL rule about layering, and it does not restrict adapters to other
-standards — the CMSIS-Driver / `Driver_SAI` binding over this transport is
-expected and unaffected.
+**Scope: this section is about the SPI/I2S/TDM transport only.** It does not
+restrict adapters to other standards; the CMSIS-Driver / `Driver_SAI` binding
+over this transport remains supported.
 
-> For NORA SPI/I2S/TDM transport, `nora_spi_i2s_tdm.h` is the single canonical
-> NORA public transport contract.  A second, reduced AK/CK portability facade is
-> not used.
+`nora_spi_i2s_tdm.h` defines the NORA public transport contract. A second,
+reduced portability facade above it is not used.
 
-- The canonical contract is **`nora_spi_i2s_tdm.h` as it exists in Sonora**:
-  the native transport, including its SYSTEM/domain model and its per-leg
-  resource model.  The CK implementation is aligned to that contract; the
-  contract is not reduced to fit CK.
-- Silicon-specific data representation and capability differences belong in the
-  **CK backend design**, below the contract — as a **capability** the caller can
-  query or an explicit **unsupported** result, not as a smaller shared surface
-  and not as silent emulation.
-- A reduced portable stream **facade above** this transport was implemented on AK
-  (`nora_tdm_stream.h` + an AK adapter) and **removed before reaching `main`**:
-  it created a second public transport API for one peripheral, its common
-  envelope could only be the intersection of the two targets, and it had no
-  callers on either.  The decision history (kept, then withdrawn) is in
-  `[internal] review_nora_hal_merge_2026-08-07.md`, items M3 → §12.1 →
-  §13.  Do not reintroduce that facade.
+- The contract includes the native SYSTEM/domain model, per-leg resource model,
+  and transport diagnostics.
+- Silicon-specific data representation and capability differences are expressed
+  as a capability the caller can query or an explicit unsupported result. They
+  must not be hidden by silently narrowing or emulating the API.
+- Do not introduce a second, reduced stream facade above this transport. If a
+  target cannot support an operation, expose that through the contract's
+  capability and unsupported-result handling.

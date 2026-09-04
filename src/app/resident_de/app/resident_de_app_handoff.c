@@ -13,9 +13,11 @@
 #include <stdint.h>
 #include <xc.h>
 
+#include "hal_nvm/nora_nvm.h"
 #include "hal_reset/nora_reset.h"
 #include "nora_tick_timer.h"
 #include "resident_de_abi.h"
+#include "resident_de_manifest.h"
 #include "resident_de_pipe.h"
 
 /* Bring-up markers ('M','P','C','T','U','D') emitted by raw U1TXB writes, so a
@@ -40,6 +42,16 @@
 /* Latched once the engine's launch counter has been zeroed for this boot. */
 static bool g_launch_acknowledged = false;
 #endif
+
+/* True if the resident engine forwarded a reset cause to this boot -- i.e. an engine
+ * demonstrably ran ahead of us. Latched because cause_take() is one-shot: the record is
+ * gone by the time the banner prints, so it cannot be re-read later.
+ *
+ * Diagnostic wording only. It must NOT gate anything: the cause record was added to the
+ * pipe on 2026-08-12 without a layout-version bump, so a compatible resident that predates
+ * it forwards nothing and would be misjudged absent. resident_boot_pipe_ready() is the
+ * authority on whether an engine is there. */
+static bool s_resident_cause_seen = false;
 
 /* CPU state as handed over, captured before this image touches anything. Kept as
  * globals rather than locals so a debugger can read them after a later fault. */
@@ -168,6 +180,7 @@ bool resident_de_app_latch_forwarded_reset_cause(void)
     {
         return false;
     }
+    s_resident_cause_seen = true;
     return nora_reset_snapshot_capture_forwarded(rcon);
 }
 
@@ -208,10 +221,85 @@ void resident_de_app_launch_banner(void)
 #endif
 }
 
+bool resident_de_app_resident_is_present(void)
+{
+    uint32_t address;
+
+    /* THE SRAM CONTAINER ALONE IS NOT ENOUGH, measured 2026-09-02. The container lives in
+     * no-init RAM and only the resident's boot pass establishes it; nothing else ever wipes
+     * it. So after the resident is erased from Flash and the board is merely RESET rather
+     * than power-cycled, the established bytes are still sitting there and
+     * resident_boot_pipe_ready() answers true with no engine in Flash at all -- which is
+     * exactly the state an IDE program-and-run leaves behind, and exactly the state the
+     * operator needs the truth about. (It answers false after a power cycle, because the
+     * version and its complement do not both survive by chance -- but the check may not
+     * depend on someone having pulled the power.)
+     *
+     * So look at Flash. An application-only image writes ONE thing into the boot region:
+     * the reset word at RESIDENT_BOOT_BASE_ADDRESS, pointing at its own entry -- verified
+     * against the linked hex, whose next record is at RESIDENT_APP_BASE_ADDRESS. A resident
+     * image continues straight on with its interrupt vector table. So a programmed byte
+     * ANYWHERE in the boot region past that first reset word means an engine is installed.
+     *
+     * Scanned rather than spot-checked at one address, so this does not silently become
+     * wrong if a future engine's first page is laid out differently -- one page is the
+     * smallest thing the NVM HAL can erase, so nothing smaller can be half-present. */
+    for (address = RESIDENT_BOOT_BASE_ADDRESS;
+         address < (RESIDENT_BOOT_BASE_ADDRESS + NORA_NVM_PAGE_BYTES);
+         address += NORA_NVM_WORD_BYTES)
+    {
+        uint32_t words[NORA_NVM_U32_PER_WORD];
+        uint32_t index;
+
+        if (nora_nvm_read_word(address, words) != NORA_NVM_OK)
+        {
+            return false;
+        }
+        for (index = 0u; index < NORA_NVM_U32_PER_WORD; index++)
+        {
+            /* Skip the reset word itself: an application-only image writes it too. */
+            if ((address == RESIDENT_BOOT_BASE_ADDRESS) && (index == 0u))
+            {
+                continue;
+            }
+            if (words[index] != UINT32_MAX)
+            {
+                /* An engine is installed. It is only usable, though, if it establishes the
+                 * container this build understands -- a resident from another pipe
+                 * generation writes its own version and is correctly reported absent. */
+                return resident_boot_pipe_ready();
+            }
+        }
+    }
+    return false;
+}
+
 void resident_de_app_delivery_banner(void)
 {
-    /* The ABI version rides on the line that already exists, so a field log can be
-     * matched against the engine's own banner without costing another printf. */
-    printf(" Delivery: resident bootloader + application (single panel), ABI=%u\n",
-           (unsigned)RESIDENT_DE_ABI_VERSION);
+    /* This line used to ASSERT the delivery mode from a compile-time constant, which made
+     * it a lie in exactly the case an operator needs the truth: build this configuration in
+     * MPLAB X and program it from the IDE, and only the application reaches Flash -- the
+     * resident engine is never rebuilt and never paired into a FACTORY_IMAGE (see
+     * buildtools/README.md "Support scope"). The board then runs an application that claims
+     * "resident bootloader + application" with no engine behind it, and *fu5A appears to be
+     * ignored. Two sessions were spent on that. So the line now REPORTS what was observed.
+     *
+     * The ABI version rides on the same line, so a field log can be matched against the
+     * engine's own banner without costing another printf. */
+    if (!resident_de_app_resident_is_present())
+    {
+        printf(" Delivery: application ONLY -- resident bootloader ABSENT"
+               " (boot region empty, or a cross-reset layout this build cannot use),"
+               " ABI=%u\n",
+               (unsigned)RESIDENT_DE_ABI_VERSION);
+        printf(" Delivery: WARNING -- serial update (*fu5A) will NOT work on this board."
+               " An image built and programmed from MPLAB X contains no resident"
+               " bootloader; build and flash with buildtools instead"
+               " (switch_config.ps1 -> build.ps1 -> *.factory.production.hex)\n");
+        return;
+    }
+    printf(" Delivery: resident bootloader + application (single panel), ABI=%u"
+           " (boot=present, pipe=ok, cause=%s)\n",
+           (unsigned)RESIDENT_DE_ABI_VERSION,
+           s_resident_cause_seen ? "ok" : "n/a");
 }

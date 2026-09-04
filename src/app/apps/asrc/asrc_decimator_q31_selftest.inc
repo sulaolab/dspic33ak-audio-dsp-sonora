@@ -139,25 +139,30 @@ static bool dec_q31_st_ref_stage(dec_q31_st_ref_t *r, uint8_t s, int32_t x,
     return true;
 }
 
-/* The whole chain, one channel.  The s24-left mask is applied only by the last
- * stage, the same asymmetry the fast path has. */
+/* The whole chain, one channel, for ANY number of cascade stages.  The s24-left
+ * mask is applied only by the last stage, the same asymmetry the fast path has.
+ *
+ * Written as a walk rather than the unrolled one-and-two-stage pair it used to be,
+ * because a composed 96 kHz chain is three stages: pre-stage, then the two of /6
+ * or /4.  Unrolling to three would have been a third arm to keep in step with
+ * s_q31.stages, and the arm nobody exercises is the one that rots. */
 static size_t dec_q31_st_ref_chain(dec_q31_st_ref_t *r, const int32_t *in,
                                    size_t frames, int32_t *out)
 {
     size_t n = 0u;
     for (size_t i = 0u; i < frames; ++i)
     {
-        int32_t v1;
-        if (!dec_q31_st_ref_stage(r, 0u, in[i], &v1)) { continue; }
-        if (s_q31.stages == 1u)
+        int32_t v = in[i];
+        for (uint8_t s = 0u; s < s_q31.stages; ++s)
         {
-            out[n++] = dec_q31_to_s24_left(v1);
-            continue;
-        }
-        int32_t v2;
-        if (dec_q31_st_ref_stage(r, 1u, v1, &v2))
-        {
-            out[n++] = dec_q31_to_s24_left(v2);
+            /* `&v` is both the source and the destination: the stage takes its
+             * input by value, so feeding a stage's output straight into the next
+             * iteration is sound. */
+            if (!dec_q31_st_ref_stage(r, s, v, &v)) { break; }
+            if ((s + 1u) == s_q31.stages)
+            {
+                out[n++] = dec_q31_to_s24_left(v);
+            }
         }
     }
     return n;
@@ -253,11 +258,33 @@ static void dec_q31_st_note(const char *what, uint32_t den, uint8_t kase,
 static bool dec_q31_st_run(uint32_t den,
                            asrc_decimator_48_to_24_variant_t v24,
                            asrc_decimator_48_to_12_variant_t v12,
+#if ASRC_DECIMATOR_HAS_96_TO_48
+                           asrc_decimator_96_to_48_variant_t vpre,
+#endif
+                           bool prestage,
                            uint8_t kase, uint8_t live_ch, uint32_t *ties)
 {
-    if (!asrc_decimator_q31_init(1u, den, (uint8_t)ASRC_DEC_Q31_CH, v24, v12))
+    /* What the failure record calls this chain.  A composed chain is reported as
+     * 1000 + its COMPOSED ratio -- 1012 is "pre + /6" -- so a composed failure can
+     * never be read as the plain chain of the same divider, which is exactly the
+     * confusion the offset exists to stop.  The pre-stage VARIANT adds 100 per
+     * enumerator on top, because the two wide rows share den == 1 and would
+     * otherwise both report 1002: 1102 is FOR_44100 and 1202 is FOR_48000. */
+#if ASRC_DECIMATOR_HAS_96_TO_48
+    const uint32_t note_den = prestage
+                                  ? (1000u + (den * 2u) + (100u * (uint32_t)vpre))
+                                  : den;
+#else
+    const uint32_t note_den = den;
+#endif
+
+    if (!asrc_decimator_q31_init(1u, den, (uint8_t)ASRC_DEC_Q31_CH, v24, v12,
+#if ASRC_DECIMATOR_HAS_96_TO_48
+                                 vpre,
+#endif
+                                 prestage))
     {
-        dec_q31_st_note("init", den, kase, live_ch, 0u, 0u, 0u, 0, 0);
+        dec_q31_st_note("init", note_den, kase, live_ch, 0u, 0u, 0u, 0, 0);
         return false;
     }
 
@@ -287,7 +314,7 @@ static bool dec_q31_st_run(uint32_t den,
                                                  got, DEC_Q31_ST_OUTMAX,
                                                  ASRC_DEC_Q31_CH, &produced))
         {
-            dec_q31_st_note("refused", den, kase, live_ch, blk, 0u, 0u, 0, 0);
+            dec_q31_st_note("refused", note_den, kase, live_ch, blk, 0u, 0u, 0, 0);
             return false;
         }
 
@@ -295,7 +322,7 @@ static bool dec_q31_st_run(uint32_t den,
                                                    DEC_Q31_ST_BLOCK, want);
         if (produced != expect)
         {
-            dec_q31_st_note("frames", den, kase, live_ch, blk, 0u, 0u,
+            dec_q31_st_note("frames", note_den, kase, live_ch, blk, 0u, 0u,
                             (int32_t)produced, (int32_t)expect);
             return false;
         }
@@ -314,7 +341,7 @@ static bool dec_q31_st_run(uint32_t den,
                     ++(*ties);
                     continue;
                 }
-                dec_q31_st_note("value", den, kase, live_ch, blk,
+                dec_q31_st_note("value", note_den, kase, live_ch, blk,
                                 (uint32_t)o, c, v, w);
                 return false;
             }
@@ -415,7 +442,11 @@ static bool dec_q31_st_r23_case(uint8_t kase, uint8_t live_ch, uint32_t *ties)
                                  ASRC_DECIMATOR_48_TO_32_M,
                                  (uint8_t)ASRC_DEC_Q31_CH,
                                  ASRC_DECIMATOR_48_TO_24_FOR_24000,
-                                 ASRC_DECIMATOR_48_TO_12_FOR_11025))
+                                 ASRC_DECIMATOR_48_TO_12_FOR_11025,
+#if ASRC_DECIMATOR_HAS_96_TO_48
+                                 ASRC_DECIMATOR_96_TO_48_SHARED,
+#endif
+                                 false))
     {
         dec_q31_st_note("init", DEC_Q31_ST_R23_DEN, kase, live_ch, 0u, 0u, 0u, 0, 0);
         return false;
@@ -518,7 +549,11 @@ bool asrc_decimator_q31_isolation_selftest(uint8_t live_ch, int32_t *out,
                                  ASRC_DECIMATOR_48_TO_32_M,
                                  (uint8_t)ASRC_DEC_Q31_CH,
                                  ASRC_DECIMATOR_48_TO_24_FOR_24000,
-                                 ASRC_DECIMATOR_48_TO_12_FOR_11025))
+                                 ASRC_DECIMATOR_48_TO_12_FOR_11025,
+#if ASRC_DECIMATOR_HAS_96_TO_48
+                                 ASRC_DECIMATOR_96_TO_48_SHARED,
+#endif
+                                 false))
     {
         dec_q31_st_note("init", DEC_Q31_ST_R23_DEN, 0u, live_ch, 0u, 0u, 0u, 0, 0);
         return false;
@@ -599,18 +634,67 @@ bool asrc_decimator_q31_isolation_selftest(uint8_t live_ch, int32_t *out,
  */
 bool asrc_decimator_q31_selftest(uint32_t *rounding_ties)
 {
+    /* One row per chain the routing gate can arm.  `prestage` composes the fixed
+     * 96 -> 48 kHz stage in front, which is what a 96 kHz leg selects: the SAME
+     * second-stage divider and the SAME coefficient variant, one stage deeper.  So
+     * the composed rows below are not a second filter set to verify -- they verify
+     * the cascade bookkeeping (a third stage's phase, the pre-stage's own ring at
+     * the top of the arena, and the second intermediate buffer) against the same
+     * oracle, which is where a composed chain can go wrong without sounding wrong. */
     static const struct
     {
         uint32_t den;
         asrc_decimator_48_to_24_variant_t v24;
         asrc_decimator_48_to_12_variant_t v12;
+#if ASRC_DECIMATOR_HAS_96_TO_48
+        asrc_decimator_96_to_48_variant_t vpre;
+#endif
+        bool     prestage;
     } chains[] = {
-        { 2u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025 },
-        { 2u, ASRC_DECIMATOR_48_TO_24_FOR_22050, ASRC_DECIMATOR_48_TO_12_FOR_11025 },
-        { 3u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025 },
-        { 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025 },
-        { 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_12000 },
-        { 6u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025 },
+#if ASRC_DECIMATOR_HAS_96_TO_48
+#  define DEC_Q31_ST_VPRE(v) v,
+#else
+#  define DEC_Q31_ST_VPRE(v)
+#endif
+        { 2u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          DEC_Q31_ST_VPRE(ASRC_DECIMATOR_96_TO_48_SHARED) false },
+        { 2u, ASRC_DECIMATOR_48_TO_24_FOR_22050, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          DEC_Q31_ST_VPRE(ASRC_DECIMATOR_96_TO_48_SHARED) false },
+        { 3u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          DEC_Q31_ST_VPRE(ASRC_DECIMATOR_96_TO_48_SHARED) false },
+        { 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          DEC_Q31_ST_VPRE(ASRC_DECIMATOR_96_TO_48_SHARED) false },
+        { 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_12000,
+          DEC_Q31_ST_VPRE(ASRC_DECIMATOR_96_TO_48_SHARED) false },
+        { 6u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          DEC_Q31_ST_VPRE(ASRC_DECIMATOR_96_TO_48_SHARED) false },
+#if ASRC_DECIMATOR_HAS_96_TO_48
+        /* Composed with the SHARED set: 96 kHz -> 24 / 22.05 / 16 / 12 / 11.025 /
+         * 8 kHz, in the order the 96 kHz routing rows publish them. */
+        { 2u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_SHARED, true },
+        { 2u, ASRC_DECIMATOR_48_TO_24_FOR_22050, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_SHARED, true },
+        { 3u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_SHARED, true },
+        { 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_12000,
+          ASRC_DECIMATOR_96_TO_48_SHARED, true },
+        { 4u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_SHARED, true },
+        { 6u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_SHARED, true },
+        /* The two WIDE variants, den == 1 -- the pre-stage IS the chain (96 -> 48 kHz
+         * and 96 -> 44.1 kHz).  Not a formality: these are the only rows whose ring
+         * sits at offset 0 and spans 183 of the 250-sample arena, so they are where a
+         * ring placed on top of the 48 kHz chains' rings, or a batch bound derived
+         * from the 27-tap reserve, would show up as wrong samples rather than as a
+         * build error.  There is no SHARED den == 1 row: init() refuses it. */
+        { 1u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_FOR_48000, true },
+        { 1u, ASRC_DECIMATOR_48_TO_24_FOR_24000, ASRC_DECIMATOR_48_TO_12_FOR_11025,
+          ASRC_DECIMATOR_96_TO_48_FOR_44100, true },
+#endif
+#undef DEC_Q31_ST_VPRE
     };
 
     uint32_t ties = 0u;
@@ -623,7 +707,12 @@ bool asrc_decimator_q31_selftest(uint32_t *rounding_ties)
             for (uint8_t ch = 0u; ch < 2u; ++ch)
             {
                 if (!dec_q31_st_run(chains[i].den, chains[i].v24,
-                                    chains[i].v12, kase, ch, &ties))
+                                    chains[i].v12,
+#if ASRC_DECIMATOR_HAS_96_TO_48
+                                    chains[i].vpre,
+#endif
+                                    chains[i].prestage,
+                                    kase, ch, &ties))
                 {
                     if (rounding_ties != NULL) { *rounding_ties = ties; }
                     return false;

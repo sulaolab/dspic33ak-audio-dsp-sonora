@@ -50,6 +50,13 @@ typedef struct
 void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
                                     asrc_frontend_plan_t* plan );
 
+/* Whether the front-end implementation this build compiled can carry the ASRC logical width
+ * (ASRC_CH).  False disqualifies it outright: a pair whose plan asks for a front end must be
+ * REFUSED rather than served by a narrower one, because an anti-alias stage that filters fewer
+ * channels than the resampler converts is a missing stage.  Pairs that need no front end are
+ * unaffected.  There is no override -- see the disqualification note in asrc_audio_path.c. */
+bool asrc_audio_path_frontend_can_serve_logical_width( void );
+
 uint32_t asrc_audio_path_ab_fixed_rate_num( void );
 uint32_t asrc_audio_path_ba_fixed_rate_num( void );
 uint32_t asrc_audio_path_ab_fixed_rate_den( void );

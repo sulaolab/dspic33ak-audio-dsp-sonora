@@ -33,6 +33,13 @@ bool audio_transport_reconfigure_leg_rate_hz( transport_leg_t leg,
  *     (8 x 32 x 96k = 24.576 MHz BCLK is beyond this SYSCLK).
  *   - it cannot run ADC and DAC together, so a leg whose role is ADC+DAC cannot be
  *     moved there.
+ *
+ * BOTH ARE PROPERTIES OF THIS CODEC, NOT OF THE ASRC.  They are refusals by the
+ * TRANSPORT, and they must never be read back as an ASRC specification, nor be
+ * allowed to size or restrict any ASRC stage: a codec with a bidirectional TDM8
+ * 96 kHz mode removes both without a single ASRC change.  The channel-width rule
+ * that keeps that true is THE CHANNEL-WIDTH AUTHORITY in
+ * src/app/apps/asrc/asrc_app_config.h.
  */
 bool audio_transport_leg_rate_is_supported( transport_leg_t leg,
                                             uint32_t        sample_rate_hz,

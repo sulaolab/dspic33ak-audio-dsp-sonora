@@ -151,59 +151,81 @@ static void itc_reg_field_write(volatile uint32_t *reg, uint32_t shift,
 static void itc_program_acquisition_sequence(void)
 {
     volatile uint32_t *cmd = ITC_DATACMD_ARRAY;
-    uint32_t guards_off = ((uint32_t)DCMD_PC_LOW << DCMD_PCA_SHIFT) |
-                          ((uint32_t)DCMD_PC_LOW << DCMD_PCB_SHIFT);
+    /* Group B is never selected (ITCTXB stays 0) and the per-record GRDA/GRDB
+     * fields are NONE, so PCB drives nothing; it is written Low rather than left
+     * at 0 because 0 means "hand the pin back to TRIS/LAT" and only 1/2 are
+     * driven levels -- see the DCMD_PC_* comment in the register header.
+     *
+     * PCA is the shield. With ENA_TOUCH_SHIELD_PHASE off, PCA is a static Low and
+     * ITCTXA is 0, so it drives nothing at all and the shield's static Low comes
+     * from RE4 as a GPIO (main.c) -- that is the condition every measurement up
+     * to 2026-08-30 was taken under. With the switch on, ITCTXA selects CVDTX23
+     * and PCA follows the sample's driven polarity: Low through sample A
+     * (electrode Low, capacitor High) and High through sample B (both swapped).
+     * That is the squarest available approximation of "the guard follows the CVD
+     * waveform as closely as possible" (DS70005591 p.1485). It is held for all
+     * four steps of a sample rather than only the charge step, because the
+     * electrode is high-Z from break-before-make onwards and a shield that stops
+     * driving mid-sample couples its own transition into the node being
+     * measured. */
+    uint32_t pcb_off  = ((uint32_t)DCMD_PC_LOW << DCMD_PCB_SHIFT);
+    uint32_t shield_a = ((uint32_t)DCMD_PC_LOW << DCMD_PCA_SHIFT) | pcb_off;
+#if defined(ENA_TOUCH_SHIELD_PHASE)
+    uint32_t shield_b = ((uint32_t)DCMD_PC_HIGH << DCMD_PCA_SHIFT) | pcb_off;
+#else
+    uint32_t shield_b = shield_a;
+#endif
 
     /* ---- Sample A ---------------------------------------------------- */
     /* charge the CVD capacitor, electrode held low, for timer A */
     cmd[0] = DCMD_CHRG |
              ((uint32_t)DCMD_PC_LOW  << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_HIGH << DCMD_PCC_SHIFT) |
-             guards_off |
+             shield_a |
              ((uint32_t)DCMD_LOOP_TMRA << DCMD_LOOP_SHIFT);
 
     /* break before make: everything tri-stated, no wait */
     cmd[1] = ((uint32_t)DCMD_PC_TRISTATE << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PCC_SHIFT) |
-             guards_off;
+             shield_a;
 
     /* connect electrode and capacitor, settle for timer B */
     cmd[2] = DCMD_BAL |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PCC_SHIFT) |
-             guards_off |
+             shield_a |
              ((uint32_t)DCMD_LOOP_TMRB << DCMD_LOOP_SHIFT);
 
     /* convert, and wait for end of conversion before moving on */
     cmd[3] = DCMD_CONV | DCMD_MSTART |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PCC_SHIFT) |
-             guards_off |
+             shield_a |
              ((uint32_t)DCMD_LOOP_ADC_EOC << DCMD_LOOP_SHIFT);
 
     /* ---- Sample B: the same four with both polarities swapped -------- */
     cmd[4] = DCMD_SECOND | DCMD_DISCHRG |
              ((uint32_t)DCMD_PC_HIGH << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_LOW  << DCMD_PCC_SHIFT) |
-             guards_off |
+             shield_b |
              ((uint32_t)DCMD_LOOP_TMRA << DCMD_LOOP_SHIFT);
 
     cmd[5] = DCMD_SECOND |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PCC_SHIFT) |
-             guards_off;
+             shield_b;
 
     cmd[6] = DCMD_SECOND | DCMD_BAL |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PCC_SHIFT) |
-             guards_off |
+             shield_b |
              ((uint32_t)DCMD_LOOP_TMRB << DCMD_LOOP_SHIFT);
 
     /* last command of the sequence: convert, run the math, END */
     cmd[7] = DCMD_SECOND | DCMD_CONV | DCMD_MSTART | DCMD_END |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PC0_SHIFT) |
              ((uint32_t)DCMD_PC_TRISTATE << DCMD_PCC_SHIFT) |
-             guards_off |
+             shield_b |
              ((uint32_t)DCMD_LOOP_ADC_EOC << DCMD_LOOP_SHIFT);
 
     /* SDATAMAP: groups 0 and 1 (SDATACMD0..3 and SDATACMD4..7) both belong to
@@ -372,6 +394,16 @@ static nora_itc_status_t itc_core_start(void)
 
     ITCCON1bits.CVDEN = 1u;
 
+#if defined(ENA_TOUCH_SHIELD_PHASE)
+    /* ITCTXA bit x selects CVDTXx into group A, whose drive is the commands' PCA
+     * field (DS70005591 p.1456-1458). Bit 23 is CVDTX23 = RP69 = RE4, which on
+     * this board is the touch shield copper through R10 = 100 ohm (R11 DNP, so
+     * that copper has no ground of its own and is meant to be driven). */
+    ITCTXA = (1uL << 23u);
+#else
+    ITCTXA = 0uL;
+#endif
+
     itc_program_acquisition_sequence();
     itc_program_math_sequence();
 
@@ -387,9 +419,23 @@ static void itc_program_records(const nora_itc_list_config_t *config)
     for (i = 0u; i < config->record_count; i++) {
         const nora_itc_record_config_t *rc = &config->records[i];
         uint32_t shift = ITC_REC_SHIFT(i);
+#if defined(ENA_TOUCH_SHIELD_PHASE)
+        /* Guards are forced off, not merely expected to be off. Group A holds
+         * both the CVDTXx pins selected in ITCTXA *and* whatever GRDA/GRDB
+         * select, and GRDA/GRDB select the adjacent CVDANx *electrode* -- on this
+         * board the adjacent channel of every pad is that pad's own redundant
+         * channel (CVDAN8's PIN+1 is CVDAN9, same copper). A phase-driven PCA
+         * with a guard selected would therefore drive the node being measured.
+         * Overriding here rather than asserting keeps the shield experiment from
+         * depending on a caller that is free to change. */
+        uint32_t half  = ((uint32_t)rc->cvdan & ITC_REC_PIN_MASK) |
+                         ((uint32_t)NORA_ITC_GUARD_NONE << ITC_REC_GRDA_SHIFT) |
+                         ((uint32_t)NORA_ITC_GUARD_NONE << ITC_REC_GRDB_SHIFT);
+#else
         uint32_t half  = ((uint32_t)rc->cvdan & ITC_REC_PIN_MASK) |
                          ((uint32_t)rc->guard_a << ITC_REC_GRDA_SHIFT) |
                          ((uint32_t)rc->guard_b << ITC_REC_GRDB_SHIFT);
+#endif
         uint32_t word  = rec[ITC_REC_WORD(i)];
 
         word &= ~(ITC_REC_HALF_MASK << shift);

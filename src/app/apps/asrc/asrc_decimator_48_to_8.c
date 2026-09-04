@@ -102,6 +102,24 @@ _Static_assert(ASRC_DECIMATOR_96_TO_48_GENERATED_CRC32 == ASRC_DECIMATOR_96_TO_4
                "96-to-48 coefficient CRC metadata mismatch");
 _Static_assert((ASRC_DECIMATOR_96_TO_48_TAPS & 1u) != 0u,
                "symmetric FIR helper requires an odd tap count");
+/* The two wide variants.  Pinned here even though the FLOAT implementation below never loads
+ * them: this file is where generated-vs-header agreement is checked for every set in the .inc,
+ * and a set whose CRC nobody pins is a set that can drift silently. */
+_Static_assert(ASRC_DECIMATOR_96_TO_48_OUT44K1_COEFF_TAPS == ASRC_DECIMATOR_96_TO_48_OUT44K1_TAPS,
+               "96-to-48 FOR_44100 coefficient count mismatch");
+_Static_assert(ASRC_DECIMATOR_96_TO_48_OUT44K1_GENERATED_CRC32 ==
+                   ASRC_DECIMATOR_96_TO_48_OUT44K1_COEFF_CRC32,
+               "96-to-48 FOR_44100 coefficient CRC metadata mismatch");
+_Static_assert(ASRC_DECIMATOR_96_TO_48_OUT48K_COEFF_TAPS == ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS,
+               "96-to-48 FOR_48000 coefficient count mismatch");
+_Static_assert(ASRC_DECIMATOR_96_TO_48_OUT48K_GENERATED_CRC32 ==
+                   ASRC_DECIMATOR_96_TO_48_OUT48K_COEFF_CRC32,
+               "96-to-48 FOR_48000 coefficient CRC metadata mismatch");
+_Static_assert(((ASRC_DECIMATOR_96_TO_48_OUT44K1_TAPS & 1u) != 0u) &&
+                   ((ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS & 1u) != 0u),
+               "every pre-stage variant must have an odd tap count");
+_Static_assert(ASRC_DECIMATOR_96_TO_48_TAPS_MAX == ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS,
+               "the widest pre-stage variant is the 48 kHz one; storage is sized by TAPS_MAX");
 #endif /* ASRC_DECIMATOR_HAS_96_TO_48 */
 
 /*
@@ -118,7 +136,7 @@ _Static_assert((ASRC_DECIMATOR_96_TO_48_TAPS & 1u) != 0u,
  * last), so results are bit-exact against it -- asrc_decimator_selftest()
  * checks exactly that.
  */
-#define DEC_STRIDE ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS   /* history frame stride */
+#define DEC_STRIDE ASRC_DECIMATOR_FLOAT_MAX_CHANNELS   /* history frame stride */
 
 static float fir_symmetric_win(const float* window,
                                const float* coeff,
@@ -188,7 +206,7 @@ bool asrc_decimator_48_to_8_init(asrc_decimator_48_to_8_t* state,
                                  uint8_t channels)
 {
     if ((state == NULL) || (channels == 0u) ||
-        (channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS))
+        (channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS))
     {
         return false;
     }
@@ -276,7 +294,7 @@ static bool process(asrc_decimator_48_to_8_t* state,
         *output_frames = 0u;
     }
     if ((state == NULL) || (state->channels == 0u) ||
-        (state->channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS) ||
+        (state->channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS) ||
         (output_frames == NULL) ||
         ((input_frames != 0u) && (input == NULL)) ||
         (input_stride < state->channels) ||
@@ -422,7 +440,7 @@ bool asrc_decimator_48_to_16_init(asrc_decimator_48_to_16_t* state,
                                   uint8_t channels)
 {
     if ((state == NULL) || (channels == 0u) ||
-        (channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS))
+        (channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS))
     {
         return false;
     }
@@ -458,7 +476,7 @@ static bool process_48_to_16(asrc_decimator_48_to_16_t* state,
         *output_frames = 0u;
     }
     if ((state == NULL) || (state->channels == 0u) ||
-        (state->channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS) ||
+        (state->channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS) ||
         (output_frames == NULL) ||
         ((input_frames != 0u) && (input == NULL)) ||
         (input_stride < state->channels) ||
@@ -573,7 +591,7 @@ bool asrc_decimator_96_to_48_init(asrc_decimator_96_to_48_t* state,
                                   uint8_t channels)
 {
     if ((state == NULL) || (channels == 0u) ||
-        (channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS))
+        (channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS))
     {
         return false;
     }
@@ -613,7 +631,7 @@ static bool process_96_to_48(asrc_decimator_96_to_48_t* state,
         *output_frames = 0u;
     }
     if ((state == NULL) || (state->channels == 0u) ||
-        (state->channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS) ||
+        (state->channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS) ||
         (output_frames == NULL) ||
         ((input_frames != 0u) && (input == NULL)) ||
         (input_stride < state->channels) ||
@@ -727,7 +745,7 @@ bool asrc_decimator_48_to_24_init(asrc_decimator_48_to_24_t* state,
                                   asrc_decimator_48_to_24_variant_t variant)
 {
     if ((state == NULL) || (channels == 0u) ||
-        (channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS))
+        (channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS))
     {
         return false;
     }
@@ -780,7 +798,7 @@ static bool process_48_to_24(asrc_decimator_48_to_24_t* state,
         *output_frames = 0u;
     }
     if ((state == NULL) || (state->channels == 0u) ||
-        (state->channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS) ||
+        (state->channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS) ||
         (state->coeff == NULL) ||
         (output_frames == NULL) ||
         ((input_frames != 0u) && (input == NULL)) ||
@@ -901,7 +919,7 @@ bool asrc_decimator_48_to_12_init(asrc_decimator_48_to_12_t* state,
                                   asrc_decimator_48_to_12_variant_t variant)
 {
     if ((state == NULL) || (channels == 0u) ||
-        (channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS))
+        (channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS))
     {
         return false;
     }
@@ -979,7 +997,7 @@ static bool process_48_to_12(asrc_decimator_48_to_12_t* state,
         *output_frames = 0u;
     }
     if ((state == NULL) || (state->channels == 0u) ||
-        (state->channels > ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS) ||
+        (state->channels > ASRC_DECIMATOR_FLOAT_MAX_CHANNELS) ||
         (state->stage1_coeff == NULL) || (state->stage2_coeff == NULL) ||
         (output_frames == NULL) ||
         ((input_frames != 0u) && (input == NULL)) ||
@@ -1139,7 +1157,17 @@ bool asrc_decimator_48_to_12_process_s24_left(
 
 #define ASRC_DEC_ST_FRAMES   (16u)   /* input frames per simulated block      */
 #define ASRC_DEC_ST_BLOCKS   (40u)   /* 640 frames: wraps stage 2 (>441) too  */
-#define ASRC_DEC_ST_CH       (2u)
+/* The float family's OWN width, on purpose: this oracle checks that THIS implementation is
+ * correct at the width it implements (ASRC_DECIMATOR_FLOAT_MAX_CHANNELS).  It is a module unit
+ * test and deliberately NOT parameterised by ASRC_CH -- "test width --X--> shipping width" is a
+ * forbidden arrow in both directions, and widening it here would hide where this legacy family's
+ * boundary actually is.
+ *
+ * It therefore proves nothing about the product's logical width.  That is a different layer and
+ * has its own check: the ASRC_CH-wide channel-isolation selftest in asrc_audio_path.c, which walks
+ * ch 0..ASRC_CH-1 through the live front end and fails if any channel is not independently
+ * carried.  Keep the two separate; a build can pass this one and still be narrowing the path. */
+#define ASRC_DEC_ST_CH       (ASRC_DECIMATOR_FLOAT_MAX_CHANNELS)
 
 typedef struct
 {

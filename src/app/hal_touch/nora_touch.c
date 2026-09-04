@@ -51,7 +51,36 @@
  *    statement about that broken condition, not about this hardware, and CVDCAP
  *    is worth re-sweeping once both are corrected -- scored on
  *    min(light-touch mag) - max(idle tail), not on the idle tail alone. */
-#define NORA_TOUCH_CHARGE_NS   (2000UL)
+/* 5,000 ns, not 2,000, and both halves of the metric moved -- measured on AK512
+ * 2026-08-30 with the shield grounded and the idle electrodes tied, which is the
+ * first time this knob has been swept under the documented measurement condition
+ * (the 2026-08-14 sweep that concluded "the knobs are flat" was taken with the
+ * shield held at VDD and the electrodes floating, which the ITC hardware
+ * documentation rules out as a measurement condition).
+ *
+ * Idle tail, peak-to-trough over matched 16 s windows, CVDAN10:
+ *   1000 ns 1268   2000 ns 1184   3000 ns 1026   5000 ns 974
+ * and the accumulated raw count moves less than 0.4 % across all four, so this is
+ * not a gain change. Touch magnitude went *up* as well: CVDAN10 taps read 994..1408
+ * against 808..1107 at 2,000 ns -- a longer charge lets the electrode reach the
+ * rail, so the finger's added capacitance is a larger share of what is measured.
+ *
+ * Consequence on the pad that was the problem: CVDAN10's idle_ref fell from
+ * 137..181 to 92..118, so max(FLOOR_MIN, idle_ref * FLOOR_MULT) stopped clearing
+ * FLOOR_MIN and all three pads now learn to 700. That is what the FLOOR_MAX cap
+ * was papering over.
+ *
+ * Cost: 199 -> 110 scans/s (each of the 2 samples charges for 3 us longer, 2^8
+ * times). The 4-scan magnitude window is then 36 ms and debounce 2 scans is 18 ms,
+ * both still well inside a tap, and the operator's verdict at 5,000 ns was "light
+ * from the first press" on pads 1 and 2.
+ *
+ * 5,000 ns is close to the ceiling: TMRA is 8-bit in TAD, and 2,000 ns is already
+ * 100 TAD, so 5,000 ns is 250 TAD. A larger value is refused by
+ * nora_touch_set_acquisition() rather than silently truncated. 3,000 ns (150 TAD,
+ * idle tail 1026, ~150 scans/s) is the middle option if the scan rate is needed
+ * back. */
+#define NORA_TOUCH_CHARGE_NS   (5000UL)
 #define NORA_TOUCH_BALANCE_NS  (1000UL)
 #define NORA_TOUCH_CVDCAP      (4u)
 #define NORA_TOUCH_ACC_COUNT   (8u)     /* 2^8: ~3x better SNR than 2^4       */
@@ -325,10 +354,39 @@
 #define NORA_TOUCH_IDLE_SHIFT        (6u)
 
 /* Consecutive scans below the candidate before idle_ref is allowed to move at
- * all. NORA_TOUCH_MAG_SCANS would be the minimum that flushes the touch out of
- * the averaging window; twice that leaves margin for the release tail without
- * being long enough to miss drift. */
-#define NORA_TOUCH_IDLE_QUIET_RUN    (8u)
+ * all -- i.e. how long after a touch this pad's magnitude is still treated as
+ * containing a finger.
+ *
+ * This was 8 (twice NORA_TOUCH_MAG_SCANS: enough to flush the touch out of the
+ * averaging window), and 8 scans is 40 ms. Measured wrong on 2026-08-30: a hand
+ * is still millimetres from the pad 40 ms after a release, and what it couples in
+ * is a large fraction of a real touch. So idle_ref -- which exists to describe the
+ * pad when *nobody is there* -- was being measured with somebody there, and the
+ * floor multiplies it by FLOOR_MULT.
+ *
+ * The log that settled it, one pad tapped 0.3..0.7 s apart, idle_ref and the
+ * threshold it produced:
+ *
+ *   idle 169 -> 900   idle 137 -> 822   idle 129 -> 774   idle 202 -> 900
+ *   idle 170 -> 900   idle 179 -> 900   idle 166 -> 900
+ *
+ * against real presses of 870..1151 on that pad: the threshold landed *inside*
+ * the tap distribution, so the same press worked or did not depending on what the
+ * previous release had left behind. Resting idle_ref on that pad, minutes later,
+ * is 90..110.
+ *
+ * 400 scans is about 2 s at the measured 199 scans/s. Seconds, not milliseconds,
+ * is the right order: it has to outlast a hand leaving the board, and a tapping
+ * burst is exactly the case where 40 ms never does.
+ *
+ * This, not s_all_quiet, is what protects the pad being tapped -- while one pad is
+ * tapped the other two are quiet, so that gate is open for the whole burst.
+ *
+ * Cost: idle_ref follows a genuine rise in noise up to 2 s later. idle_ref feeds
+ * only the floor and the pair is recomputed on every press, so the exposure is one
+ * press at a threshold 2 s out of date -- against a measured failure to detect
+ * presses at all. */
+#define NORA_TOUCH_IDLE_QUIET_RUN    (400u)
 
 typedef struct {
     uint8_t  cvdan;
@@ -350,7 +408,7 @@ typedef struct {
     int32_t  idle_ref;          /* decaying max of mag while quiet              */
     int32_t  learn_peak;        /* highest mag in the excursion under way        */
     uint8_t  learn_run;         /* scans the excursion has held                 */
-    uint8_t  quiet_run;         /* scans below the candidate, for idle_ref       */
+    uint16_t quiet_run;         /* scans below the candidate, for idle_ref       */
     uint16_t presses;           /* press events since the last reset_peaks()     */
     bool     learn_active;
     int32_t  learn_mag[NORA_TOUCH_LEARN_SAMPLES_MAX]; /* press amplitudes seen  */
@@ -386,9 +444,14 @@ static uint32_t             s_scans;
 /* True when every key was quiet on the previous scan, which is the only condition
  * under which idle_ref is allowed to move. A hand near the board is a common-mode
  * lift on all pads at once (see NORA_TOUCH_LEARN_FLOOR_MAX for the measurement),
- * so "all pads quiet" is the cheapest available test for "nobody is there" -- and
- * what the floor is meant to protect against is the noise present when nobody is.
- * One scan of lag (5 ms) against a quantity whose time constant is 320 ms. */
+ * so "all pads quiet" is a cheap test for "a hand is somewhere over the board".
+ * One scan of lag (5 ms) against a quantity whose time constant is 320 ms.
+ *
+ * It is not sufficient on its own, and 2026-08-30 measured why: tapping one pad
+ * leaves the other two quiet, so this gate stays open for the whole burst and the
+ * tapped pad's own release tail walked its idle_ref up to 202. What bounds that is
+ * NORA_TOUCH_IDLE_QUIET_RUN, which is per-pad and now counted in seconds. This
+ * gate still earns its place for the pads that are not being tapped. */
 static bool                 s_all_quiet;
 static uint32_t             s_rejected;
 static uint32_t             s_implausible;
@@ -440,12 +503,33 @@ void nora_touch_default_config( nora_touch_config_t *cfg )
      * This replaces the idle-noise calibration of A.6, which was measured wrong:
      * the pad with the smallest noise tail needed the highest threshold. */
     cfg->learn_presses     = NORA_TOUCH_LEARN_PRESSES;
-    /* Cold gate -- see nora_touch_config_t for the measurement it comes from. 900
-     * clears the 705 an untouched pad reached on 2026-08-15 and sits under the
-     * 826..1,520 the same board's real taps fired at; 4 scans (~27 ms) is the
-     * longest press debounce that a short tap's ~5-scan plateau still survives,
-     * and is well inside the ~50 ms a human reads as instant. */
-    cfg->cold_press_threshold   = 900;
+    /* Cold gate -- see nora_touch_config_t for what it decides. 800, lowered from
+     * 900 on 2026-08-30.
+     *
+     * 900 was measured on 2026-08-15 with charge 2,000 ns, where an untouched pad
+     * reached 705 and idle_ref sat at 110..190. At the 5,000 ns charge that is now
+     * the default (NORA_TOUCH_CHARGE_NS) the idle side is a different quantity:
+     * idle_ref rests at 90..97 and a 2 h 32 m soak with nobody in the room produced
+     * no press event on any pad, with each pad's peak and trough unmoved from the
+     * tap that set them 40 minutes earlier. That soak ran at press 700 / debounce
+     * 2 -- the cold gate had been lifted on all three pads -- so it measured a
+     * weaker configuration than this gate and still saw nothing.
+     *
+     * 900 is therefore no longer where a cold pad's noise is; it is where light taps
+     * are. On the same board real presses read 870..1,151 while idle_ref was being
+     * corrupted, and 994..1,408 once it was not, so 900 sat inside the bottom of the
+     * tap distribution and cost first presses for nothing. 800 keeps about 8x over
+     * the measured idle magnitude (81..119 raw) and clears the taps.
+     *
+     * Not zero, and the gate is not removed: its purpose is the minutes between
+     * power-on and the first learned press, and that window is still unmeasured --
+     * the soak above started 40 minutes after POR. Removing it needs a soak from POR
+     * with nothing learned.
+     *
+     * 4 scans is about 36 ms at 110 scans/s (it was about 27 ms at the old charge
+     * time), still the longest press debounce a short tap's about 5-scan plateau
+     * survives and still inside the about 50 ms a human reads as instant. */
+    cfg->cold_press_threshold   = 800;
     cfg->cold_debounce_scans    = 4u;
     cfg->verbose           = true;
     /* No clock: the board states it. See nora_touch_config_t.clock_hz -- a default
@@ -904,16 +988,17 @@ static void nora_touch_update_key( nora_touch_key_t *k )
             k->learn_run    = 0u;
             k->learn_peak   = 0;
 
-            if( k->quiet_run < 0xFFu ) { k->quiet_run++; }
+            if( k->quiet_run < 0xFFFFu ) { k->quiet_run++; }
 
             /* Below the candidate is not yet quiet: mag is a mean over
              * NORA_TOUCH_MAG_SCANS, so the first scans under the candidate still
              * carry the touch that just ended. Wait for the window to flush, then
              * follow the quiet magnitude slowly in *both* directions -- see
              * NORA_TOUCH_IDLE_SHIFT for the run this cost. */
-            /* ...and only while *no* pad is active: quiet_run alone clears 40 ms
-             * after this pad's own touch, which is still inside the window where a
-             * hand hovering over the board lifts every pad. See s_all_quiet. */
+            /* Two conditions covering different cases, neither subsuming the
+             * other: quiet_run is per-pad and protects the pad being tapped (see
+             * NORA_TOUCH_IDLE_QUIET_RUN), s_all_quiet protects the pads that are
+             * merely near the hand while a *different* pad is touched. */
             if( (k->quiet_run >= NORA_TOUCH_IDLE_QUIET_RUN) && s_all_quiet )
             {
                 k->idle_ref += (k->mag - k->idle_ref) >> NORA_TOUCH_IDLE_SHIFT;

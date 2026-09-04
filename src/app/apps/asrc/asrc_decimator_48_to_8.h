@@ -18,7 +18,37 @@
  * so a build that cannot use it also cannot link against it by accident. */
 #define ASRC_DECIMATOR_HAS_96_TO_48  APP_USE_96K_RATE
 
-#define ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS (2u)
+/* IMPLEMENTATION CAPACITY of this legacy float decimator family -- how many channels THIS code
+ * can process.  It is NOT an ASRC channel-width limit and must never be read as one.
+ *
+ * Three different quantities get called "channels" in this tree and only one of them may set the
+ * width of ASRC processing:
+ *
+ *   ASRC_CH                 the ASRC LOGICAL width.  The only authority over how many channels
+ *                           the front end, the history and the resampler process.
+ *   APP_SLOTS_PER_FS        the PHYSICAL I/O width (WM8904 = 2 ch, I2S = 2 slots, TDM8 = 8).
+ *                           Confined to the mapping at the two ends: replicate into ASRC_CH on
+ *                           the way in, narrow to slots on the way out.
+ *   this macro              THIS implementation's CAPABILITY, and nothing more.  It is not an
+ *                           ASRC specification.  It may only take part in selecting or VALIDATING
+ *                           an implementation; it may not change ASRC_CH.
+ *
+ * So the correct inference is NOT "float is 2 ch, therefore this path is 2 ch" but "ASRC_CH is the
+ * requirement; this implementation cannot meet it; it is therefore DISQUALIFIED as a front end".
+ * A disqualified implementation is not used at a reduced width -- the rate pairs that need a front
+ * end are refused instead, with a reason (audio_app_asrc_rate_pair_is_supported()), and the pairs
+ * that need none are unaffected.  There is no acknowledgement macro and no override, because every
+ * such escape is a way of writing "reduce the width until it fits": a width reduced to fit measures
+ * nothing, and for an anti-alias stage it is worse -- filtering fewer channels than the resampler
+ * converts is a MISSING stage, and down-conversion without one is not correct at any channel count.
+ *
+ * This was not hypothetical: the AK128 TDM8 one-to-one notes in asrc_app_build_config.h used to
+ * cite this macro as the reason the low-rate front end "cannot be used" in an 8-channel build --
+ * i.e. a legacy implementation's capacity had quietly become a product-level capability decision.
+ *
+ * 2 is honest for THIS family: ASRC_DECIMATOR_HIST_LEN below sizes every history array by it, and
+ * the frozen 48 kHz paths are byte-compared against builds that use it. Widening it is not the fix. */
+#define ASRC_DECIMATOR_FLOAT_MAX_CHANNELS (2u)
 #define ASRC_DECIMATOR_48_TO_8_STAGE1_TAPS  (43u)
 #define ASRC_DECIMATOR_48_TO_8_STAGE2_TAPS  (147u)
 #define ASRC_DECIMATOR_48_TO_8_COEFF_CRC32  (0x00F3DAE7UL)
@@ -154,17 +184,80 @@ typedef enum
  * per-tap cost (its output is 48 kHz, not 24 kHz) and nearly produced a false no-go; see study
  * sections 6.1-6.2.  17.2 us instead of 87.7 us of a 166.6 us window.
  *
- * ONE COEFFICIENT SET, NO VARIANT ENUM -- the one place this is simpler than the /4 and /2 stages
- * it feeds.  Designed against the tightest of the four rates (16 kHz: passband 6400 Hz, stopband
- * from 40000 Hz), it satisfies all of them: stage alone -104.32 dB at 16 kHz and -107.56 dB at
- * 8/11.025/12 kHz, passband edge -0.0000 dB.  Composed with each existing chain over that chain's
- * own designed passband: ripple 0.0001 dB, added droop -0.00007 dB, i.e. transparent in band.
+ * ONE COEFFICIENT SET FOR EVERY COMPOSED CHAIN, NO VARIANT ENUM -- the one place this is simpler
+ * than the /4 and /2 stages it feeds.  Designed against the tightest rate in the menu (32 kHz:
+ * passband 15000 Hz, which is the widest second-stage passband, and stopband from 48000 - 16000 =
+ * 32000 Hz, the lowest fold edge), it satisfies every rate with margin to spare -- stage alone
+ * -108.38 dB at 32 kHz's fold edge rising to -124.22 dB at 8 kHz's, passband edge -0.0001 dB.
+ * Composed with each existing chain over that chain's own designed passband: ripple 0.0001 dB,
+ * added droop -0.0001 dB, i.e. transparent in band.
  *
- * RAM +336 B, and it does NOT join the union that holds the stages above: a composed chain runs the
- * pre-stage AND a second stage in the same block, so they need to exist at once. */
+ * 21 -> 27 TAPS on 2026-09-02, to admit 96 k -> 22.05 kHz.  The widening is driven by a GATE, not
+ * by a filter defect: ASRC_FILL_SLACK_REQUIRED refuses that pair on the direct path (step 4.3537
+ * clamps the setpoint to R + ASRC_FILL_JITTER = 4 slack), and a composed /4 fixes it by putting the
+ * resampler back at step 1.0884.  The old four-rate set could not be reused for that row -- at the
+ * 36975 Hz fold edge it reads only -58.09 dB -- so the row and the coefficients go together.  The
+ * set also covers 24 kHz, whose routing row is not published yet, because doing so cost 2 taps.
+ *
+ * 27 -> 41 TAPS on 2026-09-03, to admit 96 k -> 32 kHz -- and here the old set does not merely
+ * lose margin, it FAILS: at 32 kHz's 32000 Hz fold edge the 27-tap set reads -47.95 dB, so
+ * composing it would have shipped an audible alias.  32 kHz becomes the binding case on both
+ * edges at once: the lowest fold edge in the menu (32000 Hz, under 24 kHz's 36000) and the widest
+ * second-stage passband (15000 Hz, the L=2/M=3 `:audio` stage's own).  41 taps is the minimum that
+ * clears the same -100 dB stage-alone bar, at -108.38 dB.  It stays ONE shared set because the new
+ * design dominates the old one pointwise -- every other row's fold edge is above 32000 Hz and its
+ * passband below 15000 Hz, so all six improve from a uniform -107.46 dB to -110.23..-124.22 dB.
+ *
+ * RAM +656 B (41 taps of mirrored, channel-interleaved history; +224 B over the 27-tap set), and it
+ * does NOT join the union that holds the stages above: a composed chain runs the pre-stage AND a
+ * second stage in the same block, so they need to exist at once. */
+/* THREE COEFFICIENT SETS, WITH DIFFERENT TAP COUNTS (2026-09-03).
+ *
+ * The 41-tap set above is the SHARED one, and it serves every composed chain -- 96 kHz down to
+ * 32 kHz and below, where a second stage runs behind the pre-stage.  It cannot serve the two rows
+ * whose FINAL rate is 44.1 or 48 kHz: the pre-stage has to remove everything that would fold into
+ * the final band, so its stopband edge is 48000 - final_Nyquist (25950 / 24000 Hz) and its
+ * passband has to reach 20 kHz.  That transition is up to 4.3x narrower than the shared set's
+ * 15000 -> 32000 Hz, and no tap count serves both cheaply: the shared set reads only -7.48 dB at
+ * the 48 kHz fold edge and -15.54 dB at the 44.1 kHz one, while 169 taps would cost every
+ * composed chain 4x the MACs for attenuation none of them uses.  So the FINAL rate selects the set, exactly the way it selects between the
+ * two /2 and the two /4 sets -- with one difference that matters to a caller: THESE VARIANTS DO
+ * NOT SHARE A TAP COUNT, so history and coefficient storage must be sized for the widest one.
+ *
+ * Each wide variant is a MINIMUM against the same -100 dB stage-alone bar as every other set
+ * here: 111 taps reads -91.92 dB at the 44.1 kHz fold edge and 167 taps -98.72 dB at the 48 kHz
+ * one.  Passband ripple 0.0001 dB, |H| at 20 kHz -0.0000 dB.
+ *
+ * A WIDE VARIANT IS NEVER COMPOSED.  Both serve a chain whose second stage is empty -- 96 -> 48
+ * kHz, after which the resampler pulls 48 -> 44.1 kHz (step 1.08844) or runs at step 1.00000 --
+ * so a wide ring and a second stage's rings are never live at the same time.  The Q31 front end
+ * relies on that to give a wide variant the whole history arena instead of the pre-stage reserve,
+ * and asserts it rather than assuming it. */
 #if ASRC_DECIMATOR_HAS_96_TO_48
-#define ASRC_DECIMATOR_96_TO_48_TAPS         (21u)
-#define ASRC_DECIMATOR_96_TO_48_COEFF_CRC32 (0xE3A49ADCUL)
+#define ASRC_DECIMATOR_96_TO_48_TAPS         (41u)
+#define ASRC_DECIMATOR_96_TO_48_COEFF_CRC32 (0xE22651A1UL)
+#define ASRC_DECIMATOR_96_TO_48_OUT44K1_TAPS         (113u)
+#define ASRC_DECIMATOR_96_TO_48_OUT44K1_COEFF_CRC32 (0x4188A451UL)
+#define ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS          (169u)
+#define ASRC_DECIMATOR_96_TO_48_OUT48K_COEFF_CRC32  (0x009BDEDAUL)
+/* The widest set, which is what storage is sized by.  Written as a max over the three rather than
+ * as the literal 169, so adding a variant cannot leave a ring sized for the old widest. */
+#define ASRC_DECIMATOR_96_TO_48_TAPS_MAX \
+    ((ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS > ASRC_DECIMATOR_96_TO_48_OUT44K1_TAPS) \
+         ? ((ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS > ASRC_DECIMATOR_96_TO_48_TAPS) \
+                ? ASRC_DECIMATOR_96_TO_48_OUT48K_TAPS : ASRC_DECIMATOR_96_TO_48_TAPS) \
+         : ((ASRC_DECIMATOR_96_TO_48_OUT44K1_TAPS > ASRC_DECIMATOR_96_TO_48_TAPS) \
+                ? ASRC_DECIMATOR_96_TO_48_OUT44K1_TAPS : ASRC_DECIMATOR_96_TO_48_TAPS))
+
+/* Which set the pre-stage loads.  Selected by the FINAL rate of the leg, not by the pre-stage's
+ * own ratio -- the pre-stage is always 96 -> 48 kHz, and what differs is how much of 24-48 kHz
+ * the chain behind it will fold. */
+typedef enum
+{
+    ASRC_DECIMATOR_96_TO_48_SHARED    = 0,   /* 41 taps: pass 15000, stop 32000; composed chains */
+    ASRC_DECIMATOR_96_TO_48_FOR_44100 = 1,   /* 113 taps: pass 20000, stop 25950; pre-stage only */
+    ASRC_DECIMATOR_96_TO_48_FOR_48000 = 2    /* 169 taps: pass 20000, stop 24000; pre-stage only */
+} asrc_decimator_96_to_48_variant_t;
 #endif
 
 /* num == 2, den == 3: the 48 -> 32 kHz AUDIO MODE front end (2026-08-23).
@@ -191,7 +284,29 @@ typedef enum
  * unchanged: no new assembler.
  *
  * AB LEG ONLY.  BiDir is asymmetric here by design: 32 -> 48 kHz is up-sampling and needs no
- * anti-alias front end at all, so the BA leg gets none. */
+ * anti-alias front end at all, so the BA leg gets none.
+ *
+ * OFFICIALLY SUPPORTED as of 2026-09-03 (owner decision).  The shipping specification of this
+ * chain is exactly two clauses, and both must be quoted together:
+ *
+ *     0-13 kHz  protected
+ *     13-16 kHz relaxed
+ *
+ * Accepted against a 5 % CPU reserve.  Hardware evidence, AK512, HEAD bb4a95a, shipping BIDIR
+ * float image, both legs live at 48 <-> 32 kHz:
+ *
+ *     DSPload max = 91.5 %       -> 8.5 % reserve, so the 5 % reserve criterion passes
+ *                                   (the 48/48 baseline on the same image is 71.7 %)
+ *     600 s soak                 -> miss=0 drop=0 starve=0 udf=0 bad=0/0/0/0
+ *     0-13 kHz alias  -107.03 dBc measured (19,000 -> 13,000 Hz), host gate -107.02
+ *     13-16 kHz alias  -22.52 dBc measured worst (16,250 -> 15,750 Hz), level-independent
+ *
+ * NOT MET: a 10 % CPU reserve (91.5 % leaves 8.5 %).  Also note the 32 kHz leg's per-leg
+ * response exceeds its own 500 us block period by up to 88 us -- that is one preemption by the
+ * 48 kHz leg under rate-monotonic asymmetry, not a missed deadline, and the harm counters above
+ * are what the acceptance rests on.  Do not re-derive either figure from the pre-2026-08-26
+ * `TDMsum` numbers: that instrument was replaced by `DSPload` and is gone from src/.
+ * Record: [internal] report_ak512_48_to_32_n97_stage3_revalidation_2026-09-03.md. */
 #define ASRC_DECIMATOR_48_TO_32_L             (2u)
 #define ASRC_DECIMATOR_48_TO_32_M             (3u)
 #define ASRC_DECIMATOR_48_TO_32_PROTO_TAPS   (97u)
@@ -239,7 +354,7 @@ typedef enum
  * negligible here.  Frame stride is always MAX_CHANNELS, also for mono.
  */
 #define ASRC_DECIMATOR_HIST_LEN(taps) \
-    (2u * (taps) * ASRC_DECIMATOR_48_TO_8_MAX_CHANNELS)
+    (2u * (taps) * ASRC_DECIMATOR_FLOAT_MAX_CHANNELS)
 
 typedef struct
 {
@@ -306,12 +421,20 @@ typedef struct
     uint64_t output_frames;
 } asrc_decimator_48_to_12_t;
 
-/* The 96 -> 48 kHz pre-stage.  Same shape as asrc_decimator_48_to_16_t -- one rate-changing stage,
- * so one write index and one phase counter -- and with no `coeff` pointer, because a single shared
- * coefficient set serves all four final rates (see the macro block above).  Kept as its own type
- * rather than reusing the 48->24 type for the same reason that one is separate from the 48->16 type:
- * the tap count is a compile-time literal in the pointer walk and the frozen paths must stay
- * byte-identical. */
+/* The 96 -> 48 kHz pre-stage, FLOAT implementation.  Same shape as asrc_decimator_48_to_16_t --
+ * one rate-changing stage, so one write index and one phase counter -- and with no `coeff`
+ * pointer, because this implementation serves the SHARED 27-tap set only.  Kept as its own type
+ * rather than reusing the 48->24 type for the same reason that one is separate from the 48->16
+ * type: the tap count is a compile-time literal in the pointer walk and the frozen paths must
+ * stay byte-identical.
+ *
+ * THE TWO WIDE VARIANTS ARE Q31-ONLY (2026-09-03), and that asymmetry is deliberate.  The
+ * variants exist to admit the 44.1 and 48 kHz rows, whose 113/169 taps do not fit the float front
+ * end's CPU budget at all (92.5 and 138.4 us of a 140 us budget, against 36.2 and 54.1 us in
+ * Q31) -- so no build would ever select them here.  Rather than carry a coefficient pointer and a
+ * runtime tap count into a frozen pointer walk for a chain that cannot run, the float arm of
+ * asrc_audio_path.c REFUSES those two rows.  Fail-closed, not silently narrower: PATH_FRONTEND_Q31
+ * is 1 in every shipping configuration, and this arm survives only as the selftest's oracle. */
 #if ASRC_DECIMATOR_HAS_96_TO_48
 typedef struct
 {
@@ -488,21 +611,33 @@ bool asrc_decimator_48_to_12_process_s24_left(
     size_t* output_frames);
 
 /*
- * PRE-STAGE for a 96 kHz input leg: a single 21-tap 2:1 decimator to 48 kHz, placed in FRONT of
+ * PRE-STAGE for a 96 kHz input leg: a single 27-tap 2:1 decimator to 48 kHz, placed in FRONT of
  * any of the chains above so they can serve a 96 kHz leg unchanged.  One shared coefficient set,
- * so no `variant` argument -- see the tap-count block above for why 21 taps suffice and why the
+ * so no `variant` argument -- see the tap-count block above for why so few taps suffice and why the
  * stand-alone price of 107 is the wrong shape for this position.
  *
  * Composed ratios, which is what the routing gate publishes and the feed-forward plan divides by:
  *
  *   /2       -> 48 kHz     the pre-stage alone; the resampler then runs at step 1.00000
+ *   /2 + /2  -> 22.05 kHz  composed den 4, step 1.08843  (the `:22k` variant behind it)
  *   /2 + /3  -> 16 kHz     composed den 6
  *   /2 + /4  -> 12 kHz     composed den 8, step 1.00000; or 11.025 kHz at step 1.08843
  *   /2 + /6  ->  8 kHz     composed den 12
  *
- * 22.05 and 24 kHz deliberately do NOT get this stage against a 96 kHz leg: their R+jitter is
- * already 85 and 80 against the cap of 104, so they resample directly and pay nothing.  (Their
- * 48 kHz-input /2 rows are unaffected and still use asrc_decimator_48_to_24_*.)
+ * 22.05 kHz JOINED ON 2026-09-02, and the reason is worth keeping because the old reasoning was
+ * correct when it was written.  It used to read "22.05 and 24 kHz deliberately do NOT get this
+ * stage: their R+jitter is already 85 and 80 against the cap of 104, so they resample directly and
+ * pay nothing."  R+jitter against the cap is the HARD bound, and it still fits -- but
+ * ASRC_FILL_SLACK_REQUIRED (2026-08-24) added a SOFT bound the direct path fails: at step 4.3537 the
+ * setpoint clamps to R + ASRC_FILL_JITTER, leaving 4 frames of slack where the servo needs 8, so
+ * audio_app_asrc_rate_pair_is_supported() refuses the pair outright.  A composed /4 takes the step
+ * to 1.0884 (R 32, set 64, slack 32) and it is accepted.
+ *
+ * 24 kHz still has no row here.  It escapes the same refusal only because its step is exactly 4 and
+ * floor == ceil earns the exact-step exemption -- so it RUNS, with no band limit but ASRC_POLY_FC of
+ * 96 kHz (44.64 kHz), i.e. 12-44.64 kHz folds into its band.  The pre-stage coefficients above
+ * already cover it; publishing the row is a routing decision, not a filter one.
+ * (Both rates' 48 kHz-input /2 rows are unaffected and still use asrc_decimator_48_to_24_*.)
  */
 #if ASRC_DECIMATOR_HAS_96_TO_48
 bool asrc_decimator_96_to_48_init(asrc_decimator_96_to_48_t* state,
@@ -574,12 +709,38 @@ bool asrc_decimator_selftest(void);
  * chain therefore passes num == 1, and `num` is the only thing that reaches the
  * rational path.
  *
- * The two variant arguments pick the coefficient set where a divider has more
- * than one; they are ignored for the dividers that do not, and for 2/3.
+ * The variant arguments pick the coefficient set where a stage has more than
+ * one; each is ignored by the stages that do not.  `vpre` is the pre-stage's own
+ * set and is read only when `with_prestage` is true.
+ *
+ * `with_prestage` composes the fixed 96 -> 48 kHz /2 stage in FRONT of the chain
+ * `num`/`den` names, which is how a 96 kHz leg is served: the composed ratio is
+ * den*2, and `den == 1` means the pre-stage alone (96 -> 48 kHz, resampler at step
+ * 1.00000).  It is a separate argument rather than a wider `den` on purpose --
+ * everything behind it stays a 48 kHz-input chain selected by the same divider and
+ * the same coefficient variants, so the pre-stage is one more cascade stage rather
+ * than a second set of rows.  A RATIONAL chain IS reachable behind it since
+ * 2026-09-03: 2/3 after a /2 is the 96 -> 32 kHz row (composed num 2 / den 6), host-
+ * and hardware-measured, and it inherits the 2/3 chain's partial specification
+ * unchanged (`0-13 kHz protected / 13-16 kHz relaxed`).  Because a composed chain
+ * then has THREE stages, dispatch is on `num` and never on a stage count.  `true` in
+ * a build with no 96 kHz leg is refused, not silently dropped -- dropping it would run the second stage
+ * at twice its intended input rate, which is a wrong filter and not a wrong rate.
+ *
+ * `vpre` names the pre-stage's coefficient set.  A WIDE set (FOR_44100 / FOR_48000)
+ * is accepted only with `den == 1`, i.e. only when the pre-stage IS the chain: it
+ * is sized to live in the second stage's history arena, so composing one behind
+ * anything is refused rather than overlapped.  SHARED with `den == 1` is refused
+ * too -- 96 -> 48 kHz with a 36 kHz stopband protects nothing above 24 kHz, which
+ * is the whole reason those rows waited for a variant.
  */
 bool asrc_decimator_q31_init(uint32_t num, uint32_t den, uint8_t channels,
                              asrc_decimator_48_to_24_variant_t v24,
-                             asrc_decimator_48_to_12_variant_t v12);
+                             asrc_decimator_48_to_12_variant_t v12,
+#if ASRC_DECIMATOR_HAS_96_TO_48
+                             asrc_decimator_96_to_48_variant_t vpre,
+#endif
+                             bool with_prestage);
 
 /* Frames this front end would emit for `input_frames`, at its current phase. */
 size_t asrc_decimator_q31_output_frames(size_t input_frames);

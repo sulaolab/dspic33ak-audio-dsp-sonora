@@ -226,9 +226,8 @@ demos.
 
 `buildtools/README.md` documents every profile, what it guarantees, its
 per-device availability, and the troubleshooting for when a build or a flash
-does not behave. Classic configurations never compile ASRC application
-sources, and vice versa; a maintainer-side ratchet enforces that in the development
-tree.
+does not behave. Classic configurations never compile ASRC application sources,
+and vice versa.
 
 ## How the code is laid out
 
@@ -275,7 +274,6 @@ That is what makes the HALs reusable, and it is checked rather than trusted.
 - [`docs_public/full_test.md`](docs_public/full_test.md) — the full-test procedure and its
   pass criteria.
 - [`buildtools/README.md`](buildtools/README.md) — the build system in full.
-  English, like `README.md` and `docs_public/` — the directories that are published.
 
 ## Results worth quoting
 
@@ -284,10 +282,7 @@ measurements rather than estimates. The default profile (M30/L128, Kaiser
 β=11, `fc=0.465`) runs 16 independent channel states per direction; a
 20-minute soak of the bidirectional 48 kHz case measured 76.6% TDM-active
 occupancy, with the 8 kHz endpoint's worst window at 90.0%, and no misses or
-saturated windows
-(`[internal] report_asrc_dsp_load_phase2_2026-07-28.md`;
-the earlier six-window run of the same kernel is in
-`[internal] report_asrc_m30_production_2026-07-27.md`).
+saturated windows.
 
 Two things that number does *not* say: the physical codec transport is TDM8,
 so 16 channels is a processing-capacity result, and the absolute peak carries a

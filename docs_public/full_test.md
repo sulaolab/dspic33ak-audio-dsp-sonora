@@ -1,22 +1,15 @@
 # Full Test — definition, procedure and acceptance criteria
 
-What "run the full test" means for this project, stated so that two people
-running it reach the same verdict, and so that a verdict can be re-read later
-from the evidence rather than remembered.
-
-Nothing here is new tooling. Every gate below already exists in the repository;
-what was missing was the *definition*: which gates make up a full run, what each
-one is allowed to conclude, and what has to be written down. Where a step needs
-hardware or lab equipment, the method is described here and the numbers that
-depend on a particular bench are kept out (see `docs_public/README.md`).
+This procedure defines the checks that establish whether a Sonora build works on
+the supported hardware. It separates host checks, builds, board bring-up,
+serial update, application function, measurements, and listening.
 
 ## 1. When a full run is required
 
 | trigger | scope |
 |---|---|
-| Weekly | Full run, T0 – T6. Independent of whether anything changed: it is what keeps the criteria honest, because a gate nobody runs is a gate nobody notices breaking. |
-| Before publishing a public repository, or cutting a release | Full run, T0 – T6, plus the release-scope build matrix (§6, all profile tiers). No exceptions — publication is the point at which a wrong answer leaves the building. |
-| Ordinary change | Subset, by change class (§13). Not a full run. |
+| End-to-end verification of a build or board setup | Full run, T0 – T6. |
+| A focused source or configuration change | Run the applicable tiers in addition to the normal build checks. |
 
 A run that skips a tier is not a full run. Report it as the subset it was.
 
@@ -60,35 +53,24 @@ stops the run.
 | # | gate | command | pass rule | measured |
 |---|---|---|---|---|
 | T0.1 | Configuration integrity | `pwsh ./buildtools/check_configurations.ps1` | prints `Configuration gate: PASS` and lists every configuration with its delivery mode | PASS, 1.7 s |
-| T0.2 | Application separation ratchet — **development tree only** | `pwsh ./buildtools/check_separation.ps1` | `current` count must not exceed the recorded baseline; prints `PASS (no new violations)` | PASS, 11.2 s (0/0) |
-| T0.3 | Serial-boot package model | `python tools/test_serial_boot_package.py` | exit 0; ends `ALL PASS: resident serial-boot package/factory/fault tests` | PASS, 0.7 s |
-| T0.4 | Fixed 48→8 kHz decimator model | `python tools/asrc/test_asrc_decimator_48_to_8.py` | exit 0; ends `PASS: fixed-decimator host acceptance` | PASS, 1.7 s |
-| T0.5 | ASRC rate-plan equation | `python tools/asrc/test_asrc_rate_plan.py` | exit 0; ends `PASS: general ASRC rate-plan equation` | PASS, 0.7 s |
-| T0.6 | Hot-path invariance | `python tools/asrc/hotpath_invariance.py --elf <elf> --map <map> --compare tools/asrc/hotpath_baseline_<...>.json` | every watched function's instruction sequence, and program and data size, unchanged against the chosen baseline | runs after T1 (needs an ELF); **not exercised in the reference run** — the committed baselines predate current `main`, so a difference would not distinguish drift from regression until they are re-taken (§14.4) |
-| T0.7 | Naming / terminology gate | maintainer-side tool, outside this repository | zero findings; its exclusion list is maintainer-side too and does not ship | maintainer step |
+| T0.2 | Serial-boot package model | `python tools/test_serial_boot_package.py` | exit 0; ends `ALL PASS: resident serial-boot package/factory/fault tests` | PASS, 0.7 s |
+| T0.3 | Fixed 48→8 kHz decimator model | `python tools/asrc/test_asrc_decimator_48_to_8.py` | exit 0; ends `PASS: fixed-decimator host acceptance` | PASS, 1.7 s |
+| T0.4 | ASRC rate-plan equation | `python tools/asrc/test_asrc_rate_plan.py` | exit 0; ends `PASS: general ASRC rate-plan equation` | PASS, 0.7 s |
+| T0.5 | Hot-path invariance | `python tools/asrc/hotpath_invariance.py --elf <elf> --map <map> --compare tools/asrc/hotpath_baseline_<...>.json` | every watched function's instruction sequence, and program and data size, unchanged against the selected baseline | runs after T1 (needs an ELF) when the selected profile has a baseline |
 
-Two of these are maintainer-side. `check_separation.ps1` is itself
-`export-ignore`d (`.gitattributes`), same as the development-only documentation
-tree its baseline lives under, so it does not ship to a public checkout; the naming gate
-never shipped in this repository at all either. A public consumer's T0 is
-therefore T0.1 and T0.3 – T0.6. State which variant a run was.
-
-**T0.3 – T0.5 are `__main__` scripts, not pytest tests.** They define no `test_`
+**T0.2 – T0.4 are `__main__` scripts, not pytest tests.** They define no `test_`
 functions, so `python -m pytest tools/...` collects nothing and reports
 `no tests ran` (exit code 5, measured). Nothing was executed, and a runner that
 treats "not 1" as success, or a human reading a quiet `-q` line, records a pass
 for a suite that never ran. Invoke each file with `python` and read *its* exit
 code.
 
-Two files under `tools/` look like T0 members and are not:
+Two scripts under `tools/` are not T0 host gates:
 
-- `tools/test_dual_partition_hex.py` — **not a verifier.** Its own docstring says
-  it is kept for its invariant list; the A/B implementation it tested lives on a
-  separate branch. It fails when run. Excluded from T0 by definition, not by
-  accident, and it must not be "fixed" into a green by weakening it.
-- `tools/classic/test_csv_biquad_smoke.py` — opens the **UART1 "USB Serial Port"**
-  and needs a running board with a Classic image. It is a T4 item (§9), and on a
-  bench with no board it fails with `SMOKE FAIL: zero successes out of 5 tries`.
+- `tools/test_dual_partition_hex.py` is not a verifier and is expected to fail
+  when run. Do not include it in a host-gate result.
+- `tools/classic/test_csv_biquad_smoke.py` needs a running Classic image and
+  hardware; treat it as a T4 check rather than a host test.
 
 ## 5. T0 evidence
 
@@ -150,9 +132,9 @@ change that adds a buffer or a table can turn a tight row into a link failure
 with no other warning.
 
 Each AK512 row's resident bootloader built to `0x62E0 / 0x8000` (25,312 B,
-77.2 %); the AK128 row's resident predates that part's 16 KiB migration and is
-superseded by the image described in `src/shared/resident_de_manifest.h`.
-Every row produced a verified factory image plus one `.sfb` package.
+77.2 %). Verify the AK128 resident size against its 16 KiB region for the
+selected build. Every row produced a verified factory image plus one `.sfb`
+package.
 
 **Reading a build's log:** it contains **two** size blocks, and the *last* one
 is the resident bootloader (25,312 bytes at 77 % of its own 0x8000 region on
@@ -164,8 +146,9 @@ size improvement.
 **Release scope** additionally covers the advanced and internal profiles — 21
 application profiles exist for dsPIC33AK512MPS512 alone (USB variants,
 per-direction ASRC legs, measurement and headroom profiles), plus AK128's own
-smaller set. A weekly run that covers 6 of the AK512's 21 (plus one AK128
-profile as a device sanity check) must say so; silence reads as "all of them".
+smaller set. A representative run that covers 6 of the AK512's 21 (plus one
+AK128 profile as a device sanity check) must say so; silence reads as "all of
+them".
 
 Pass rules, per selection:
 
@@ -175,8 +158,8 @@ Pass rules, per selection:
    the MC106), and program and data memory fit the device.
 3. A `FACTORY_IMAGE` is produced and verified (`Verify FACTORY_IMAGE` in the
    log), plus a `.sfb` under `artifacts/serial_update_packages/`.
-4. T0.6 (hot-path invariance) is then run against the ELF of the profile whose
-   baseline JSON exists, and must report no change.
+4. When a baseline JSON exists for the selected profile, run T0.5 against that
+   profile's ELF and require no change.
 
 Record per selection: status, elapsed seconds, resolved configuration, program
 and data bytes, and the `.sfb` name. Build products are timestamped and kept;
@@ -402,10 +385,8 @@ silently:
   the firmware, can dominate the result. Compare like with like, and prefer the
   procedure the baseline was taken with.
 
-Lab baselines and raw captures are development records: they live in the
-development tree's private documentation and notes directories, never in
-`docs_public/`. A public consumer running T5 supplies their own baseline and
-states it.
+Keep lab baselines and raw captures with the test record. A consumer running T5
+supplies and states their own baseline.
 
 ## 11. T6 — listening test
 
@@ -419,35 +400,17 @@ coexisted with audible defects, so T5 passing does not stand in for T6.
 - A named human signs off. This tier cannot be automated and must not be
   reported as passed by anyone who did not listen.
 
-## 12. Evidence and record-keeping
+## 12. Recording a run
 
-One directory per run, in the development tree's private documentation
-directory — which is `export-ignore`d, so a public consumer keeps the
-equivalent outside the published tree:
-
-```
-<private-docs>/shared/fulltest_runs/<YYYY-MM-DD>_<short-sha>/
-  summary.md          one page: fixtures (§3) + one row per tier with PASS/FAIL
-  t0.log              command, exit code, summary line, seconds
-  t1/summary.tsv      one row per selection (§6)
-  t1/<selection>.log  full build logs
-  t2..t6/             console captures, measurement CSVs, listening notes
-```
-
-Rules that keep the record trustworthy:
-
-- **A tier not run is written as "not run", never left blank.** A blank cell is
-  read as a pass by the next person.
-- Raw serial captures and transient logs are development records: keep them in
-  `notes_private/` or the run directory, and do not add them to `docs_public/`.
-- Record the *tool's own* verdict line, not a paraphrase of it.
-- If a gate was made to pass by changing the gate, that change is part of the
-  run's record.
+Record the selected configuration, toolchain versions, board topology, commands,
+and each tier's PASS, FAIL, or not-run result. Keep full logs and raw captures
+with the test record rather than in the source tree. Preserve each tool's own
+verdict line so the result can be checked later.
 
 ## 13. Subsets by change class
 
-Not every change needs a full run. These are the minimum subsets; they are
-subsets, and must be reported as such.
+Not every change needs a full run. These are practical minimum subsets; report a
+subset as such rather than calling it a full run.
 
 | change | minimum |
 |---|---|
@@ -457,47 +420,12 @@ subsets, and must be reported as such.
 | DSP algorithm, gain or filter | the above plus T5.1/T5.4/T5.6 and T6 |
 | HAL, clock, or transport | T0, full T1, T2, T3, T4 both applications, T5.3–T5.5. Wide blast radius: this is the class that most often looks local and is not |
 | Bootloader, serial update, memory layout | T0, full T1 (every row is a delivery-mode image now), T2, full T3 |
-| Anything, before publication or release | Full run, release-scope matrix |
 
-## 14. Known gaps
+## 14. Known limitations
 
-Stated so that the absence is a task and not a surprise. None of these is a
-reason to weaken a criterion.
-
-1. T3 – T6 have no runner: they are checklists executed by hand. T0 and T1 are
-   scriptable today and should be a single entry point; `buildtools/run_t2.ps1`
-   covers T2 except T2.1 (a power cycle is a human's hand on the board).
-2. `tools/test_dual_partition_hex.py` is a non-verifier sitting among the tests
-   (§4). Either restore it against the branch that owns the feature, or rename
-   it so it stops looking like a gate.
-3. `tools/classic/test_csv_biquad_smoke.py` lives under a name that implies a
-   host test but needs hardware (§4).
-4. Hot-path invariance baselines exist for some profiles only; a selection with
-   no baseline is unmeasured, not clean.
-5. T5 acceptance tolerances are stated per baseline rather than centrally, so
-   "no worse than baseline" depends on reading the right baseline.
-6. A public consumer's T0 is two gates short of the maintainer's: the naming gate
-   (T0.7) never shipped here, and the separation ratchet (T0.2) is
-   `export-ignore`d along with the development-only tree its baseline lives in.
-   Run it from a development clone instead.
-7. **No verb enumerates individual console commands.** A bare `?` now prints a
-   console-grammar/module-letter legend (2026-08-16), so a tester gets some
-   self-description from the running image without reading source — but it is
-   a legend, not a walk of every verb (there is no dispatch-table registry to
-   enumerate those from). T4's per-verb checklist is still derived from source,
-   not captured live.
-8. T2.3 and T2.7 have no direct readout: both are inferred from telemetry
-   counters and cadence (§7). A verb reporting the tick count and the resolved
-   clock tree would measure the thing itself rather than a consequence of it.
-9. T2.1 (power-cycle boot) is not reachable from the host: the PKOB4 tooling can
-   assert `MCLR`, which is a warm reset, not a power cycle. Any run whose result
-   depends on a cold start needs a human, and the record must say which one it
-   got — `?sr` reports the latched reset cause, so this is checkable rather than
-   a matter of trust.
-10. The cold-start banner is only catchable through the boot-button hold (§7), and
-    the 5 s hold window has a thin margin against USB re-enumeration: in the
-    measured run the bridge caught only repeats **4/5 and 5/5** — it missed the
-    first ~3 s — so a re-enumeration two seconds slower would have caught nothing.
-    The margin is a host-timing property, not a designed one. If a machine ever
-    needs to witness a cold banner unattended, the window is the number to raise,
-    or the banner should be replayable on request from the console.
+- T3 – T6 require hardware and are performed by hand.
+- T2.1 requires a real power cycle; a host reset is not equivalent.
+- The console `?` command prints a module and grammar legend, not an exhaustive
+  list of individual commands.
+- T2.3 and T2.7 are inferred from telemetry counters and cadence rather than a
+  dedicated readout.

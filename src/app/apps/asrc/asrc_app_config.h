@@ -339,6 +339,51 @@
 // Override-friendly (like the FIR geometry below) so a named build preset can select a
 // narrower width without source editing. The 96 kHz preset uses 8: its block window is
 // half the 48 kHz one, so the shipping 16-channel width does not fit.
+/* THE CHANNEL-WIDTH AUTHORITY.  ASRC_CH is the ASRC LOGICAL width, and it is the only symbol in
+ * the tree allowed to decide how many channels the front end, the history and the resampler
+ * process.  This holds at every sample rate and on every target -- it is a design rule, not a
+ * property of one preset.
+ *
+ * Two other quantities are also counted in channels and must never be confused with it:
+ *
+ *   APP_SLOTS_PER_FS                    the PHYSICAL I/O width (WM8904 = 2 ch, I2S = 2 slots,
+ *                                       TDM8 = 8).  Confined to the two mapping ends: the L/R pair
+ *                                       is replicated into ASRC_CH on the way in, and ASRC_CH is
+ *                                       narrowed to the slots on the way out.  It may not reach
+ *                                       anything between those two ends.
+ *   an implementation's own capability   e.g. ASRC_DECIMATOR_FLOAT_MAX_CHANNELS.  May only SELECT
+ *                                       or VALIDATE an implementation.  An implementation that
+ *                                       cannot carry ASRC_CH is DISQUALIFIED: the rate pairs that
+ *                                       need it are refused with a reason, and it is never used at
+ *                                       a reduced width.  No acknowledgement, no override -- every
+ *                                       escape is "reduce the width until it fits" in disguise.
+ *
+ * Forbidden, each one a bug that has actually happened here:
+ *   APP_SLOTS_PER_FS --X--> processing width   (a 2-slot bus is not a 2-channel filter)
+ *   implementation capacity --X--> ASRC_CH     (a legacy limit is not a product specification)
+ *   sample rate --X--> processing width        (a rate may set workload, never channel count)
+ *   test width --X--> shipping width           (and not the reverse either)
+ *
+ * A TRANSPORT LIMIT HAS A SHELF LIFE; THE ASRC DOES NOT.  Every narrow number the transport
+ * currently forces is an OPERATIONAL ESCAPE from the WM8904 on this evaluation board, and each one
+ * disappears the day a different codec is adopted -- not relaxed, REMOVED:
+ *
+ *   2 slots at 96 kHz   because THIS codec's SYSCLK is a 12.288 MHz crystal and cannot clock the
+ *                       24.576 MHz BCLK a TDM8 96 kHz frame needs.
+ *   one-way A->B        because THIS codec cannot run ADC and DAC together at or above 88.2 kHz.
+ *
+ * A codec with a bidirectional TDM8 96 kHz mode removes both with NO ASRC change, which is only
+ * true while the rule above is obeyed.  So an ASRC stage designed, sized, measured or specified
+ * against "2 channels" or "one direction" is not merely inelegant -- it is already wrong, and it
+ * fails silently, because it keeps building and keeps passing after the codec changes.  When
+ * recording any measured number, say which constraint family produced it: codec/HW, ASRC
+ * algorithm, or CPU budget.  See the 96 kHz preset block in asrc_app_build_config.h.
+ *
+ * The reason the rule is absolute: the codec on the evaluation board is one possible endpoint, not
+ * the specification.  Reducing a width so a stage fits produces a number that measures nothing --
+ * and for an anti-alias stage it is worse than nothing, because filtering fewer channels than the
+ * resampler converts is a MISSING anti-alias stage, and down-conversion without one is not a
+ * working conversion at any channel count. */
 #ifndef ASRC_CH
 #define ASRC_CH             (16u)
 #endif
