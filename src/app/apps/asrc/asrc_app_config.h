@@ -222,6 +222,216 @@
 #ifndef APP_ASRC_HEADROOM_DBG_PERIOD_MS
 #define APP_ASRC_HEADROOM_DBG_PERIOD_MS (APP_DBG_PERIOD_MS)
 #endif
+
+/*
+ * 96 kHz CPU LOAD STUDY switch.  Bench-only.  Default 0, and it must stay 0 in every
+ * shipping preset.
+ *
+ * WHAT IT DOES: it lifts exactly two of the ENA_96K_RATE guards in asrc_app_validate.h,
+ * and nothing else.  It does not change a filter, a rate, a block length, an interrupt
+ * priority or a channel mapping.
+ *
+ * WHY TWO GUARDS AND NOT ONE SWITCH PER GUARD: the two belong to different constraint
+ * families (see the three families named in asrc_app_build_config.h's 96 kHz comment),
+ * and the reason each is liftable FOR A MEASUREMENT is different:
+ *
+ *   1. ASRC_CH <= 8 is a CPU-BUDGET guard.  It encodes an answer -- "8 is what the
+ *      166.7 us window was measured to carry" -- to the very question a load study asks.
+ *      Refusing to compile the measurement that would update it makes the number
+ *      unfalsifiable.  So this switch does not weaken an ASRC limit; it re-opens the
+ *      measurement the limit came from.  The guard stays in force for every build that
+ *      does not set this switch, which is every real build.
+ *
+ *   2. APP_ENA_ASRC_BIDIR is a CODEC/HW guard, and it is NOT lifted as an audio claim.
+ *      The WM8904 still cannot run ADC and DAC together at or above 88.2 kHz, and this
+ *      switch does not pretend otherwise: leg A stays ADC-only and leg B stays DAC-only,
+ *      because audio_transport.c derives both roles from the nominal RATE and never from
+ *      this flag.  What BIDIR=1 changes is only how many ASRC ENGINES run -- two instead
+ *      of one -- which is a DSP workload question, not a codec question.  Leg B's RX
+ *      therefore carries no captured audio, so the B->A engine resamples whatever the
+ *      idle ADCDAT line clocks in.  That is deliberate and it is the point: the study
+ *      measures the compute cost of the bidirectional engine pair, and every channel is
+ *      processed in full regardless of what its samples contain.
+ *
+ * WHAT IT DOES NOT LICENSE: do not read a pass from a build with this switch set as
+ * "96 kHz bidirectional audio works", and do not cite its numbers without saying which
+ * constraint family they answer.  A 96 kHz codec that is bidirectional at TDM8 removes
+ * guard 2 outright; this switch never does.
+ */
+#ifndef APP_ASRC_96K_LOAD_STUDY
+#define APP_ASRC_96K_LOAD_STUDY      (0)
+#endif
+#if (APP_ASRC_96K_LOAD_STUDY != 0) && (APP_ASRC_96K_LOAD_STUDY != 1)
+#error "APP_ASRC_96K_LOAD_STUDY must be 0 or 1"
+#endif
+
+/*
+ * Per-STAGE tick accumulators inside asrc_pull (Q31 arm only).  Bench-only, default 0.
+ *
+ * APP_ASRC_HEADROOM_INSTRUMENT already reports the per-block PEAK of each whole stage
+ * (cbA/cbB/pushAB/pushBA/pull).  This splits `pull` into the parts a load study
+ * has to separate before it can propose an optimisation -- phase/weight bookkeeping,
+ * coefficient-row blend, FIR MAC, Q31->slot conversion and the TDM slot scatter -- by
+ * SUMMING each part over the block instead of peaking it, so one block's total is
+ * directly comparable with that block's `pull`.
+ *
+ * It is not free: SEVEN timer reads per OUTPUT FRAME (four before the F1 sub-split),
+ * so the instrumented `pull` is larger than the real one.  Quantify it, do not assume
+ * it -- run the same image once with this at 0 and once at 1 and difference the `pull`
+ * peaks.  Take every absolute
+ * deadline figure from the 0 build; take only the RATIOS from the 1 build.
+ */
+#ifndef APP_ASRC_STAGE_PROFILE
+#define APP_ASRC_STAGE_PROFILE       (0)
+#endif
+#if APP_ASRC_STAGE_PROFILE && !APP_ASRC_HEADROOM_INSTRUMENT
+#error "APP_ASRC_STAGE_PROFILE requires APP_ASRC_HEADROOM_INSTRUMENT (it reports on the same telemetry line)."
+#endif
+
+/*
+ * Leg-A STAGE PARTITION (block level).  Bench-only, default 0.  It exists because the
+ * per-stage figures above split `pull` only, and `pull` is the CONSUMER half: at a mixed
+ * rate pair the producer half -- the fixed front end -- runs in the OTHER leg's ISR.  For
+ * the 96 -> 32 kHz pair that means leg A carries the 96->48 pre-stage, the 48->32 rational
+ * rows, the AB push, AND the whole BA pull, while leg B carries only the AB pull.  So a
+ * breakdown of leg A cannot be assembled from `[stg]` alone, and a leg-A residual computed
+ * against the A->B filter chain misattributes the B->A direction's MACs to "fixed cost".
+ *
+ * This switch adds SIX timer reads per leg-A block (about 0.55 us at 89 ns a read) and one
+ * `[legA]` line whose rows sum to the SAME image's `cbA` by construction:
+ *
+ *     cbA = fe(pre + r23 + chk) + pushAB + pullBA + ledA + rest
+ *
+ * `rest` is a residual, not a measurement: it is what the ISR costs on top of the five
+ * measured stages, including this instrumentation itself.  Quantify the instrument by
+ * building the same image at 0 and differencing `cbA`; take absolute deadline figures from
+ * the 0 build, as with APP_ASRC_STAGE_PROFILE.
+ *
+ * Independent of APP_ASRC_STAGE_PROFILE on purpose: the block-level partition is cheap
+ * enough to run at an operating point that is already at 99 % demand, and the per-frame
+ * one is not.
+ */
+#ifndef APP_ASRC_LEG_PROFILE
+#define APP_ASRC_LEG_PROFILE         (0)
+#endif
+#if APP_ASRC_LEG_PROFILE && !APP_ASRC_HEADROOM_INSTRUMENT
+#error "APP_ASRC_LEG_PROFILE requires APP_ASRC_HEADROOM_INSTRUMENT (it reports on the same telemetry line, and reuses its cbA/pushAB/ledA probes)."
+#endif
+
+/*
+ * HALF-BAND 96 -> 48 kHz PRE-STAGE (Q31 front end).  Default 0; the production ban was
+ * LIFTED by the owner on 2026-09-07 (see "WHAT THE OWNER DECIDED" below).
+ *
+ * It swaps the shared 41-tap pre-stage for a 35-tap HALF-BAND set and runs it through a
+ * kernel that steps the history by two samples, because a half-band's odd-index taps are
+ * zero BY CONSTRUCTION -- 19 real MACs instead of 41.  A microbench measured the kernel at
+ * -10.05 us/block at 12 channels; this gate is what puts the same arithmetic on the REAL
+ * leg-A path, which is the only place that can say whether the saving survives.
+ *
+ * WHAT IS AND IS NOT BEING SKIPPED.  Every channel and every slot is still processed --
+ * this drops arithmetic whose OPERAND is structurally zero, which is a filter-structure
+ * optimisation, not a reduction of the channel count.
+ *
+ * THE STOPBAND COST, WHICH HAS NOT CHANGED.  A half-band is symmetric about fs/4, so its
+ * attenuation at the 32000 Hz fold edge EQUALS its passband ripple at 16000 Hz: -56.6 dB,
+ * against the shipping set's -108.38 dB.  In the PROTECTED band (0..13 kHz, reached only
+ * from 35000 Hz up) it reads -108.78 dB against the shipping -110.23 dB, so the audible
+ * damage is confined to 15..16 kHz -- but "confined" is not "measured by ear".
+ *
+ * WHAT THE OWNER DECIDED (2026-09-07).  The "measurement only / keep it off the shipping
+ * path" restriction is LIFTED: this may be built into a production candidate for the
+ * 96 -> 32 kHz 12x12 ch work.  The numbers above are unchanged by that decision -- what
+ * changed is who carries the risk.  Still owed before anything ships: a LISTENING test of
+ * the 15..16 kHz region, which is the one claim above that no measurement supports.  Do not
+ * read the lifted ban as "the stopband question was answered".
+ *
+ * BOTH SIDES OF THE BUILD MUST AGREE.  The kernel lives in a .s file, so this has to be
+ * passed to the assembler as well (-AsDefine APP_ASRC_Q31_PRE_HALFBAND=1) or the link fails
+ * on an undefined _fir_ring_q31_hb_ymod_yonly_block.  That is the intended failure mode: a
+ * half-configured build must not quietly fall back to the dense kernel, because the whole
+ * point of the measurement is which kernel ran.
+ */
+#ifndef APP_ASRC_Q31_PRE_HALFBAND
+#define APP_ASRC_Q31_PRE_HALFBAND    (0)
+#endif
+#if (APP_ASRC_Q31_PRE_HALFBAND != 0) && (APP_ASRC_Q31_PRE_HALFBAND != 1)
+#error "APP_ASRC_Q31_PRE_HALFBAND must be 0 or 1"
+#endif
+/* The ASRC_SAMPLE_Q31 pairing is checked further down, where that macro has its
+ * default -- checking it here would read an undefined macro as 0. */
+
+/*
+ * BIT-EXACT Q31 PULL KERNELS, SELECTABLE AT RUNTIME.  MEASUREMENT ONLY, default 0.
+ *
+ * At 1 the image carries BOTH the baseline generic-pull kernels and optimised variants of
+ * them, and audio_app_asrc_q31_opt_set() -- console "*au SS" -- picks which one the pull
+ * calls.  Nothing about the arithmetic changes: same coefficients, same operand order, same
+ * accumulator model, same s24-left mask, so the emitted samples are identical bit for bit.
+ * What changes is the instruction count around them (see mchp_asrc_q31_row16.s):
+ *
+ *   1  the coefficient-row blend is unrolled, dropping its dtb        7 -> 6 instr/tap
+ *   2  the s24-left mask folds into the dot product's store, which    3.5 -> 1 instr/ch
+ *      removes the C loop that used to apply it
+ *   3  the dot product's per-channel fixed cost drops                 6 -> 4 instr/ch
+ *
+ * WHY A RUNTIME SWITCH AND NOT TWO IMAGES.  A few us cannot be measured across images.
+ * Measured in this tree on 2026-09-06: a stage that was not touched at all moved several us
+ * because the change shifted Y-space placement.  The decision bands for this work are
+ * 21.0 us (does it fit) and 22.8 us (does it fit with 5 % reserve), so cross-image noise of
+ * that size would decide the answer.  One image, two paths, differenced.
+ *
+ * WHAT THE SWITCH COSTS BOTH PATHS EQUALLY.  One test-and-branch per output frame, in both
+ * arms.  It does not cancel exactly -- a taken and a not-taken branch are not the same
+ * cycle count -- so treat about 0.2 us of the delta as belonging to the harness, not the
+ * kernels.  It is far below the bands above.
+ *
+ * NOT COMPATIBLE WITH APP_ASRC_STAGE_PROFILE, and that is enforced below rather than
+ * merged: the per-frame probes cost +11.5 us on the pull and land inside the very buckets
+ * the switch changes, so a delta taken from a profiled image would be measuring the
+ * instrument.  The block-level figures come from a probe-free image; run the profiled image
+ * separately when the question is where the remaining time went.
+ */
+#ifndef APP_ASRC_Q31_OPT_KERNELS
+#define APP_ASRC_Q31_OPT_KERNELS     (0)
+#endif
+#if (APP_ASRC_Q31_OPT_KERNELS != 0) && (APP_ASRC_Q31_OPT_KERNELS != 1)
+#error "APP_ASRC_Q31_OPT_KERNELS must be 0 or 1"
+#endif
+#if APP_ASRC_Q31_OPT_KERNELS && APP_ASRC_STAGE_PROFILE
+#error "APP_ASRC_Q31_OPT_KERNELS and APP_ASRC_STAGE_PROFILE cannot both be 1: the per-frame probes cost +11.5 us inside the buckets the kernel switch changes, so the A/B delta would measure the instrument. Take the delta from a probe-free image and profile in a separate one."
+#endif
+
+/*
+ * CANDIDATE 4 -- hold the consumer read cursor (rd) and read phase (frac) in LOCALS for the
+ * whole block instead of in the engine struct.
+ *
+ * The arithmetic is bit-identical by construction: the same float32 additions and the same
+ * repeated `- 1.0f` in the same order, on the same values.  Only WHERE the two state words
+ * live between output frames changes.  From the compiler output of the measured image the
+ * advance costs 28 instructions per output frame, 8 of which are these loads and stores
+ * (a->frac is reloaded and stored once per frame, a->rd once per wrap -- and at 96->32 the
+ * step is ~3.0, so the wrap loop runs exactly three times per frame).
+ *
+ * WHY THIS IS NOT A `*au` BIT.  The other three candidates are single call sites, so one
+ * image can hold both arms and switch per frame.  This one cannot: the hoist is a property
+ * of the LOOP, and any faithful in-image emulation of the un-hoisted arm would have to add
+ * work to the baseline side, which biases the delta in the flattering direction -- the one
+ * mistake that cannot be spotted afterwards in the numbers.  So this is a build switch and
+ * its delta is a two-image delta.  Take it at 8 channels, where the run is fully non-starve
+ * and leg B `cpu` MIN reproduced to 0.1 us across two windows of the same run.
+ *
+ * Semantic difference worth writing down: a->rd / a->frac are now written once per BLOCK
+ * rather than once per frame.  Nothing reads them mid-block -- the servo, the telemetry and
+ * the restart path all run at block boundaries -- but a future mid-block reader would see
+ * the state of the previous block, not of the previous frame.
+ */
+#ifndef APP_ASRC_Q31_HOIST_RDFRAC
+#define APP_ASRC_Q31_HOIST_RDFRAC    (0)
+#endif
+#if (APP_ASRC_Q31_HOIST_RDFRAC != 0) && (APP_ASRC_Q31_HOIST_RDFRAC != 1)
+#error "APP_ASRC_Q31_HOIST_RDFRAC must be 0 or 1"
+#endif
+
 /*
  * Rate-monotonic RX-ISR leg priorities: 1 = the shorter-deadline (higher-rate) leg preempts
  * the other, 0 = both legs stay on the base priority (the pre-2026-08-25 symmetric behaviour).
@@ -451,12 +661,46 @@
 #ifndef ASRC_SAMPLE_Q31
 #define ASRC_SAMPLE_Q31     (0)
 #endif
+#if APP_ASRC_Q31_PRE_HALFBAND && !ASRC_SAMPLE_Q31
+#error "APP_ASRC_Q31_PRE_HALFBAND only exists in the Q31 front end (ASRC_SAMPLE_Q31=1); the float pre-stage has no half-band kernel."
+#endif
 
 #if ASRC_SAMPLE_Q31
   #undef  ASRC_POLY_METHOD
   #define ASRC_POLY_METHOD  (ASRC_POLY_Q31)
 #elif (ASRC_POLY_METHOD == ASRC_POLY_Q31)
   #error "ASRC_POLY_METHOD == ASRC_POLY_Q31 requires ASRC_SAMPLE_Q31 == 1"
+#endif
+
+/*
+ * Deferred to here on purpose: ASRC_POLY_METHOD and ASRC_POLY_Q31 are only defined further
+ * down this header, and #if treats an unknown identifier as 0, so this same test placed next
+ * to the switch declaration would read 0 != 0 and never fire.  A guard with a silent false
+ * negative is worse than no guard.
+ */
+#if APP_ASRC_Q31_HOIST_RDFRAC && (ASRC_POLY_METHOD != ASRC_POLY_Q31)
+#error "APP_ASRC_Q31_HOIST_RDFRAC requires ASRC_POLY_METHOD == ASRC_POLY_Q31: the STREAM8_PAIR fast path writes a->rd/a->frac and continues out of the frame body, which would strand the hoisted locals."
+#endif
+#if APP_ASRC_Q31_HOIST_RDFRAC && (APP_ASRC_INTERP != ASRC_INTERP_POLY)
+#error "APP_ASRC_Q31_HOIST_RDFRAC requires APP_ASRC_INTERP == ASRC_INTERP_POLY: the LINEAR frame body advances a->rd/a->frac in the struct, and the block-end write-back would then clobber it with the stale hoisted copy."
+#endif
+
+/*
+ * TRIAL Full-IIR 48 -> 32 kHz anti-alias stage (six-SOS elliptic LPF at 48 kHz, with
+ * the generic ASRC then converting at step 1.5).  0 in EVERY preset: it is an
+ * experiment, opted into with -Define APP_ASRC_FULL_IIR_48_TO_32=1, and left at 0 the
+ * image is byte-identical to one built without it.
+ *
+ * Compiling it in does NOT select it: the image still boots on the N97 front end and
+ * `*aj 1` switches, so one image measures both candidates under identical DSP, TDM,
+ * console and instrument conditions -- the only way the two CPU figures compare.
+ *
+ * It needs the float32 sample path and the CH_MAJOR ring; asrc_full_iir_48_to_32.c
+ * refuses to build otherwise rather than pushing float values into an integer ring.
+ * See src/app/apps/asrc/asrc_full_iir_48_to_32.h.
+ */
+#ifndef APP_ASRC_FULL_IIR_48_TO_32
+#define APP_ASRC_FULL_IIR_48_TO_32 (0)
 #endif
 
 /* The Q31 correctness proof (coefficient digest, the 110 generated vectors, the

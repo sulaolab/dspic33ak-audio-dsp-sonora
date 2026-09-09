@@ -16,6 +16,10 @@
 # case-insensitive, so *.s also matches *.S.
 !src/app/dspic33-cmsis-dsp/Source/**/*.s
 !src/boot/resident_de_boot_precrt.S
+# Same exception for hand-written assembly that belongs to an application rather
+# than to the vendored (published) CMSIS-DSP tree.  -save-temps writes its dumps
+# under build/ and into *.X/, never into src/, so this cannot pick one up.
+!src/app/apps/**/*.s
 
 # MPLAB X output directories
 build/

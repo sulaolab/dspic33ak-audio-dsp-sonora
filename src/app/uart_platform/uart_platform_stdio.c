@@ -35,6 +35,24 @@
  */
 static volatile bool s_tx_muted = false;
 
+/*
+ * Blocking-write yield hook (see header for why it exists and the contract). `volatile`
+ * because an ISR-context printf may read it while the mainline is registering it.
+ *
+ * The chunk size is what bounds the stall. 128 bytes is longer than every telemetry line in
+ * this firmware, so for the report that motivated the hook the wire behaviour is unchanged --
+ * one yield, then the same single write per line. It only splits a genuinely long single
+ * write (a capture dump), and there it caps the stall at one chunk regardless of length.
+ */
+#define UART_PLATFORM_STDIO_YIELD_CHUNK  (128u)
+
+static volatile uart_platform_stdio_yield_fn s_yield_hook = 0;
+
+void uart_platform_stdio_set_yield_hook(uart_platform_stdio_yield_fn fn)
+{
+    s_yield_hook = fn;
+}
+
 void uart_platform_stdio_set_tx_mute(bool mute)
 {
     s_tx_muted = mute;
@@ -56,7 +74,9 @@ bool uart_platform_stdio_tx_muted(void)
  */
 int write(int handle, void *buffer, unsigned int len)
 {
-    size_t written;
+    const uint8_t *src = (const uint8_t *)buffer;
+    size_t written = 0u;
+    unsigned int offset = 0u;
 
     (void)handle;
 
@@ -75,13 +95,29 @@ int write(int handle, void *buffer, unsigned int len)
         return (int)len;
     }
 
-    written = nora_uart_write(UART_PLATFORM_STDIO_INST, buffer, (size_t)len);
+    /* Chunked so a registered yield hook runs while this blocks, not only before it. */
+    while (offset < len) {
+        unsigned int chunk = len - offset;
+        const uart_platform_stdio_yield_fn yield = s_yield_hook;
+
+        if (chunk > UART_PLATFORM_STDIO_YIELD_CHUNK) {
+            chunk = UART_PLATFORM_STDIO_YIELD_CHUNK;
+        }
+
+        if (yield != 0) {
+            yield();
+        }
+
+        written += nora_uart_write(UART_PLATFORM_STDIO_INST, src + offset,
+                                   (size_t)chunk);
 #if !APP_ASRC_MEAS_UART2_STREAM
-    /* Normal build: mirror console text to the PKOB4 "USB Serial Device" (UART2). In the
-     * ASRC long-stream build UART2 is a dedicated binary DATA port, so the mirror is
-     * suppressed -- all console text stays on UART1 (control), UART2 stays binary-only. */
-    (void)UART2_WriteMirror((const uint8_t *)buffer, (size_t)len);
+        /* Normal build: mirror console text to the PKOB4 "USB Serial Device" (UART2). In the
+         * ASRC long-stream build UART2 is a dedicated binary DATA port, so the mirror is
+         * suppressed -- all console text stays on UART1 (control), UART2 stays binary-only. */
+        (void)UART2_WriteMirror(src + offset, (size_t)chunk);
 #endif
+        offset += chunk;
+    }
 
     return (int)written;
 }

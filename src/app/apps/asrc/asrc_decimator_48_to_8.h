@@ -762,6 +762,20 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
                                          size_t output_stride,
                                          size_t *output_frames);
 
+#if APP_ASRC_LEG_PROFILE
+/* Peak-held tick totals of the composed rational chain's two arithmetic halves, and clear.
+ * `pre_ticks` is every cascade stage ahead of the phase rows (the 96 -> 48 kHz /2 pre-stage
+ * for the 96 -> 32 kHz pair); `r23_ticks` is the phase rows (the 97-tap 48 -> 32 kHz
+ * resampler).  Foreground-only reader -- it clears the peaks for the next window.  Both are
+ * 0 in a build whose live chain is not the rational one, which means "this chain did not
+ * run", never "it was free". */
+void asrc_decimator_q31_profile_read( uint32_t* pre_ticks, uint32_t* r23_ticks );
+/* Same two halves, but the LAST call's values rather than the peaks, read-and-clear.  This is
+ * what a caller adds to its own rows so that every row describes one and the same block. */
+void asrc_decimator_q31_profile_take_last( uint32_t* pre_ticks, uint32_t* r23_ticks );
+#endif
+
+
 #if APP_ASRC_FRONTEND_SELFTEST
 /* Where the Q31 boot check stopped, as numbers: the caller already has a printf,
  * and formatting in here would need a second one (see the printf single-caller

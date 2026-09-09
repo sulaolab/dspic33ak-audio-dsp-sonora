@@ -39,6 +39,14 @@
 #  define ASRC_FIR_KERNEL_BENCH_AVAILABLE  0
 #endif
 
+/* Phase 2/3's H2 probe has several 16ch float work buffers.  It normally
+ * follows the parent bench switch, preserving every existing H2 measurement
+ * build.  A short-FIR-only image may override this to 0: the two probes are
+ * foreground-only and never need to coexist in one ROM image. */
+#ifndef ASRC_H2_KERNEL_BENCH_AVAILABLE
+#  define ASRC_H2_KERNEL_BENCH_AVAILABLE ASRC_FIR_KERNEL_BENCH_AVAILABLE
+#endif
+
 #if ASRC_FIR_KERNEL_BENCH_AVAILABLE && !defined(__dsPIC33AK512MPS512__)
 #  error "ASRC_FIR_KERNEL_BENCH_AVAILABLE=1 is AK512-only: the Y scratch arena address and the X-space coefficient budget are both device-specific.  See the comment above."
 #endif
@@ -49,5 +57,46 @@
 // trials == 0 selects the default trial count.  Runs in the caller's context (the console's
 // main-loop foreground), takes a few tens of milliseconds, and touches no streaming state.
 void asrc_fir_kernel_bench_run( uint32_t trials );
+
+/* Phase-2 H2 component timing: float FIR49, five DF2T SOS, and their actual
+ * serial composition over 16 channels x 16 frames.  Like *aq this is an
+ * opt-in foreground probe and never enters the streaming audio path. */
+void asrc_h2_timing_bench_run( uint32_t trials );
+
+/* Phase-3 H2 feasibility probe.  This is distinct from the Phase-2 baseline
+ * above: it compares only already-present DSP kernels and conversion cost in
+ * probe-local buffers.  It never enters the streaming audio path. */
+void asrc_h2_optimized_kernel_bench_run( uint32_t trials );
+
+/* Measurement-only calibration of the existing Q31 /2 batch kernel at
+ * 107/81/65/49/33 taps.  It does not change a live frontend or implement a
+ * Hybrid; its results price how many IIR SOS a shorter FIR could buy. */
+void asrc_fir_tradeoff_bench_run( uint32_t trials );
+
+/* Full-IIR precheck (Phase-4 follow-up): the six-SOS 48 kHz anti-alias LPF timed
+ * with the Phase-3 optimized DF2T kernel, so the 6 x 25.7 us linear estimate is
+ * replaced by a measurement of the sixth section's real marginal cost.  It times
+ * the IIR only; the front-end removal and the generic ASRC's step 1.0 -> 1.5 move
+ * are measured as runtime telemetry across two images instead.  Foreground-only
+ * and never part of the audio path, like the probes above. */
+void asrc_full_iir_precheck_bench_run( uint32_t trials );
+
+/* Candidate E (half-band /2 pre-stage): measures the BLOCK DIFFERENCE between the
+ * shipping dense 41-tap /2 kernel and a 35-tap half-band prototype run by a
+ * kernel that walks only the 19 structurally non-zero taps.  It exists because
+ * the host CPU model's -10.69 us/block assumes the measured 1.012 cycles/MAC
+ * survives a strided inner loop, which only hardware can settle.  It changes no
+ * default, no rate and no live filter, and the coefficients are synthetic: it
+ * times a geometry, it does not qualify a response.
+ *
+ * It needs its own assembler, src/app/apps/asrc/asrc_fir_hb_kernel_dspic33ak.s,
+ * whose body is guarded by .ifdef -- so this probe additionally needs
+ *
+ *     buildtools/build.ps1 -Full -Define ASRC_FIR_KERNEL_BENCH_AVAILABLE=1 \
+ *                                -AsDefine ASRC_FIR_KERNEL_BENCH_AVAILABLE=1
+ *
+ * and without the -AsDefine the link fails on the missing kernel rather than
+ * measuring something else. */
+void asrc_hb_kernel_bench_run( uint32_t trials );
 
 #endif /* ASRC_FIR_KERNEL_BENCH_H */

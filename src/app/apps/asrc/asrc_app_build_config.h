@@ -91,9 +91,70 @@
  * rejected.
  * No PLL/clock-tree change is involved: only the codec's own divisors move.
  */
+/* 96 kHz -> 32 kHz, 12 channels, Q31: the whole recipe of the measured configuration.
+ * Everything the 2026-09-08 dwell was built with is pinned HERE, so the preset is the
+ * only thing anyone has to select.  Before this existed the same image needed ten
+ * -Define values and one -AsDefine, and a forgotten one produced a build that ran but
+ * was not the thing that had been measured.
+ *
+ * This block sits ABOVE the shared 96 kHz block below and every knob is #ifndef, so
+ * these values win and the preset still inherits the rest of the 96 kHz setup
+ * (ENA_96K_RATE, the runtime front end, the headroom instrument) from there.
+ *
+ * Deliberately NOT pinned: APP_ASRC_STAGE_PROFILE / APP_ASRC_LEG_PROFILE.  Both
+ * default to 0 and the measured image had them off; a profiling build passes them on
+ * the command line, which is how a probe build should differ from the shipping one.
+ *
+ * WHY THIS IS NOT A LOAD STUDY.  APP_ASRC_96K_LOAD_STUDY exists to lift the two
+ * 96 kHz guards for a bench measurement, and this preset does NOT set it -- it is a
+ * selectable configuration, not a measurement, so the guards name it directly in
+ * asrc_app_validate.h instead.  The ASRC_CH <= 8 guard states a budget for a 96 kHz
+ * leg B (a 166.7 us block); leg B here boots at 32 kHz, so the block is 500 us and
+ * the guard's premise does not describe this operating point.
+ */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K)
+  /* Twelve channels each way.  Measured, not assumed: Hard RT functional PASS with a
+   * worst leg B response of 494.1 us against the 500 us block.  The 5 % engineering
+   * reserve FAILS at that margin, which is why the tier is internal. */
+  #ifndef ASRC_CH
+    #define ASRC_CH  (12u)
+  #endif
+  /* Leg B boots at 32 kHz.  This is not a preference: the 500 us block it produces is
+   * what makes 12 channels fit, and every number recorded for this preset assumes it.
+   * `*ar` can still move leg B at runtime; above 32 kHz is outside what was measured. */
+  #ifndef APP_TRANSPORT_LEG_B_BOOT_RATE_HZ
+    #define APP_TRANSPORT_LEG_B_BOOT_RATE_HZ  (32000)
+  #endif
+  /* Q31 sample path plus the optimised Q31 row kernels and the HB31 half-band
+   * pre-stage.  These three are what bought the margin, so they are pinned rather
+   * than suggested.  ASRC_SAMPLE_Q31 also forces ASRC_POLY_METHOD to the Q31 kernel,
+   * so no ASRC_POLY_METHOD is set here -- setting one would be dead code. */
+  #ifndef ASRC_SAMPLE_Q31
+    #define ASRC_SAMPLE_Q31  (1)
+  #endif
+  #ifndef APP_ASRC_Q31_OPT_KERNELS
+    #define APP_ASRC_Q31_OPT_KERNELS  (1)
+  #endif
+  #ifndef APP_ASRC_Q31_PRE_HALFBAND
+    #define APP_ASRC_Q31_PRE_HALFBAND  (1)
+  #endif
+  /* Rear polyphase at M=28 (fc 0.4632, Kaiser beta 10.55).  Host gate: M30 is
+   * -0.741 dB at 20 kHz / -108.5 dB worst image, M28 -0.928 dB / -105.3 dB. */
+  #ifndef APP_ASRC_EXPERIMENTAL_M28
+    #define APP_ASRC_EXPERIMENTAL_M28  (1)
+  #endif
+  /* Two engines.  APP_ENA_ASRC_BIDIR defaults to 1 in asrc_app_config.h and this
+   * preset is absent from the lists above that force it to 0, so nothing needs
+   * defining here -- but the reason it is left alone is not obvious: at 96 kHz the
+   * ANALOG path is one-way (the WM8904 has no simultaneous ADC+DAC at or above
+   * 88.2 kHz), and running the B->A engine anyway over an idle capture line is
+   * deliberate, because that engine costs CPU and the CPU cost is the measurement. */
+#endif
+
 #if (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B) || \
     (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_A_TO_B) || \
-    (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_B_TO_A)
+    (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_B_TO_A) || \
+    (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K)
   #ifndef ENA_96K_RATE
     #define ENA_96K_RATE
   #endif
@@ -518,8 +579,12 @@
 
 #if APP_ASRC_EXPERIMENTAL_M28 && \
     (APP_BUILD != APP_BUILD_ASRC_CODEC_BIDIR) && \
-    (APP_BUILD != APP_BUILD_ASRC_CODEC_MEAS)
-  #error "APP_ASRC_EXPERIMENTAL_M28 is supported only with the standard BIDIR or MEAS preset"
+    (APP_BUILD != APP_BUILD_ASRC_CODEC_MEAS) && \
+    (APP_BUILD != APP_BUILD_ASRC_CODEC_96K_A_TO_B) && \
+    (APP_BUILD != APP_BUILD_ASRC_MEAS_96K_A_TO_B) && \
+    (APP_BUILD != APP_BUILD_ASRC_MEAS_96K_B_TO_A) && \
+    (APP_BUILD != APP_BUILD_ASRC_CODEC_96K_12CH_32K)
+  #error "APP_ASRC_EXPERIMENTAL_M28 is supported only with the standard BIDIR/MEAS presets or the 96 kHz leg presets"
 #endif
 
 /* Standard BIDIR and MEAS use production M30.  M28 is deliberately hidden
@@ -532,7 +597,8 @@
     (APP_BUILD == APP_BUILD_ASRC_CODEC_MEAS_HEADROOM_M30) || \
     (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B) || \
     (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_A_TO_B) || \
-    (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_B_TO_A)
+    (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_B_TO_A) || \
+    (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K)
   #if APP_ASRC_EXPERIMENTAL_M28
     #define ASRC_POLY_M                   (28u)
     #define ASRC_POLY_FC                  (0.4632f)

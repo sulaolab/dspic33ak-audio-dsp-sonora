@@ -24,6 +24,8 @@
 #include "audio_app_asrc.h"             // *al: interp load multiplier
 #include "asrc_fir_kernel_bench.h"   // *aq: front-stage FIR kernel cycles/MAC bench
                                        // *ar: audio_app_asrc_rate_pair_is_supported
+#include "asrc_full_iir_48_to_32.h"   // *aj: trial 48->32 anti-alias stage select
+#include "asrc_clock_control.h"       // *aj 02: CCP period-queue observation window reset
 
 //===========================================================
 // asrc_console.c
@@ -156,6 +158,200 @@ static void asrc_console_rate( app_console_msg_t* msg )
            (unsigned long)rates_hz[rate_index] );
     msg->status = APP_CONSOLE_OK;
 }
+
+#if APP_ASRC_Q31_OPT_KERNELS
+/*
+ * "*au SS" / "?au" -- select which Q31 kernels the generic pull runs.
+ *
+ * SS is a BITMASK, so the two candidates can be differenced independently:
+ *
+ *   00  baseline blend      + baseline row16 + the C s24-left mask loop
+ *   01  paired-tap blend    + baseline row16
+ *   02  baseline blend      + unrolled row16 with the mask folded into its store
+ *   03  both
+ *
+ * A bit is only SELECTABLE if that kernel passed the boot bit-exactness selftest;
+ * "?au" reports the selectable mask and the fail count, and a request for a bit
+ * outside it is refused rather than silently ignored.  The two arms are scored
+ * separately at boot because the first blend formulation (the one that moved the
+ * delta into the accumulator via lac/mac/msc) was NOT bit-exact on this silicon,
+ * and while it failed it also masked whether row16 was sound.
+ *
+ * Every selectable kernel is bit-identical to the baseline, so this switch changes
+ * timing only.  It exists because the two arms have to be differenced INSIDE ONE
+ * IMAGE: an untouched stage moved several us on a Y-placement change alone, and the
+ * decision bands are 21.0 / 22.8 us wide, so a two-image comparison cannot answer
+ * the question.
+ */
+static void asrc_console_q31_opt_mode( app_console_msg_t* msg )
+{
+    const uint16_t in_len = msg->data_len;
+    const uint8_t  sub    = ( in_len > 0u ) ? msg->data[0] : 0xFFu;
+
+    msg->data_len = 0u;
+
+    if( msg->kind != '*' )
+    {
+        if( in_len != 0u )
+        {
+            printf(" \"?au\" takes no payload\n");
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            return;
+        }
+        printf(" \"?au\" q31 blend=%s row16=%s  selectable=%u  selftest fails=%lu\n",
+               ( ( audio_app_asrc_q31_opt_get() & 0x1u ) != 0u ) ? "OPT" : "BASELINE",
+               ( ( audio_app_asrc_q31_opt_get() & 0x2u ) != 0u ) ? "OPT" : "BASELINE",
+               (unsigned)audio_app_asrc_q31_opt_allow(),
+               (unsigned long)audio_app_asrc_q31_opt_fails() );
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    if( ( in_len != 1u ) || ( sub > 0x3u ) )
+    {
+        printf(" \"*au SS\" bad args SS=%u (bitmask: 0=baseline 1=blend 2=row16 3=both)\n",
+               (unsigned)sub);
+        msg->status = APP_CONSOLE_ERR_BAD_DATA;
+        return;
+    }
+
+    if( ( sub & (uint8_t)~audio_app_asrc_q31_opt_allow() ) != 0u )
+    {
+        /* Refuse rather than measure two DIFFERENT filters against each other.  This is
+         * per candidate: a bit whose kernel failed the boot bit-exactness selftest cannot
+         * be selected, while the other bit stays usable. */
+        printf(" \"*au\" refused: SS=%u asks for a kernel the bit-exactness\n"
+               "         selftest did not prove (selectable=%u, fails=%lu)\n",
+               (unsigned)sub, (unsigned)audio_app_asrc_q31_opt_allow(),
+               (unsigned long)audio_app_asrc_q31_opt_fails() );
+        msg->status = APP_CONSOLE_ERR_UNSUPPORTED;
+        return;
+    }
+
+    audio_app_asrc_q31_opt_set( sub );
+    printf(" \"*au\" q31 blend=%s row16=%s\n", ( ( sub & 0x1u ) != 0u ) ? "OPT" : "BASELINE",
+           ( ( sub & 0x2u ) != 0u ) ? "OPT" : "BASELINE" );
+    msg->status = APP_CONSOLE_OK;
+}
+#endif /* APP_ASRC_Q31_OPT_KERNELS */
+
+#if APP_ASRC_FULL_IIR_48_TO_32
+/*
+ * *aj SS : select the A->B 48 -> 32 kHz anti-alias stage, and report it.
+ *
+ *   *aj00  N97      -- the shipping 2/3 rational FIR front end (this is what boots)
+ *   *aj01  Full-IIR -- the trial 6-SOS elliptic LPF at 48 kHz, ASRC then at step 1.5
+ *   *aj02  clear the stage's peak / over_fs / block counters, so a steady-state delta can
+ *          be taken separately from the start-up and switch transients
+ *   ?aj    report mode, whether it is armed for the live pair, and the counters
+ *
+ * A mode change is applied by RE-APPLYING leg A's current rate, not by poking streaming
+ * state: leg A takes the whole-transport restart path, which is mute -> teardown ->
+ * reset_stream_state() (where the stage's state is cleared and it is armed or retired)
+ * -> prefill -> unmute.  Reaching the same state any other way would mean writing
+ * sixteen channels of filter state while the block ISR reads them.
+ *
+ * Selecting a mode that does not apply to the live pair is NOT an error: the mode is
+ * global and the stage is qualified for A = 48 kHz / B = 32 kHz only.  The reset hook
+ * says so on the console, and the mode takes effect if that pair is selected later.
+ */
+static void asrc_console_full_iir_mode( app_console_msg_t* msg )
+{
+    const uint16_t in_len = msg->data_len;
+    const uint8_t  sub    = ( in_len > 0u ) ? msg->data[0] : 0xFFu;
+
+    msg->data_len = 0u;
+
+    if( msg->kind != '*' )
+    {
+        if( in_len != 0u )
+        {
+            printf(" \"?aj\" takes no payload\n");
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            return;
+        }
+        {
+            uint32_t out_milli = 0u, state_milli = 0u, over_fs = 0u, nonfinite = 0u, blocks = 0u;
+            uint32_t crc = 0u, unity_crc = 0u, sos = 0u;
+            int32_t  mdb = 0;
+            asrc_full_iir_48_to_32_stats( &out_milli, &state_milli, &over_fs, &nonfinite, &blocks );
+            asrc_full_iir_48_to_32_identity( &crc, &unity_crc, &mdb, &sos );
+            printf(" \"?aj\" 48->32 stage=%s armed=%u  %luSOS gain=%ldmdB crc=%08lX unity_crc=%08lX\n",
+                   ( asrc_full_iir_48_to_32_mode() == ASRC_FULL_IIR_MODE_FULL_IIR )
+                       ? "FULL_IIR" : "N97",
+                   (unsigned)( asrc_full_iir_48_to_32_armed() ? 1u : 0u ),
+                   (unsigned long)sos, (long)mdb,
+                   (unsigned long)crc, (unsigned long)unity_crc );
+            printf("      peaks x1000FS: out=%lu state=%lu  over_fs=%lu nan=%lu blocks=%lu\n",
+                   (unsigned long)out_milli, (unsigned long)state_milli,
+                   (unsigned long)over_fs, (unsigned long)nonfinite, (unsigned long)blocks );
+#if APP_ASRC_MEAS
+            /* The real clamp, measured where it actually is: the int24 output the codec gets.
+             * over_fs above is the float 48 kHz intermediate, which has no clamp at all. */
+            {
+                uint32_t at_fs = 0u, frames = 0u;
+                int32_t  peak = 0;
+                audio_app_meas_out_fs_stats( &at_fs, &frames, &peak );
+                printf("      out24: at_fs=%lu of %lu frames  peak=%ld LSB (%lu x1000FS)\n",
+                       (unsigned long)at_fs, (unsigned long)frames, (long)peak,
+                       (unsigned long)( (uint32_t)peak / 8389u ) );
+            }
+#endif
+        }
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    if( ( in_len != 1u ) || ( sub > 2u ) )
+    {
+        printf(" \"*aj SS\" bad args SS=%u (0=N97 1=Full-IIR 2=clear counters)\n", (unsigned)sub);
+        msg->status = APP_CONSOLE_ERR_BAD_DATA;
+        return;
+    }
+
+    if( sub == 2u )
+    {
+        asrc_full_iir_48_to_32_stats_clear();
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+        /* Same command starts a fresh CCP queue-observation window, so a mode comparison has
+         * one baseline for both. The CCP overrun counter itself is NOT cleared here. */
+        asrc_clock_control_queue_stats_clear();
+#endif
+#if APP_ASRC_MEAS
+        audio_app_meas_out_fs_clear();
+#endif
+        printf(" \"*aj\" 48->32 stage counters cleared\n");
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    asrc_full_iir_48_to_32_set_mode( ( sub == 1u ) ? ASRC_FULL_IIR_MODE_FULL_IIR
+                                                   : ASRC_FULL_IIR_MODE_N97 );
+
+    /* Re-apply leg A's own rate: same value, full restart path, so the selection is
+     * applied by the ordinary mute-bounded sequence. */
+    {
+        audio_transport_snapshot_t snap;
+        uint32_t rate_a_hz = 0u;
+        if( audio_transport_snapshot_get( &snap ) &&
+            ( snap.leg_count > (uint8_t)AUDIO_TRANSPORT_LEG_A ) )
+        {
+            rate_a_hz = snap.legs[AUDIO_TRANSPORT_LEG_A].configured_rate_hz;
+        }
+        printf(" \"*aj\" 48->32 stage -> %s (restarting leg A at %lu Hz)\n",
+               ( sub == 1u ) ? "FULL_IIR" : "N97", (unsigned long)rate_a_hz );
+        if( ( rate_a_hz == 0u ) ||
+            !asrc_console_request_sample_rate_hz( 0u, rate_a_hz ) )
+        {
+            /* The mode is set; only the immediate re-arm failed.  Say which, so nobody
+             * reads a stale `fe=` field as the new selection. */
+            printf(" \"*aj\" restart not performed -- selection takes effect at the next"
+                   " leg-A rate change or restart\n");
+        }
+    }
+    msg->status = APP_CONSOLE_OK;
+}
+#endif /* APP_ASRC_FULL_IIR_48_TO_32 */
 
 #if APP_ASRC_MEAS
 // *ac (write, no payload) : arm a one-shot A->B capture (was *nt20).
@@ -830,6 +1026,60 @@ static void asrc_console_fir_kernel_bench( app_console_msg_t* msg )
     asrc_fir_kernel_bench_run( hundreds * 100u );
     msg->status = APP_CONSOLE_OK;
 }
+
+#if ASRC_H2_KERNEL_BENCH_AVAILABLE
+/* *ah [VV] (write): Phase-2 H2 timing probe, with VV*100 blocks; omitted or
+ * zero selects its required 10,000-block default. */
+static void asrc_console_h2_timing_bench( app_console_msg_t* msg )
+{
+    const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
+    msg->data_len = 0u;
+    asrc_h2_timing_bench_run( hundreds * 100u );
+    msg->status = APP_CONSOLE_OK;
+}
+
+/* *ao [VV] (write): Phase-3 H2 probe.  It evaluates existing optimized FIR
+ * and DF2T kernels only; like *ah it is foreground-only and defaults to
+ * 10,000 trials when VV is zero or omitted. */
+static void asrc_console_h2_optimized_kernel_bench( app_console_msg_t* msg )
+{
+    const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
+    msg->data_len = 0u;
+    asrc_h2_optimized_kernel_bench_run( hundreds * 100u );
+    msg->status = APP_CONSOLE_OK;
+}
+/* *ai [VV] (write): Full-IIR precheck.  Times the Phase-4 six-SOS anti-alias LPF
+ * on target; like *ah/*ao it is foreground-only and defaults to 10,000 trials. */
+static void asrc_console_full_iir_precheck_bench( app_console_msg_t* msg )
+{
+    const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
+    msg->data_len = 0u;
+    asrc_full_iir_precheck_bench_run( hundreds * 100u );
+    msg->status = APP_CONSOLE_OK;
+}
+#endif /* ASRC_H2_KERNEL_BENCH_AVAILABLE */
+
+/* *ad [VV] (write): existing Q31 /2 FIR 107/81/65/49/33-tap CPU calibration.
+ * It is foreground-only and defaults to 10,000 trials when VV is zero/omitted. */
+static void asrc_console_fir_tradeoff_bench( app_console_msg_t* msg )
+{
+    const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
+    msg->data_len = 0u;
+    asrc_fir_tradeoff_bench_run( hundreds * 100u );
+    msg->status = APP_CONSOLE_OK;
+}
+
+/* *ae [VV] (write): candidate E half-band /2 kernel, measured block difference
+ * against the shipping dense 41 tap.  Validates the stride-8 modulo wrap before
+ * it times anything and refuses to time a wrong answer.  Foreground-only and
+ * defaults to 10,000 trials, like *ad. */
+static void asrc_console_hb_kernel_bench( app_console_msg_t* msg )
+{
+    const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
+    msg->data_len = 0u;
+    asrc_hb_kernel_bench_run( hundreds * 100u );
+    msg->status = APP_CONSOLE_OK;
+}
 #endif /* ASRC_FIR_KERNEL_BENCH_AVAILABLE */
 
 static void asrc_console_pop_test( app_console_msg_t* msg )
@@ -859,9 +1109,15 @@ static void asrc_console_pop_test( app_console_msg_t* msg )
                        : asrc_pop_measure_phase( audio_transport_declick_b_shutdown_only, mask, 150u, &sd_db );
     const int32_t su   = asrc_pop_measure_phase( audio_transport_declick_b_startup_only,  mask, 150u, &su_db );
 
-    // The B-only restart briefly stopped B's clock; B is now re-inited and clean. Clear the transient
-    // frmerr/liveness so the manage loop does NOT fire a log-flooding full-transport auto-recovery
-    // (which would also disrupt the quiet-log state during a measurement session).
+    // The B-only restart briefly stopped B's clock. The declick primitives PARK leg B's sync domain
+    // across that outage (stop_domain -> codec -> start_domain), so the SPI2 slave is not left
+    // stranded mid-frame and there should be no frame-error run to begin with. This clear stays as
+    // insurance for a build/topology where the park is refused: without it the manage loop fires a
+    // log-flooding full-transport auto-recovery, which also disrupts a measurement session.
+    //
+    // NOTE (2026-09-05, owner decision): parking the leg removes the garbage frames the DAC used to
+    // receive while B's clock died, so the SHUTDOWN pop figure is NOT comparable with mask
+    // measurements taken before this change. Continuity of the old numbers was deliberately given up.
     delay_ms( 100 );
     audio_transport_frmerr_reset();
 
@@ -928,6 +1184,109 @@ void sonora_app_console_onmsg( app_console_msg_t* msg )
             break;
         }
         asrc_console_fir_kernel_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    case 'h':   // H2 FIR49 + five-SOS component timing: "*ah [VV]" (write only)
+#if ASRC_H2_KERNEL_BENCH_AVAILABLE
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        asrc_console_h2_timing_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    case 'o':   // H2 Phase-3 existing optimized-kernel feasibility: "*ao [VV]" (write only)
+#if ASRC_H2_KERNEL_BENCH_AVAILABLE
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        asrc_console_h2_optimized_kernel_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    case 'i':   // Full-IIR precheck, six-SOS anti-alias LPF: "*ai [VV]" (write only)
+#if ASRC_H2_KERNEL_BENCH_AVAILABLE
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        asrc_console_full_iir_precheck_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    case 'd':   // Q31 /2 short-FIR trade-off calibration: "*ad [VV]" (write only)
+#if ASRC_FIR_KERNEL_BENCH_AVAILABLE
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        asrc_console_fir_tradeoff_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    case 'e':   // candidate E half-band /2 kernel block difference: "*ae [VV]" (write only)
+#if ASRC_FIR_KERNEL_BENCH_AVAILABLE
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        asrc_console_hb_kernel_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    case 'j':   // 48->32 anti-alias stage select: "*aj SS" write / "?aj" read
+#if APP_ASRC_FULL_IIR_48_TO_32
+        asrc_console_full_iir_mode( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    /* 'u' for unrolled.  NOT 'k': "?ak" is already the coefficient dump under
+     * APP_ASRC_MEAS, and a duplicate case label would break every MEAS build even
+     * though this research image happens to be built with meas=off. */
+    case 'u':   // Q31 kernel pair select: "*au SS" write / "?au" read
+#if APP_ASRC_Q31_OPT_KERNELS
+        asrc_console_q31_opt_mode( msg );
         break;
 #else
         msg->data_len = 0u;

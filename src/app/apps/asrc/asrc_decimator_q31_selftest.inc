@@ -131,6 +131,26 @@ static bool dec_q31_st_ref_stage(dec_q31_st_ref_t *r, uint8_t s, int32_t x,
 
     const int32_t *const c = &s_q31_coeff[st->coeff_off];
     int64_t sum = 0;
+#if APP_ASRC_Q31_PRE_HALFBAND
+    /* A half-band stage keeps its coefficients PACKED, so the oracle cannot walk them
+     * with c[k].  It goes through the same index rule the packing used -- one rule, two
+     * readers -- and adds nothing for a structural zero, which is exact rather than an
+     * approximation: the dense kernel would add coefficient 0 times the sample.  The
+     * dropped terms therefore cannot change this sum, and the oracle stays a genuine
+     * independent check of the kernel (linear shift register, int64, no modulo). */
+    if (st->hb_half != 0u)
+    {
+        for (uint16_t k = 0u; k < T; ++k)
+        {
+            uint16_t idx = 0u;
+            if (dec_q31_hb_coeff_index(k, st->hb_half, &idx))
+            {
+                sum += (int64_t)c[idx] * (int64_t)h[T - 1u - k];
+            }
+        }
+    }
+    else
+#endif
     for (uint16_t k = 0u; k < T; ++k)
     {
         sum += (int64_t)c[k] * (int64_t)h[T - 1u - k];

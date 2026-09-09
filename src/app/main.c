@@ -175,7 +175,7 @@ static nora_high_res_timer_status_t init_timers( void );
 
 #if SONORA_APP_IS_CLASSIC
 static void   dbg_RGB_pot( void );
-#else
+#elif APP_USE_RGB_STATUS_LED
 static void   set_rgb_idle_color( void );
 #endif
 static void   dbg_print( void );
@@ -758,12 +758,15 @@ int main(void)
     // generator on the device shares. The Classic audio PWM DAC is app-owned --
     // brought up by the app contract's start_aux_output() (no-op for ASRC).
     ////////////////////////////////////
+#if APP_USE_RGB_STATUS_LED
     pwm_led_init();
 #if SONORA_APP_IS_ASRC
     // ASRC does not use the potentiometer. Keep the RGB status LED, but let
     // hardware PWM hold the existing dim-green idle color without ADC polling.
     set_rgb_idle_color();
 #endif
+#endif //APP_USE_RGB_STATUS_LED (OFF for ASRC: nothing else in an ASRC build
+       // references hal_pwm, so this call is what keeps the backend linked)
     sonora_app_start_aux_output();
 
 
@@ -1145,7 +1148,7 @@ static void dbg_RGB_pot( void )
     LED_COLOR_GREEN( g );
     LED_COLOR_BLUE ( b );
 }
-#else
+#elif APP_USE_RGB_STATUS_LED
 static void set_rgb_idle_color( void )
 {
     pwm3_set_duty( 0u );   // red

@@ -65,6 +65,21 @@
 #endif
 #define ASRC_DEC_Q31_CH  ASRC_CH
 
+/* The channel repeat below is a bitmask (`f[c & mask]`), which is what ties this kernel to
+ * power-of-two widths -- but it ties only the SOURCE width, never the logical one.  A source
+ * narrower than ASRC_CH has to be repeated, and a mask can only repeat a power-of-two count.
+ * A source that is ALREADY the full logical width repeats nothing, so all its mask has to do
+ * is leave every index below ASRC_CH alone: the smallest 2^k-1 that covers the width does
+ * that for any width, power of two or not.  That is what this is, and it is why a
+ * non-power-of-two ASRC_CH (12) is carried here while a non-power-of-two SLOT count still
+ * is not.  ASRC_CH <= 16 is enforced by the app, so 15u is the widest mask this ever needs. */
+#define ASRC_DEC_Q31_FULL_MASK                                            \
+    ((uint8_t)(((ASRC_DEC_Q31_CH) <= 2u) ? 1u :                           \
+               (((ASRC_DEC_Q31_CH) <= 4u) ? 3u :                          \
+                (((ASRC_DEC_Q31_CH) <= 8u) ? 7u : 15u))))
+_Static_assert(ASRC_DEC_Q31_CH <= 16u,
+               "ASRC_DEC_Q31_FULL_MASK only covers widths up to 16");
+
 /* The kernel.  Declared here rather than in a header because it is the only
  * caller in the application; the bench declares its own copy for the same
  * reason.  The signature is fixed by the .s file. */
@@ -77,6 +92,29 @@ extern int32_t *fir_ring_q31_ymod_yonly_block(
     uint32_t       decim_bytes, /* w5  decimation factor * 4            */
     const int32_t *ring,        /* w6  YMODSRT (ring base)              */
     uint32_t       ring_bytes); /* w7  ring length in bytes             */
+
+#if APP_ASRC_Q31_PRE_HALFBAND
+/* The half-band twin of the kernel above, MEASUREMENT ONLY.  Same window, same
+ * modulo ring, same outputs -- it just steps the history by two samples across the
+ * stretches where the filter structure makes the tap zero, so a 4*half-1 filter
+ * costs 2*half+1 MACs.  `coeff` is therefore PACKED (19 entries for 35 taps), in the
+ * ascending index order dec_q31_hb_coeff_index() below defines; `half` replaces the
+ * tap count, and the filter length it implies is 4*half - 1.
+ *
+ * It is declared under the gate, not always, so that a build without the gate cannot
+ * link against it by accident -- and a build WITH the C gate but without the matching
+ * -AsDefine fails at link on this symbol, which is the failure we want.  Falling back
+ * to the dense kernel would leave a measurement that silently measured nothing. */
+extern int32_t *fir_ring_q31_hb_ymod_yonly_block(
+    const int32_t *coeff,       /* w0  2*half+1 packed entries, X space */
+    const int32_t *hist,        /* w1  Y space, oldest sample of window */
+    uint32_t       half,        /* w2  >= 3; filter length 4*half - 1   */
+    int32_t       *out,         /* w3  outputs written here             */
+    uint32_t       outputs,     /* w4  >= 1                             */
+    uint32_t       decim_bytes, /* w5  decimation factor * 4            */
+    const int32_t *ring,        /* w6  YMODSRT (ring base)              */
+    uint32_t       ring_bytes); /* w7  ring length in bytes             */
+#endif
 
 /*
  * PER-CHANNEL HISTORY ARENA, in two parts.
@@ -246,6 +284,13 @@ typedef struct
     uint16_t ring_off;    /* offset into the per-channel 190-sample arena  */
     uint16_t coeff_off;   /* offset into s_q31_coeff                       */
     uint8_t  decim;
+#if APP_ASRC_Q31_PRE_HALFBAND
+    /* Non-zero ONLY on a half-band stage, and it is what selects the kernel: the
+     * coefficients at coeff_off are packed when this is set, so the two have to be
+     * decided together and read together.  Under the gate only, so that the descriptor
+     * array of a default build is the size and shape it has always been. */
+    uint16_t hb_half;
+#endif
 } dec_q31_stage_t;
 
 static struct
@@ -418,11 +463,19 @@ _Static_assert(ASRC_DEC_Q31_CH >= 2u, "front end computes at least the real pair
  * STILL UNGATED (known, 2026-09-02): nothing here can see that a build with the front end off has
  * rates selectable that NEED it, because leg rates are runtime.  Expressing that needs a gate over
  * the rate menu rather than the width, so it is deliberately left as a documented hole rather than
- * a half-check that would pass the cases it cannot see. */
-_Static_assert((ASRC_DEC_Q31_CH & (ASRC_DEC_Q31_CH - 1u)) == 0u,
-               "front-end channel repeat is a mask, so this kernel geometry carries only "
-               "power-of-two widths -- widen the geometry or choose another width; do NOT "
-               "disable the front end to make a width compile");
+ * a half-check that would pass the cases it cannot see.
+ *
+ * WIDENED 2026-09-06 (bench 12 ch study): what the mask actually constrains is the SOURCE width,
+ * not the logical one.  Repeating a narrower source into ASRC_CH needs a power-of-two source
+ * count; a source that is already full width repeats nothing and only needs a mask that leaves
+ * every index below ASRC_CH alone, which ASRC_DEC_Q31_FULL_MASK is for any width up to 16.  So
+ * the assertion below states that identity property instead of "ASRC_CH is a power of two", and
+ * the source count is checked where it is actually known -- at runtime, in process().  Nothing
+ * about the work narrowed: all ASRC_CH channels are still filtered, by the same stages. */
+_Static_assert((ASRC_DEC_Q31_CH - 1u) <= ASRC_DEC_Q31_FULL_MASK,
+               "ASRC_DEC_Q31_FULL_MASK must leave every channel index below ASRC_DEC_Q31_CH "
+               "unchanged -- widen the geometry or choose another width; do NOT disable the "
+               "front end to make a width compile");
 
 /* Rounded float -> Q31.  Runs in init(), never on the audio path.  Every
  * coefficient of a unity-gain decimation lowpass is well inside +/-1, so the
@@ -456,6 +509,59 @@ static void dec_q31_load_coeff(uint16_t off, const float *src, uint16_t taps)
     }
 }
 
+#if APP_ASRC_Q31_PRE_HALFBAND
+/*
+ * WHERE TAP k OF A HALF-BAND FILTER LIVES IN THE PACKED ARRAY, and whether it lives
+ * there at all.  Length taps = 4*half - 1 puts the centre at M = 2*half - 1, which is
+ * ODD, and a half-band prototype is exactly zero at every EVEN offset from its centre.
+ * So the survivors are the even ABSOLUTE indices plus M, packed ascending:
+ *
+ *     k even, k < M   ->  k/2            (h[0], h[2], ... h[M-1])
+ *     k == M          ->  half           (the centre)
+ *     k even, k > M   ->  k/2 + 1        (h[M+1], h[M+3], ... h[taps-1])
+ *     k odd,  k != M  ->  no entry; the tap is zero BY STRUCTURE
+ *
+ * This is the one place the mapping is written down, and both the coefficient packing
+ * and the selftest oracle go through it -- an oracle with its own copy of the rule
+ * would agree with a wrong kernel as readily as with a right one.
+ *
+ * It is a STRUCTURAL rule, never a test for a small coefficient: nothing here inspects
+ * a value.  The generator asserts that the taps this drops really are zero (largest
+ * dropped magnitude 1.8e-17 against a smallest kept 2.6e-06) so that a cutoff which
+ * drifted off fs/4 fails at build time rather than quietly losing real taps.
+ */
+static bool dec_q31_hb_coeff_index(uint16_t k, uint16_t half, uint16_t *idx)
+{
+    const uint16_t m = (uint16_t)((2u * half) - 1u);
+    if (k == m)            { *idx = half; return true; }
+    if ((k & 1u) != 0u)    { return false; }
+    *idx = (uint16_t)((k < m) ? (k / 2u) : ((k / 2u) + 1u));
+    return true;
+}
+
+static void dec_q31_stage_set_hb(uint8_t s, uint16_t taps, uint16_t half,
+                                 uint8_t decim, uint16_t ring, uint16_t ring_off,
+                                 uint16_t coeff_off, const float *coeff)
+{
+    s_q31.stage[s].taps      = taps;   /* the WINDOW is still 4*half-1 long */
+    s_q31.stage[s].decim     = decim;
+    s_q31.stage[s].ring      = ring;
+    s_q31.stage[s].ring_off  = ring_off;
+    s_q31.stage[s].coeff_off = coeff_off;
+    s_q31.stage[s].hb_half   = half;
+    s_q31.wr[s]    = 0u;
+    s_q31.phase[s] = 0u;
+    for (uint16_t k = 0u; k < taps; ++k)
+    {
+        uint16_t idx = 0u;
+        if (dec_q31_hb_coeff_index(k, half, &idx))
+        {
+            s_q31_coeff[coeff_off + idx] = dec_q31_from_float(coeff[k]);
+        }
+    }
+}
+#endif
+
 static void dec_q31_stage_set(uint8_t s, uint16_t taps, uint8_t decim,
                               uint16_t ring, uint16_t ring_off,
                               uint16_t coeff_off, const float *coeff)
@@ -465,6 +571,9 @@ static void dec_q31_stage_set(uint8_t s, uint16_t taps, uint8_t decim,
     s_q31.stage[s].ring      = ring;
     s_q31.stage[s].ring_off  = ring_off;
     s_q31.stage[s].coeff_off = coeff_off;
+#if APP_ASRC_Q31_PRE_HALFBAND
+    s_q31.stage[s].hb_half   = 0u;   /* dense unless dec_q31_stage_set_hb() said so */
+#endif
     s_q31.wr[s]    = 0u;
     s_q31.phase[s] = 0u;
     dec_q31_load_coeff(coeff_off, coeff, taps);
@@ -565,8 +674,41 @@ bool asrc_decimator_q31_init(uint32_t num, uint32_t den, uint8_t channels,
              * than route a 48 kHz output through a filter designed for 24 kHz. */
             return false;
         }
+#if APP_ASRC_Q31_PRE_HALFBAND
+        /*
+         * MEASUREMENT BUILD: the SHARED composed pre-stage runs the 35-tap HALF-BAND set
+         * through the sparse kernel instead of the 41-tap set through the dense one.  Only
+         * this arm is swapped -- a WIDE variant is the whole chain and has no half-band
+         * design, and den == 1 was already refused above.
+         *
+         * EVERYTHING AROUND IT IS DELIBERATELY LEFT ALONE so that the two images differ in
+         * the kernel and nothing else:
+         *   - the ring stays DEC_Q31_PRE_RING (55 samples), not the 49 that 35 taps would
+         *     justify, so the Y history is byte-identical and nothing moves in the arena;
+         *   - cbase stays DEC_Q31_PRE_TAPS (41), not the 19 the packed set occupies, so the
+         *     second stage reads its coefficients from the SAME addresses in both builds.
+         * Both cost a few unused words and buy a comparison that is about one variable.
+         *
+         * The batch bound moves on its own: bmax = 1 + (55-35)/2 = 11 against 8, and b
+         * stays 8 because a block is 16 input frames.  So the call count per block does not
+         * change either.
+         */
+        if (vpre == ASRC_DECIMATOR_96_TO_48_SHARED)
+        {
+            dec_q31_stage_set_hb(0u, ASRC_DECIMATOR_96_TO_48_HB_COEFF_TAPS,
+                                 ASRC_DECIMATOR_96_TO_48_HB_COEFF_HALF,
+                                 (uint8_t)DEC_Q31_PRE_DECIM, pre_ring, pre_off, 0u,
+                                 s_96_to_48_hb_coeff);
+        }
+        else
+        {
+            dec_q31_stage_set(0u, pre_taps, (uint8_t)DEC_Q31_PRE_DECIM,
+                              pre_ring, pre_off, 0u, pre_coeff);
+        }
+#else
         dec_q31_stage_set(0u, pre_taps, (uint8_t)DEC_Q31_PRE_DECIM,
                           pre_ring, pre_off, 0u, pre_coeff);
+#endif
         sbase = 1u;
         cbase = pre_taps;
         if (den == 1u)
@@ -716,6 +858,62 @@ static size_t dec_q31_r23_count(size_t in_frames)
 }
 
 /*
+ * Push `n` input frames into stage `s`'s ring, for every channel.
+ *
+ * BIT-EXACT restructuring of what used to be a frame-outer / channel-inner pair
+ * of nested loops in each of the two runners below.  Same values, same
+ * destinations, same ring state on exit; only the address arithmetic changed.
+ *
+ * Why it was worth changing: the old form recomputed `s_q31_hist[c]` -- a row
+ * multiply by DEC_Q31_HIST_PER_CH -- once per (frame, channel), which at 12
+ * channels x 16 frames is 192 multiplies per stage per block, and reloaded
+ * s_q31.wr[s] from the state struct once per frame.  The measured non-kernel half
+ * of one stage was 15.6 us at 12 ch
+ * (`[internal] report_ak512_96k32k_12ch_legA_partition_2026-09-06.md` section 4.3)
+ * and this loop is the bulk of it.
+ *
+ * Channel-outer walks both sides with a CONSTANT stride instead: the destination
+ * by 1 inside the ring (wrapping at most once per lap) and the source by
+ * in_stride.  The write pointer advances identically for every channel, so it is
+ * derived once at the end rather than stored per frame.  `in` never aliases
+ * s_q31_hist -- it is the caller's block or s_q31_mid -- so the channel-outer
+ * order cannot change what any later channel reads.
+ *
+ * This does NOT skip a channel or a slot: every one of s_q31.channels channels is
+ * written, including the ones the input repeat mask feeds from the same source
+ * sample.  What was removed is address arithmetic, not work.
+ */
+static void dec_q31_hist_push(uint8_t s, uint16_t ring_off, uint16_t R,
+                              const int32_t *in, size_t n, size_t in_stride,
+                              uint8_t in_ch_mask)
+{
+    const uint8_t  nch = s_q31.channels;
+    const uint16_t w0  = s_q31.wr[s];
+    int32_t       *base = &s_q31_hist[0][ring_off];
+
+    for (uint8_t c = 0u; c < nch; ++c)
+    {
+        const int32_t *src = in + (size_t)(c & in_ch_mask);
+        int32_t       *dst = base + w0;
+        int32_t *const end = base + R;
+
+        for (size_t k = 0u; k < n; ++k)
+        {
+            *dst = *src;
+            src += in_stride;
+            ++dst;
+            if (dst == end) { dst = base; }
+        }
+        base += DEC_Q31_HIST_PER_CH;
+    }
+
+    /* One modulo per stage per block, in place of a compare-and-branch per frame.
+     * Written as a modulo rather than a subtract so it stays correct if a caller
+     * ever pushes more than one lap; `n <= R` for every caller today. */
+    s_q31.wr[s] = (uint16_t)(((uint32_t)w0 + (uint32_t)n) % (uint32_t)R);
+}
+
+/*
  * One block of the 2/3 rational chain.
  *
  * Push the whole block into the shared ring first, then issue ONE kernel call per
@@ -736,16 +934,8 @@ static size_t dec_q31_r23_run(const int32_t *in, size_t in_frames,
      * build error and not a mute -- it reads back the wrong window. */
     const uint8_t  rb  = s_q31.r23_base;
 
-    for (size_t i = 0u; i < in_frames; ++i)
-    {
-        const int32_t *const f = in + (i * in_stride);
-        const uint16_t w = s_q31.wr[rb];
-        for (uint8_t c = 0u; c < nch; ++c)
-        {
-            s_q31_hist[c][w] = f[c & in_ch_mask];
-        }
-        s_q31.wr[rb] = (uint16_t)(((w + 1u) == R) ? 0u : (w + 1u));
-    }
+    /* ring_off is 0 for both phase rows -- they share one ring. */
+    dec_q31_hist_push(rb, 0u, R, in, in_frames, in_stride, in_ch_mask);
 
     /* Walk the schedule once, recording per row how many outputs it owes and
      * where its FIRST window ends (as a distance behind the write pointer). */
@@ -783,20 +973,32 @@ static size_t dec_q31_r23_run(const int32_t *in, size_t in_frames,
         /* Row r owns output slots (r ^ p0), (r ^ p0) + 2, ... of this block. */
         const size_t slot0 = (size_t)((r ^ p0) & 1u);
 
+        /* Both walks are constant-stride, so neither the ring base nor the output
+         * slot needs a multiply per channel or per output.  Successive outputs of
+         * ONE row are two slots apart because the other row owns the slots in
+         * between; the channel index is the fastest axis of `out`, hence ++dst. */
+        int32_t     *ring    = &s_q31_hist[0][st->ring_off];
+        int32_t     *dst     = &out[slot0 * out_stride];
+        const size_t dst_hop = out_stride * 2u;
+
         for (uint8_t c = 0u; c < nch; ++c)
         {
             int32_t tmp[DEC_Q31_R23_MAX_ROW_BATCH];
-            int32_t *const ring = &s_q31_hist[c][st->ring_off];
 
             (void)fir_ring_q31_ymod_yonly_block(coeff, ring + start, st->taps,
                                                 tmp, (uint32_t)rows[r],
                                                 (uint32_t)st->decim * 4u,
                                                 ring, (uint32_t)R * 4u);
-            for (size_t j = 0u; j < (size_t)rows[r]; ++j)
             {
-                out[(((j * 2u) + slot0) * out_stride) + c] =
-                    dec_q31_to_s24_left(tmp[j]);
+                int32_t *o = dst;
+                for (size_t j = 0u; j < (size_t)rows[r]; ++j)
+                {
+                    *o = dec_q31_to_s24_left(tmp[j]);
+                    o += dst_hop;
+                }
             }
+            ring += DEC_Q31_HIST_PER_CH;
+            ++dst;
         }
     }
     return produced;
@@ -869,16 +1071,9 @@ static size_t dec_q31_stage_run(uint8_t s,
         if (avail < need)
         {
             /* Not enough for another output.  Absorb, and leave the phase. */
-            for (size_t k = 0u; k < avail; ++k, ++i)
-            {
-                const int32_t *const f = in + (i * in_stride);
-                const uint16_t w = s_q31.wr[s];
-                for (uint8_t c = 0u; c < nch; ++c)
-                {
-                    s_q31_hist[c][st->ring_off + w] = f[c & in_ch_mask];
-                }
-                s_q31.wr[s] = (uint16_t)(((w + 1u) == R) ? 0u : (w + 1u));
-            }
+            dec_q31_hist_push(s, st->ring_off, R, in + (i * in_stride), avail,
+                              in_stride, in_ch_mask);
+            i += avail;
             s_q31.phase[s] = (uint8_t)((size_t)s_q31.phase[s] + avail);
             break;
         }
@@ -887,16 +1082,9 @@ static size_t dec_q31_stage_run(uint8_t s,
         if (b > bmax) { b = bmax; }
         const size_t push_n = need + ((b - 1u) * D);
 
-        for (size_t k = 0u; k < push_n; ++k, ++i)
-        {
-            const int32_t *const f = in + (i * in_stride);
-            const uint16_t w = s_q31.wr[s];
-            for (uint8_t c = 0u; c < nch; ++c)
-            {
-                s_q31_hist[c][st->ring_off + w] = f[c & in_ch_mask];
-            }
-            s_q31.wr[s] = (uint16_t)(((w + 1u) == R) ? 0u : (w + 1u));
-        }
+        dec_q31_hist_push(s, st->ring_off, R, in + (i * in_stride), push_n,
+                          in_stride, in_ch_mask);
+        i += push_n;
         s_q31.phase[s] = 0u;
 
         /* Oldest sample of the FIRST output's window.  The batch spans
@@ -905,35 +1093,102 @@ static size_t dec_q31_stage_run(uint8_t s,
         const uint16_t span = (uint16_t)(T + ((b - 1u) * D));
         const uint16_t w0   = (uint16_t)(((uint32_t)s_q31.wr[s] + R - span) % R);
 
+        /* Constant-stride walks, as in the rational runner: the ring base advances
+         * by one channel row and the output column by one channel, so neither the
+         * kernel setup nor the scatter pays a multiply per channel or per output. */
+        int32_t *ring = &s_q31_hist[0][st->ring_off];
+        int32_t *dst  = &out[produced * out_stride];
+
         for (uint8_t c = 0u; c < nch; ++c)
         {
             int32_t tmp[DEC_Q31_MAX_BATCH];
-            int32_t *const ring = &s_q31_hist[c][st->ring_off];
 
+#if APP_ASRC_Q31_PRE_HALFBAND
+            /* One test on a descriptor field already in the cache line, once per channel
+             * per batch -- 12 tests per block against the 22 MACs per output it selects
+             * away.  The rational runner needs no such test: a phase ROW is never a
+             * half-band stage, so its hb_half is 0 by construction. */
+            if (st->hb_half != 0u)
+            {
+                (void)fir_ring_q31_hb_ymod_yonly_block(coeff, ring + w0,
+                                                       (uint32_t)st->hb_half,
+                                                       tmp, (uint32_t)b,
+                                                       (uint32_t)D * 4u,
+                                                       ring, (uint32_t)R * 4u);
+            }
+            else
+#endif
             (void)fir_ring_q31_ymod_yonly_block(coeff, ring + w0, T,
                                                 tmp, (uint32_t)b,
                                                 (uint32_t)D * 4u,
                                                 ring, (uint32_t)R * 4u);
-            if (last)
             {
-                for (size_t o = 0u; o < b; ++o)
+                int32_t *o = dst;
+                if (last)
                 {
-                    out[((produced + o) * out_stride) + c] =
-                        dec_q31_to_s24_left(tmp[o]);
+                    for (size_t k = 0u; k < b; ++k)
+                    {
+                        *o = dec_q31_to_s24_left(tmp[k]);
+                        o += out_stride;
+                    }
+                }
+                else
+                {
+                    for (size_t k = 0u; k < b; ++k)
+                    {
+                        *o = tmp[k];
+                        o += out_stride;
+                    }
                 }
             }
-            else
-            {
-                for (size_t o = 0u; o < b; ++o)
-                {
-                    out[((produced + o) * out_stride) + c] = tmp[o];
-                }
-            }
+            ring += DEC_Q31_HIST_PER_CH;
+            ++dst;
         }
         produced += b;
     }
     return produced;
 }
+
+#if APP_ASRC_LEG_PROFILE
+#include "nora_high_res_timer.h"
+/*
+ * Block-level split of THIS front end into its two arithmetic parts, peak-held over the
+ * telemetry window (see APP_ASRC_LEG_PROFILE in asrc_app_config.h).  Only the composed
+ * rational chain is instrumented, because that is the one whose two halves are the study
+ * subject: `pre` is every cascade stage AHEAD of the phase rows (for 96 -> 32 kHz, the
+ * 96 -> 48 kHz /2 pre-stage) and `r23` is the L/M phase rows themselves (the 97-tap
+ * 48 -> 32 kHz resampler).  Anything this function costs outside the two -- the argument
+ * and bound checks, the dispatch, the loop -- is not measured here and shows up as the
+ * caller's feA minus these two, which is exactly where it belongs.
+ *
+ * Written only from a block ISR, read only from the foreground telemetry print, and a torn
+ * 32-bit read can misprint one line but cannot corrupt the peak -- the same treatment the
+ * neighbouring dbg_ counters get, and for the same reason: no guard in the audio ISR.
+ */
+static volatile uint32_t s_dq31_pre_ticks;
+static volatile uint32_t s_dq31_r23_ticks;
+static volatile uint32_t s_dq31_pre_last;
+static volatile uint32_t s_dq31_r23_last;
+
+/* Per-CALL values, read-and-clear.  The peaks above answer "how bad does each half get";
+ * these answer "what did the two halves cost in THE block the caller is attributing", which
+ * is the only form that can be added to a caller's other rows without mixing blocks. */
+void asrc_decimator_q31_profile_take_last( uint32_t* pre_ticks, uint32_t* r23_ticks )
+{
+    if( pre_ticks != NULL ) { *pre_ticks = s_dq31_pre_last; }
+    if( r23_ticks != NULL ) { *r23_ticks = s_dq31_r23_last; }
+    s_dq31_pre_last = 0u;
+    s_dq31_r23_last = 0u;
+}
+
+void asrc_decimator_q31_profile_read( uint32_t* pre_ticks, uint32_t* r23_ticks )
+{
+    if( pre_ticks != NULL ) { *pre_ticks = s_dq31_pre_ticks; }
+    if( r23_ticks != NULL ) { *r23_ticks = s_dq31_r23_ticks; }
+    s_dq31_pre_ticks = 0u;
+    s_dq31_r23_ticks = 0u;
+}
+#endif /* APP_ASRC_LEG_PROFILE */
 
 /*
  * `input_channels` is how many REAL channels the source frame carries -- 2 for a
@@ -959,7 +1214,11 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
     if ((s_q31.stages == 0u) || (output_frames == NULL) ||
         ((input_frames != 0u) && (input == NULL)) ||
         (input_channels == 0u) ||
-        ((input_channels & (uint8_t)(input_channels - 1u)) != 0u) ||
+        /* The repeat is a bitmask, so a source NARROWER than the logical width must be a
+         * power of two.  A source at or above the logical width repeats nothing and needs
+         * no such property -- which is the only reason a 12 ch logical width can run here. */
+        ((input_channels < s_q31.channels) &&
+         ((input_channels & (uint8_t)(input_channels - 1u)) != 0u)) ||
         (input_stride < input_channels) ||
         (output_stride < s_q31.channels))
     {
@@ -970,7 +1229,11 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
         return false;
     }
 
-    const uint8_t in_mask = (uint8_t)(input_channels - 1u);
+    /* Repeat a narrower source; pass a full-width one straight through.  The `>=` arm is the
+     * identity mask, so it is also what a 16 ch source into an 8 ch width has always got. */
+    const uint8_t in_mask = (input_channels >= s_q31.channels)
+                                ? ASRC_DEC_Q31_FULL_MASK
+                                : (uint8_t)(input_channels - 1u);
 
     /* The rational chain is dispatched before the cascade arms: its last two stage
      * descriptors are phase rows and not cascade stages, so this branch must be
@@ -1006,6 +1269,9 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
         size_t         n          = input_frames;
         size_t         src_stride = input_stride;
         uint8_t        src_mask   = in_mask;
+#if APP_ASRC_LEG_PROFILE
+        const uint32_t prof_t0 = nora_high_res_timer_get_count();
+#endif
         for (uint8_t s = 0u; s < rb; ++s)
         {
             /* Never `last`: the phase rows are downstream, so an intermediate stage
@@ -1015,10 +1281,24 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
                                   (size_t)ASRC_DEC_Q31_CH, false);
             src        = dst;
             src_stride = (size_t)ASRC_DEC_Q31_CH;
-            src_mask   = (uint8_t)(ASRC_DEC_Q31_CH - 1u);
+            src_mask   = ASRC_DEC_Q31_FULL_MASK;   /* full-width intermediate: identity */
         }
+#if APP_ASRC_LEG_PROFILE
+        const uint32_t prof_t1 = nora_high_res_timer_get_count();
+#endif
         *output_frames = dec_q31_r23_run(src, n, src_stride, src_mask,
                                          output, output_stride);
+#if APP_ASRC_LEG_PROFILE
+        {
+            const uint32_t prof_t2 = nora_high_res_timer_get_count();
+            const uint32_t pre     = prof_t1 - prof_t0;
+            const uint32_t r23     = prof_t2 - prof_t1;
+            if (pre > s_dq31_pre_ticks) { s_dq31_pre_ticks = pre; }
+            if (r23 > s_dq31_r23_ticks) { s_dq31_r23_ticks = r23; }
+            s_dq31_pre_last = pre;
+            s_dq31_r23_last = r23;
+        }
+#endif
         return true;
     }
 
@@ -1069,7 +1349,7 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
                               last);
         src        = dst;
         src_stride = (size_t)ASRC_DEC_Q31_CH;
-        src_mask   = (uint8_t)(ASRC_DEC_Q31_CH - 1u);
+        src_mask   = ASRC_DEC_Q31_FULL_MASK;   /* full-width intermediate: identity */
     }
     *output_frames = n;
     return true;

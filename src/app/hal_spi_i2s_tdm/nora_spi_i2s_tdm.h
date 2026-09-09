@@ -651,6 +651,22 @@ extern bool nora_spi_i2s_tdm_inst_get_status( nora_spi_i2s_tdm_inst_t* inst,
                                                    nora_spi_i2s_tdm_status_t* status,
                                                    bool clear_peak );
 
+// Forget one leg's (or the primary leg's) framed-transport error history: the SPIROV / SPITUR /
+// FRMERR block counts and the consecutive-FRMERR run reported by get_status() are zeroed.
+//
+// block_count, block_deadline_miss_count, the RX-DMA cause counters and the load peaks are NOT
+// touched -- a caller must never be able to erase the evidence that a leg is dead or missing
+// deadlines by asking for the frame-error history to be dropped. clear_peak on get_load()/
+// get_status() remains what it always was: the ISR load min/max/event peaks only.
+//
+// This exists for the one case the counters cannot handle themselves: the consecutive-FRMERR run
+// is cleared by observing a CLEAN block, so a burst that ends with the leg quiet (no further
+// block ISRs) leaves the run standing, and every later reader sees "misframed right now" for an
+// event that is over. A caller that has just re-initialised the clock source / codec knows the
+// history is stale and drops it here. Returns false and changes nothing on a bad instance.
+extern bool nora_spi_i2s_tdm_inst_clear_error_counts( nora_spi_i2s_tdm_inst_t* inst );
+extern bool nora_spi_i2s_tdm_clear_error_counts( void );
+
 
 
 // Last-error diagnostic. The bool-returning calls (set_port / open / close / inst_configure /

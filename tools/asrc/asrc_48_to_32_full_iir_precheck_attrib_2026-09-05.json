@@ -1,0 +1,57 @@
+{
+  "alias_sweep_split": {
+    "landing_0_to_15k": {
+      "band": "0-15 kHz (the gate)",
+      "points": 56,
+      "worst_dbc": -119.79140182220061,
+      "worst_landing_hz": 14900.0,
+      "worst_source_hz": 17100.0
+    },
+    "landing_15_to_16k": {
+      "band": "15-16 kHz (not protected)",
+      "points": 8,
+      "worst_dbc": -73.65253450374603,
+      "worst_landing_hz": 15900.0,
+      "worst_source_hz": 16100.0
+    },
+    "step_hz": 125.0
+  },
+  "spur_attribution": {
+    "cases": {
+      "nominal_all_float32": {
+        "step": 1.5,
+        "wanted_amplitude": 0.8000012930770027,
+        "wanted_db": 1.4039393826683347e-05,
+        "worst_spur_amplitude": 1.279790295792713e-07,
+        "worst_spur_dbc": -135.91903752441925,
+        "worst_spur_hz": 999.8619796366879
+      },
+      "offnominal_all_float32": {
+        "step": 1.50015,
+        "wanted_amplitude": 0.7999848028729117,
+        "wanted_db": -0.0001650022781111814,
+        "worst_spur_amplitude": 4.790420267950959e-06,
+        "worst_spur_dbc": -104.45416241479992,
+        "worst_spur_hz": 14385.802736792757
+      },
+      "offnominal_all_float64": {
+        "step": 1.50015,
+        "wanted_amplitude": 0.7999860218092952,
+        "wanted_db": -0.00015176760315418187,
+        "worst_spur_amplitude": 4.279271027017516e-06,
+        "worst_spur_dbc": -105.43425210555944,
+        "worst_spur_hz": 14385.802736792757
+      },
+      "offnominal_float64_frac_only": {
+        "step": 1.50015,
+        "wanted_amplitude": 0.7999861166987886,
+        "wanted_db": -0.00015073733562913393,
+        "worst_spur_amplitude": 4.279008543019689e-06,
+        "worst_spur_dbc": -105.43478593147098,
+        "worst_spur_hz": 14385.802736792757
+      }
+    },
+    "offset_ppm": 100.0,
+    "tone_hz": 15000.0
+  }
+}

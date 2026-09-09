@@ -1100,6 +1100,26 @@
   #define APP_USE_USB_AUDIO_IN          (0)
 #endif
 
+// RGB status LED (PG1/2/3 via hal_pwm, pwm_led.c). Classic maps the potentiometer
+// onto it (dbg_RGB_pot: dim green -> blue -> white -> red). The ASRC app has no POT
+// and only ever showed a fixed dim-green idle glow, so it does not earn its ROM
+// there: pwm_led.c plus the whole hal_pwm backend are otherwise unreferenced in an
+// ASRC link -- measured 2026-09-09, AK128 ASRC BI 1,744 B and AK512 ASRC 5,832 B of
+// program memory for a static glow. Hence OFF for ASRC, ON for Classic. Set this to
+// 1 in an ASRC build to get the glow back. Unrelated to the PWM audio DAC output
+// path, which has its own switch (APP_USE_PWM_AUDIO) -- but see the guard below:
+// that path relies on pwm_led_init() having run the module-wide clock-source select.
+#ifndef APP_USE_RGB_STATUS_LED
+  #if APP_PROFILE == APP_PROFILE_ASRC
+    #define APP_USE_RGB_STATUS_LED      (0)
+  #else
+    #define APP_USE_RGB_STATUS_LED      (1)
+  #endif
+#endif
+#if APP_USE_PWM_AUDIO && !APP_USE_RGB_STATUS_LED
+  #error "APP_USE_PWM_AUDIO relies on pwm_led_init() performing the module-wide PWM clock-source select (nora_pwm_module_init) before the audio DAC generators start. Keep APP_USE_RGB_STATUS_LED at 1."
+#endif
+
 // ENA_DRC_DF2T_CASCADE is defined directly in the user-config section above.
 
 

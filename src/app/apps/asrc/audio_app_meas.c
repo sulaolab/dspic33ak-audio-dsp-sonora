@@ -431,8 +431,43 @@ void audio_app_meas_set_decimator_tone_idx( uint8_t idx )
 }
 #endif
 
+/* Real-clamp observation on the OUTPUT block -- see the header for why the float-side over_fs
+ * counter cannot answer this. 16 compares per 8-frame block, no float work, 12 B of state. */
+#define MEAS_OUT_FS_POS  ( 8388607 )
+#define MEAS_OUT_FS_NEG  ( -8388608 )
+static uint32_t s_out_at_fs  = 0u;
+static uint32_t s_out_frames = 0u;
+static int32_t  s_out_peak   = 0;
+
+void audio_app_meas_out_fs_stats( uint32_t* at_fs, uint32_t* frames, int32_t* peak )
+{
+    if( at_fs  != 0 ) { *at_fs  = s_out_at_fs;  }
+    if( frames != 0 ) { *frames = s_out_frames; }
+    if( peak   != 0 ) { *peak   = s_out_peak;   }
+}
+
+void audio_app_meas_out_fs_clear( void )
+{
+    s_out_at_fs  = 0u;
+    s_out_frames = 0u;
+    s_out_peak   = 0;
+}
+
 void audio_app_meas_capture( const int32_t* out_block )
 {
+    /* Before any early return: this must see every output block, not only armed ones. */
+    {
+        const int32_t* q = out_block;
+        for( uint16_t n = 0u; n < APP_BLOCK_FRAMES; n++ )
+        {
+            const int32_t v = q[0] >> 8;              // 24-bit L, exactly as the codec receives it
+            const int32_t a = ( v < 0 ) ? -v : v;
+            if( ( v >= MEAS_OUT_FS_POS ) || ( v <= MEAS_OUT_FS_NEG ) ) { s_out_at_fs++; }
+            if( a > s_out_peak ) { s_out_peak = a; }
+            q += APP_SLOTS_PER_FS;
+        }
+        s_out_frames += APP_BLOCK_FRAMES;
+    }
 #if APP_ASRC_MEAS_UART2_STREAM
     // Q19 base: while a long stream is armed, this same A->B output block feeds the frame
     // producer instead of the one-shot RAM capture (they never run at once). One block ->

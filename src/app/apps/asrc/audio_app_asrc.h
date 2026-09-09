@@ -42,6 +42,21 @@ void audio_app_asrc_set_ratio_ab( float ratio );
 void audio_app_asrc_push_ab( const int32_t* src );
 void audio_app_asrc_pull_ab( int32_t* dst );
 
+#if APP_ASRC_FULL_IIR_48_TO_32
+// Push one block that is ALREADY in the ring's float representation (24-bit counts),
+// channel-major with `ch_stride` floats per channel. For the Full-IIR 48 -> 32 kHz trial
+// stage, which is a float filter feeding a float ring: going through the int32 interface
+// would add a 24-bit requantisation and a clip point the host qualification does not have.
+// Frame accounting is asrc_push()'s (a whole block, no resampling).
+/* `frames` is how many frames each channel row actually carries; `ch_stride` stays the row
+ * pitch of the source buffer.  Behind the 96->48 kHz pre-stage a block is only half full,
+ * so the two differ.  `from_frontend` selects the ring-overflow attribution (front-end
+ * intermediate overflow vs the direct path's guard drop), exactly as asrc_push_frames()
+ * and asrc_push() do. */
+void audio_app_asrc_push_ab_block_f32( const float* src, uint32_t ch_stride,
+                                      uint32_t frames, uint8_t from_frontend );
+#endif
+
 #if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
 // Push already-decimated frames; FIFO units follow the active intermediate rate.
 void audio_app_asrc_push_ab_frames( const int32_t* src, size_t frames, size_t stride );
@@ -183,6 +198,16 @@ int16_t  audio_app_asrc_q58_last_off( void );
 // direction then runs mult*ASRC_CH channels of poly interpolation to project CPU load.
 void    audio_app_asrc_set_load_mult( uint8_t mult );
 uint8_t audio_app_asrc_get_load_mult( void );
+#endif  /* APP_ASRC_LOAD_TEST */
+
+#if APP_ASRC_Q31_OPT_KERNELS
+/* Q31 kernel-pair select, for differencing baseline against optimised INSIDE ONE IMAGE
+ * (console `*au`).  Both pairs are bit-identical -- proven at boot -- so this is a timing
+ * switch only and needs no reset.  See APP_ASRC_Q31_OPT_KERNELS in asrc_app_config.h. */
+void     audio_app_asrc_q31_opt_set( uint8_t mask );  /* bit0 blend, bit1 row16+mask */
+uint8_t  audio_app_asrc_q31_opt_get( void );
+uint8_t  audio_app_asrc_q31_opt_allow( void );   /* bits the boot selftest proved exact */
+uint32_t audio_app_asrc_q31_opt_fails( void );   /* boot bit-exactness selftest, 0 = pass */
 #endif
 
 #if APP_B_ROUTE_USES_BA
@@ -204,6 +229,14 @@ bool audio_app_asrc_rate_pair_is_supported( uint32_t rate_a_hz, uint32_t rate_b_
 // Telemetry line(s) printed with the 2 s TDM report: fill / resample step / peak
 // asrc_pull time per direction, plus the caller-measured per-domain rates fsA_hz/fsB_hz.
 void audio_app_asrc_dbg_print( uint32_t fsA_hz, uint32_t fsB_hz );
+
+#if APP_ASRC_LEG_PROFILE
+/* The `pull` peak of the window audio_app_asrc_dbg_print() has just printed, for the leg
+ * partition line that follows it.  0 for a direction this build has no engine for.
+ * engine is ASRC_ENGINE_AB / ASRC_ENGINE_BA. */
+uint32_t audio_app_asrc_dbg_pull_ticks_last( uint8_t engine );
+#endif
+
 
 #if (APP_ASRC_INTERP == ASRC_INTERP_POLY) && \
     (ASRC_POLY_METHOD == ASRC_POLY_STREAM8_PAIR) && \

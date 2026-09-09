@@ -22,6 +22,10 @@
 #include "audio_app_meas.h"   // R10 Q10: measurement-only control-variable trace hook
 #endif
 
+#if APP_ASRC_FULL_IIR_48_TO_32
+#include "asrc_full_iir_48_to_32.h"   // trial 48->32 anti-alias stage: `fe=` naming + its own line
+#endif
+
 #if APP_B_INDEP_DOMAIN && APP_B_ROUTE_IS_ASRC
 
 #include <stdint.h>
@@ -828,6 +832,71 @@ typedef struct {
     uint8_t           dbg_jmax;
     float             dbg_step;             // resample step at last pull
     uint32_t          dbg_pull_ticks_max;   // peak raw timer ticks in asrc_pull, cleared on report
+#if APP_ASRC_STAGE_PROFILE
+    /*
+     * Per-STAGE tick totals inside asrc_pull, peak-held over the print window (see
+     * APP_ASRC_STAGE_PROFILE in asrc_app_config.h).  SUMMED over the block's output frames,
+     * not peaked per frame, so coef+mac+conv from one block is comparable with THAT block's
+     * dbg_pull_ticks_max -- a per-frame peak would not be.  Q31 arm only; the float arms leave
+     * them at 0, and a 0 here means "not measured", never "free".
+     */
+    uint32_t          dbg_stg_coef_max;     // asrc_q31_phase_of + mchp_asrc_q31_blend_row
+    uint32_t          dbg_stg_mac_max;      // mchp_asrc_q31_row16 (the FIR MACs)
+    uint32_t          dbg_stg_conv_max;     // asrc_q31_to_slot over ASRC_CH
+    /*
+     * F1 sub-split.  ph+bl == coef by construction (same two probes plus one in the middle),
+     * and coef is kept so this window stays comparable with the E1-era reports.  st is the
+     * slot scatter, which lives OUTSIDE the poly arm and so is measured on every arm.
+     */
+    uint32_t          dbg_stg_ph_max;       // asrc_q31_phase_of + wbase + asrc_q31_wb
+    uint32_t          dbg_stg_bl_max;       // mchp_asrc_q31_blend_row alone
+    uint32_t          dbg_stg_st_max;       // d[s] = (s<ASRC_CH) ? out[s] : 0 scatter
+    /*
+     * MIN-hold of the same block totals, and it is not a curiosity: for a direction whose
+     * pull runs in the LOWER-priority leg (at 96/32 that is A->B, in leg B at IPL 3), every
+     * bucket total is WALL time -- leg A preempts inside it, so the MAX is the block that got
+     * robbed hardest and `rest` goes hugely negative.  The MIN over the print window is the
+     * block where that bucket's 16 short windows all escaped preemption, which does happen:
+     * a bucket of b us inside a 500 us block with 3 leg-A blocks escapes with probability
+     * ~(1-b/500)^3, so at ~19 blocks/s over 10 s the minimum is a clean CPU figure.  For the
+     * direction that runs in the TOP-priority leg (B->A, leg A) nothing preempts it and MAX
+     * is already CPU; the MIN is then just the least-work block and the two nearly agree.
+     */
+    uint32_t          dbg_stg_coef_min;
+    uint32_t          dbg_stg_mac_min;
+    uint32_t          dbg_stg_conv_min;
+    uint32_t          dbg_stg_ph_min;
+    uint32_t          dbg_stg_bl_min;
+    uint32_t          dbg_stg_st_min;
+    /*
+     * How often the blended coefficient row would be BYTE-IDENTICAL to the previous output
+     * frame's, i.e. (pq, wbq) unchanged.  Not an optimisation, a measurement: it sizes a memo
+     * that would skip mchp_asrc_q31_blend_row entirely on a hit, which is bit-exact by
+     * definition (same two rows, same weight -> same 30 words).  Expected to differ hugely by
+     * direction: at 96->32 the step is ~3.0 so frac barely moves and pq should almost never
+     * change; at 32->96 the step is ~1/3 so pq jumps ~42.7 of 128 every frame and never repeats.
+     */
+    uint32_t          dbg_memo_hit;
+    /*
+     * REGRESSION CHECK, and it must now read 0.  It was the proof-of-race counter for the
+     * blended-row scratch when s_ceff_q31 was ONE array shared by both engines: written by
+     * blend_row, read by row16, and at MIXED rates the two leg ISRs no longer share a
+     * priority, so leg A preempted leg B between those two calls and leg B's dot product ran
+     * against leg A's coefficient row.  It counted 4.51 per cent of A->B frames and exactly 0
+     * on B->A, matching the priority relation.  s_ceff_q31 is per-engine as of 2026-09-06, so
+     * nothing outside this engine can reach this buffer and a nonzero count means the split
+     * was undone or a third caller appeared.  The tag lives in the buffer's own extra word
+     * (ASRC_CEFF_OWNER_SLOT), stamped BEFORE blend_row -- so a preemption INSIDE the blend
+     * would be caught too -- and checked before row16.  It never proved a clean run: a
+     * preemption inside row16, which re-reads the row per channel, was never detectable, so
+     * the old 4.51 per cent was a lower bound.
+     */
+    uint32_t          dbg_ceff_steal;
+    uint32_t          dbg_memo_tot;
+    uint32_t          dbg_prev_pq;
+    int32_t           dbg_prev_wbq;
+    uint8_t           dbg_prev_valid;
+#endif
     volatile uint32_t dbg_rx_tick;          // high-res-timer count latched at the last asrc_push (producer
                                             // RX block arrival). Shipping fast-acquire (Q57/Q58 intra-block
                                             // phase at ratio-lock) + Q40 continuous-fill est (MEAS) use it.
@@ -1044,6 +1113,24 @@ static void asrc_reset( asrc_t* a )
     a->dbg_jmax          = 0u;
     a->dbg_step          = 0.0f;
     a->dbg_pull_ticks_max = 0u;
+#if APP_ASRC_STAGE_PROFILE
+    a->dbg_stg_coef_max  = 0u;
+    a->dbg_stg_mac_max   = 0u;
+    a->dbg_stg_conv_max  = 0u;
+    a->dbg_stg_ph_max    = 0u;
+    a->dbg_stg_bl_max    = 0u;
+    a->dbg_stg_st_max    = 0u;
+    a->dbg_stg_coef_min  = 0xFFFFFFFFu;
+    a->dbg_stg_mac_min   = 0xFFFFFFFFu;
+    a->dbg_stg_conv_min  = 0xFFFFFFFFu;
+    a->dbg_stg_ph_min    = 0xFFFFFFFFu;
+    a->dbg_stg_bl_min    = 0xFFFFFFFFu;
+    a->dbg_stg_st_min    = 0xFFFFFFFFu;
+    a->dbg_memo_hit      = 0u;
+    a->dbg_ceff_steal    = 0u;
+    a->dbg_memo_tot      = 0u;
+    a->dbg_prev_valid    = 0u;
+#endif
     a->dbg_guard_drops   = 0u;
     a->dbg_starve_frames = 0u;
     for( uint8_t c = 0u; c < ASRC_CH; c++ ) { a->last_out[c] = 0; }
@@ -1070,6 +1157,128 @@ static void asrc_reset( asrc_t* a )
     }
 #endif
 }
+
+/*
+ * ------------------------------------------------------------------
+ * Producer ring write -- ONE definition, shared by every int32 producer.
+ * ------------------------------------------------------------------
+ *
+ * asrc_push() and asrc_push_frames() used to carry their own copy of this loop, and the
+ * two copies had to agree bit-for-bit.  asrc_push_frames()'s own comment records what a
+ * divergence costs: values 2^-8 too small (-48.1648 dB), silently, with every build and
+ * selftest still passing.  One definition retires that whole class of bug --
+ * asrc_push_frames_selftest() still checks the equivalence, and now it is checking one
+ * function against itself.
+ *
+ * It is also where the producer's cost lives, so the loop is written for the ISR rather
+ * than for symmetry with the reader.  Three things move OUT of the per-channel body:
+ *
+ *   - The source word and its conversion.  Under the replication mapping (channel c <-
+ *     input slot c & 1) two distinct words feed all ASRC_CH channels, so the old form did
+ *     ASRC_CH loads and ASRC_CH masks per frame to produce two values.  Now two of each,
+ *     with the channel loop unrolled by two so both stores issue per iteration.
+ *   - The destination address.  `a->ch[c][idx]` is a multiply by ASRC_FIFO_PHYS per
+ *     channel; walking a pointer by that constant stride is an add.
+ *   - The mirror test.  `idx < ASRC_POLY_M` depends only on the frame, so it selects
+ *     between two loops instead of being re-evaluated ASRC_CH times per frame.
+ *
+ * Nothing about the STORED VALUES moves: the s24-left -> Q31 mask, the float scaling, the
+ * ring wrap and the mirror overhang are bit-for-bit what they were.  Measured cost of the
+ * old form at ASRC_CH=12 / APP_SLOTS_PER_FS=2 was 17 cycles per stored sample (pushAB =
+ * 16.4 us per 16-frame block), against 6 cycles for the scatter on the way out.
+ */
+static inline asrc_samp_t asrc_ring_conv( int32_t w )
+{
+#if ASRC_SAMPLE_Q31
+    // s24-left IS Q31: keep the codec word, drop only the sub-LSBs.
+    return (asrc_samp_t)(int32_t)( (uint32_t)w & 0xFFFFFF00u );
+#else
+    return (asrc_samp_t)( (float)( w >> 8 ) );   // 24-bit source slot
+#endif
+}
+
+// Channel c <- input slot (c & 1): the ordinary multi-channel profiles replicate physical
+// L/R to model a wider workload.  `p` points at this frame's first slot; `idx` is the
+// already-masked ring index.
+static inline void asrc_ring_write_replicate( asrc_t* a, const int32_t* p, uint32_t idx )
+{
+    const asrc_samp_t v0 = asrc_ring_conv( p[0] );
+    const asrc_samp_t v1 = asrc_ring_conv( p[1] );
+#if (ASRC_HISTORY_LAYOUT == ASRC_HISTORY_TILE8)
+    for( uint16_t c = 0u; c < ASRC_CH; c++ )
+    {
+        const asrc_samp_t v = ( ( c & 1u ) != 0u ) ? v1 : v0;
+        a->tile[c >> 3u][idx][c & 7u] = v;
+#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
+        if( idx < ASRC_POLY_M ) { a->tile[c >> 3u][idx + ASRC_FIFO_FRAMES][c & 7u] = v; }
+#endif
+    }
+#else
+    asrc_samp_t* d = &a->ch[0][idx];
+    uint16_t c = 0u;
+#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
+    if( idx < ASRC_POLY_M )
+    {
+        for( ; ( c + 1u ) < ASRC_CH; c += 2u )
+        {
+            d[0]                                 = v0;
+            d[ASRC_FIFO_FRAMES]                  = v0;   // mirror overhang
+            d[ASRC_FIFO_PHYS]                    = v1;
+            d[ASRC_FIFO_PHYS + ASRC_FIFO_FRAMES] = v1;
+            d += 2u * ASRC_FIFO_PHYS;
+        }
+        // An odd width leaves the LAST channel index even, so it takes slot 0.
+        if( c < ASRC_CH ) { d[0] = v0; d[ASRC_FIFO_FRAMES] = v0; }
+        return;
+    }
+#endif
+    for( ; ( c + 1u ) < ASRC_CH; c += 2u )
+    {
+        d[0]              = v0;
+        d[ASRC_FIFO_PHYS] = v1;
+        d += 2u * ASRC_FIFO_PHYS;
+    }
+    if( c < ASRC_CH ) { d[0] = v0; }
+#endif
+}
+
+#if APP_ASRC_TDM8_ONE_TO_ONE
+// Channel c <- input slot c: the explicit AK128 TDM8 profile.  Every channel has its own
+// source word, so only the addressing and the mirror test hoist out of the body.
+static inline void asrc_ring_write_direct( asrc_t* a, const int32_t* p, uint32_t idx )
+{
+#if (ASRC_HISTORY_LAYOUT == ASRC_HISTORY_TILE8)
+    for( uint16_t c = 0u; c < ASRC_CH; c++ )
+    {
+        const asrc_samp_t v = asrc_ring_conv( p[c] );
+        a->tile[c >> 3u][idx][c & 7u] = v;
+#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
+        if( idx < ASRC_POLY_M ) { a->tile[c >> 3u][idx + ASRC_FIFO_FRAMES][c & 7u] = v; }
+#endif
+    }
+#else
+    asrc_samp_t* d = &a->ch[0][idx];
+#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
+    if( idx < ASRC_POLY_M )
+    {
+        for( uint16_t c = 0u; c < ASRC_CH; c++ )
+        {
+            const asrc_samp_t v = asrc_ring_conv( p[c] );
+            d[0]                = v;
+            d[ASRC_FIFO_FRAMES] = v;   // mirror overhang
+            d += ASRC_FIFO_PHYS;
+        }
+        return;
+    }
+#endif
+    for( uint16_t c = 0u; c < ASRC_CH; c++ )
+    {
+        d[0] = asrc_ring_conv( p[c] );
+        d += ASRC_FIFO_PHYS;
+    }
+#endif
+}
+#endif  // APP_ASRC_TDM8_ONE_TO_ONE
 
 // Producer side: push this block's input frames into the per-channel rings.  The
 // ordinary multi-channel profiles replicate physical L/R (ch c <- input slot
@@ -1114,32 +1323,11 @@ static void asrc_push( asrc_t* a, const int32_t* src )
     const int32_t* p = src;
     for( uint16_t n = 0u; n < APP_BLOCK_FRAMES; n++ )
     {
-        const uint32_t idx = a->wr & ASRC_FIFO_MASK;
-        for( uint8_t c = 0u; c < ASRC_CH; c++ )
-        {
 #if APP_ASRC_TDM8_ONE_TO_ONE
-            const uint8_t slot = c;
+        asrc_ring_write_direct( a, p, a->wr & ASRC_FIFO_MASK );
 #else
-            const uint8_t slot = c & 1u;
+        asrc_ring_write_replicate( a, p, a->wr & ASRC_FIFO_MASK );
 #endif
-#if ASRC_SAMPLE_Q31
-            // s24-left IS Q31: keep the codec word, drop only the sub-LSBs.
-            const asrc_samp_t v = (int32_t)( (uint32_t)p[slot] & 0xFFFFFF00u );
-#else
-            const asrc_samp_t v = (float)( p[slot] >> 8 );   // 24-bit source slot
-#endif
-#if (ASRC_HISTORY_LAYOUT == ASRC_HISTORY_TILE8)
-            a->tile[c >> 3u][idx][c & 7u] = v;
-#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
-            if( idx < ASRC_POLY_M ) { a->tile[c >> 3u][idx + ASRC_FIFO_FRAMES][c & 7u] = v; }
-#endif
-#else
-            a->ch[c][idx] = v;
-#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
-            if( idx < ASRC_POLY_M ) { a->ch[c][idx + ASRC_FIFO_FRAMES] = v; }   // mirror overhang
-#endif
-#endif
-        }
         a->wr++;   // overflow guard lives in the consumer now (see the rd declaration)
         p += APP_SLOTS_PER_FS;
     }
@@ -1286,37 +1474,62 @@ static void asrc_push_frames( asrc_t* a, const int32_t* src,
     a->dbg_rx_tick = nora_high_res_timer_get_count();
     a->prod_frames = 1u;   // charge a consumer-side discard to dbg_intermediate_overflow
     const int32_t* p = src;
+    /* The amplitude representation MUST match asrc_push()'s exactly: the two producers write
+     * the same ring and a mismatch is silent (values 2^-8 too small, = -48.1648 dB, with every
+     * build/selftest still passing).  That is why the write itself is now the SHARED
+     * asrc_ring_write_replicate() rather than a second copy of it; asrc_push_frames_selftest()
+     * below still checks the equivalence.  This producer has no TDM8 one-to-one arm -- its
+     * source is always the stereo intermediate stream. */
     for( size_t n = 0u; n < frames; n++ )
     {
-        const uint32_t idx = a->wr & ASRC_FIFO_MASK;
-        for( uint8_t c = 0u; c < ASRC_CH; c++ )
-        {
-            /* Amplitude representation MUST match asrc_push()'s Q31 arm exactly: the two
-             * producers write the same ring and a mismatch is silent (values 2^-8 too small,
-             * = -48.1648 dB, with every build/selftest still passing).  Bit-exact equivalence
-             * is enforced by asrc_push_frames_selftest() below. */
-#if ASRC_SAMPLE_Q31
-            // s24-left IS Q31: keep the codec word, drop only the sub-LSBs.
-            const asrc_samp_t v = (int32_t)( (uint32_t)p[c & 1u] & 0xFFFFFF00u );
-#else
-            const asrc_samp_t v = (float)( p[c & 1u] >> 8 );
-#endif
-#if (ASRC_HISTORY_LAYOUT == ASRC_HISTORY_TILE8)
-            a->tile[c >> 3u][idx][c & 7u] = v;
-#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
-            if( idx < ASRC_POLY_M ) { a->tile[c >> 3u][idx + ASRC_FIFO_FRAMES][c & 7u] = v; }
-#endif
-#else
-            a->ch[c][idx] = v;
-#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
-            if( idx < ASRC_POLY_M ) { a->ch[c][idx + ASRC_FIFO_FRAMES] = v; }
-#endif
-#endif
-        }
+        asrc_ring_write_replicate( a, p, a->wr & ASRC_FIFO_MASK );
         a->wr++;   // overflow guard lives in the consumer now (see the rd declaration)
         p += stride;
     }
 }
+
+#if APP_ASRC_FULL_IIR_48_TO_32
+/* Producer for a stage that has ALREADY produced the ring's own float representation:
+ * one block of APP_BLOCK_FRAMES frames, channel-major, `ch_stride` floats apart, values
+ * in 24-bit counts.  It is a THIRD producer beside asrc_push() and asrc_push_frames(),
+ * and the reason it exists is that the Full-IIR stage is a float filter feeding a float
+ * ring: routing it through the int32 interface would insert a 24-bit requantisation and
+ * a clip point that the host qualification does not have, in the one place the peak is
+ * above full scale.
+ *
+ * Frame accounting matches asrc_push(), NOT asrc_push_frames(): the stage does not
+ * resample, so a whole block goes in and prod_frames stays 0 (a consumer-side discard
+ * is charged to dbg_guard_drops, the direct path's counter, not to the front end's
+ * intermediate-overflow counter).
+ *
+ * Amplitude representation is asrc_push()'s float arm, quoted: (float)(word >> 8).  The
+ * caller converts; this writer must not scale.  The mismatch this mirrors cost -48 dB
+ * once with every selftest still passing -- see asrc_push_frames_selftest().
+ */
+static void asrc_push_block_f32( asrc_t* a, const float* src, uint32_t ch_stride,
+                                uint32_t frames, uint8_t from_frontend )
+{
+    a->dbg_rx_tick = nora_high_res_timer_get_count();
+    /* Attribution only: 1 = a front end fed this block (charge a consumer-side discard to
+     * dbg_intermediate_overflow), 0 = raw TDM block, as before. */
+    a->prod_frames = from_frontend;
+    const uint32_t wr = a->wr;
+    for( uint32_t c = 0u; c < ASRC_CH; c++ )
+    {
+        const float* p = &src[ c * ch_stride ];
+        for( uint32_t n = 0u; n < frames; n++ )
+        {
+            const uint32_t idx = ( wr + n ) & ASRC_FIFO_MASK;
+            const asrc_samp_t v = p[n];
+            a->ch[c][idx] = v;
+#if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
+            if( idx < ASRC_POLY_M ) { a->ch[c][idx + ASRC_FIFO_FRAMES] = v; }   // mirror overhang
+#endif
+        }
+    }
+    a->wr = wr + frames;   // published last, as in asrc_push()
+}
+#endif /* APP_ASRC_FULL_IIR_48_TO_32 */
 
 #if (ASRC_HISTORY_LAYOUT != ASRC_HISTORY_TILE8)
 /* Regression guard for the defect this selftest was written after: asrc_push_frames() carried
@@ -2354,7 +2567,26 @@ float audio_app_asrc_get_alpha_mult( void ) { return q30_alpha_mult_of( s_q30_al
 // On underrun emit silence and hold the read phase until the FIFO refills.
 static void asrc_pull( asrc_t* a, int32_t* dst )
 {
+#if ASRC_SAMPLE_Q31
+    /*
+     * This engine's own blended-row scratch (asrc_poly_q31.inc).  Resolved once per pull
+     * rather than per frame, and by comparison instead of pointer arithmetic: sizeof(asrc_t)
+     * is not a power of two, so `a - &s_asrc[0]` would put a division in the block.  Both
+     * arms are compile-time addresses, so this is a compare and a select.
+     */
+#if APP_B_ROUTE_USES_BA
+    int32_t* const ceff = ( a == &s_asrc[ASRC_ENGINE_BA] ) ? s_ceff_q31[ASRC_ENGINE_BA]
+                                                           : s_ceff_q31[ASRC_ENGINE_AB];
+#else
+    int32_t* const ceff = s_ceff_q31[ASRC_ENGINE_AB];
+#endif
+#endif
     const uint32_t t0_cnt = nora_high_res_timer_get_count();   // telemetry: time this pull
+#if APP_ASRC_STAGE_PROFILE
+    // Block-local stage totals; peak-held into a->dbg_stg_*_max at the end of this pull.
+    uint32_t stg_coef = 0u, stg_mac = 0u, stg_conv = 0u;
+    uint32_t stg_ph = 0u, stg_bl = 0u, stg_st = 0u;
+#endif
 
 #if APP_ASRC_MEAS
     // R12 Q12: intentional FF-ratio freeze -- controller uses the latched ratio, but a->ratio keeps
@@ -2851,6 +3083,26 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
         }
     }
 #endif
+    /*
+     * CANDIDATE 4 (APP_ASRC_Q31_HOIST_RDFRAC): keep the consumer read cursor and read phase in
+     * LOCALS for the whole block instead of in the engine struct.  ASRC_RD_ / ASRC_FRAC_ are the
+     * only names the POLY frame body uses for these two words, so the two arms cannot drift:
+     * with the switch off they expand to the struct members and the generated code is unchanged.
+     * The arithmetic is bit-identical either way -- same float32 additions, same repeated
+     * `- 1.0f`, same order, same values; only WHERE the two words live between output frames
+     * changes.  Written back once, immediately after the loop.
+     *
+     * a->wr stays a memory read on purpose: the producer ISR updates it mid-block.
+     */
+#if APP_ASRC_Q31_HOIST_RDFRAC
+    uint32_t rd_hoist   = a->rd;
+    float    frac_hoist = a->frac;
+#define ASRC_RD_    rd_hoist
+#define ASRC_FRAC_  frac_hoist
+#else
+#define ASRC_RD_    a->rd
+#define ASRC_FRAC_  a->frac
+#endif
     for( uint16_t n = 0u; n < APP_BLOCK_FRAMES; n++ )
     {
 #if (APP_ASRC_INTERP == ASRC_INTERP_POLY) && \
@@ -3059,7 +3311,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
         int32_t out[ASRC_CH];
         for( uint8_t c = 0u; c < ASRC_CH; c++ ) { out[c] = 0; }
 #if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
-        if( ( a->wr - a->rd ) >= ( ASRC_POLY_AHEAD + 1u ) )   // rd-MH .. rd+AHEAD window available
+        if( ( a->wr - ASRC_RD_ ) >= ( ASRC_POLY_AHEAD + 1u ) )   // rd-MH .. rd+AHEAD window available
         {
 #if (ASRC_POLY_METHOD == ASRC_POLY_Q31)
             /* One blended coefficient row per OUTPUT FRAME, shared by all 16
@@ -3067,23 +3319,119 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
              * d, no union window -- so, unlike the float pair path, this costs
              * the same at step == 1 and at step != 1.  The mask on out[] is the
              * s24-left store; sacr.l already rounded and saturated. */
+#if APP_ASRC_STAGE_PROFILE
+            const uint32_t stg_t0 = nora_high_res_timer_get_count();
+#endif
             float          wb;
-            const uint32_t pq    = asrc_q31_phase_of( a->frac, &wb );
-            const uint32_t wbase = ( a->rd - ASRC_POLY_MH ) & ASRC_FIFO_MASK;
+            const uint32_t pq    = asrc_q31_phase_of( ASRC_FRAC_, &wb );
+            const uint32_t wbase = ( ASRC_RD_ - ASRC_POLY_MH ) & ASRC_FIFO_MASK;
+#if APP_ASRC_STAGE_PROFILE
+            /*
+             * wb -> Q31 hoisted so the probe can land between the phase/weight bookkeeping
+             * and the row blend.  Hoisted UNDER THE GATE ONLY: doing it unconditionally would
+             * change the APP_ASRC_STAGE_PROFILE=0 image, and that image is the one every
+             * absolute deadline figure (E1) came from.  Same value, same order -- the
+             * arithmetic is untouched either way.
+             */
+            const int32_t  wbq_p   = asrc_q31_wb( wb );
+            /* Counted BEFORE the probe so it is charged to `rest`, not to `ph`. */
+            a->dbg_memo_tot++;
+            if( a->dbg_prev_valid && ( pq == a->dbg_prev_pq ) && ( wbq_p == a->dbg_prev_wbq ) )
+            {
+                a->dbg_memo_hit++;
+            }
+            a->dbg_prev_pq    = pq;
+            a->dbg_prev_wbq   = wbq_p;
+            a->dbg_prev_valid = 1u;
+            const uint32_t stg_t0b = nora_high_res_timer_get_count();
+            ( (volatile int32_t*)ceff )[ASRC_CEFF_OWNER_SLOT] = (int32_t)(uintptr_t)a;
             mchp_asrc_q31_blend_row( ASRC_POLY_Q31_ROW( pq ),
                                      ASRC_POLY_Q31_ROW( pq + 1u ),
-                                     s_ceff_q31, ASRC_POLY_M, asrc_q31_wb( wb ) );
+                                     ceff, ASRC_POLY_M, wbq_p );
+#elif APP_ASRC_Q31_OPT_KERNELS
+            /*
+             * ONE IMAGE, FOUR PATHS (`*au 00`..`*au 03`, one bit per candidate).  The
+             * test-and-branch is paid by BOTH arms once per output frame, so it cancels
+             * in the difference apart from the branch itself, and what it does not
+             * cancel it charges to the optimised arm -- the conservative direction for
+             * a GO decision.
+             */
+            if( ( s_q31_opt & ASRC_Q31_OPT_BIT_BLEND ) != 0u )
+            {
+                mchp_asrc_q31_blend_row_opt( ASRC_POLY_Q31_ROW( pq ),
+                                             ASRC_POLY_Q31_ROW( pq + 1u ),
+                                             ceff, ASRC_POLY_M, asrc_q31_wb( wb ) );
+            }
+            else
+            {
+                mchp_asrc_q31_blend_row( ASRC_POLY_Q31_ROW( pq ),
+                                         ASRC_POLY_Q31_ROW( pq + 1u ),
+                                         ceff, ASRC_POLY_M, asrc_q31_wb( wb ) );
+            }
+#else
+            mchp_asrc_q31_blend_row( ASRC_POLY_Q31_ROW( pq ),
+                                     ASRC_POLY_Q31_ROW( pq + 1u ),
+                                     ceff, ASRC_POLY_M, asrc_q31_wb( wb ) );
+#endif
+#if APP_ASRC_STAGE_PROFILE
+            const uint32_t stg_t1 = nora_high_res_timer_get_count();
+#endif
+#if APP_ASRC_STAGE_PROFILE
+            if( ( (volatile int32_t*)ceff )[ASRC_CEFF_OWNER_SLOT] != (int32_t)(uintptr_t)a )
+            {
+                a->dbg_ceff_steal++;
+            }
+#endif
+#if APP_ASRC_Q31_OPT_KERNELS
+            if( ( s_q31_opt & ASRC_Q31_OPT_BIT_ROW16 ) != 0u )
+            {
+                /*
+                 * The s24-left mask is folded into this kernel's store, so the
+                 * conversion loop MUST NOT run for this arm.  Running it would be
+                 * arithmetically harmless -- the mask is idempotent -- but it would
+                 * leave the cost being measured inside the measurement, which is the
+                 * one mistake that cannot be spotted afterwards in the numbers.
+                 */
+                mchp_asrc_q31_row16_opt( &a->ch[0][wbase],
+                                         (uint32_t)( ASRC_FIFO_PHYS * sizeof( asrc_samp_t ) ),
+                                         ceff, ASRC_POLY_M, out, ASRC_CH );
+            }
+            else
+            {
+                mchp_asrc_q31_row16( &a->ch[0][wbase],
+                                     (uint32_t)( ASRC_FIFO_PHYS * sizeof( asrc_samp_t ) ),
+                                     ceff, ASRC_POLY_M, out, ASRC_CH );
+                for( uint8_t c = 0u; c < ASRC_CH; c++ )
+                {
+                    out[c] = asrc_q31_to_slot( out[c] );
+                }
+            }
+#else
             mchp_asrc_q31_row16( &a->ch[0][wbase],
                                  (uint32_t)( ASRC_FIFO_PHYS * sizeof( asrc_samp_t ) ),
-                                 s_ceff_q31, ASRC_POLY_M, out, ASRC_CH );
+                                 ceff, ASRC_POLY_M, out, ASRC_CH );
+#if APP_ASRC_STAGE_PROFILE
+            const uint32_t stg_t2 = nora_high_res_timer_get_count();
+#endif
             for( uint8_t c = 0u; c < ASRC_CH; c++ )
             {
                 out[c] = asrc_q31_to_slot( out[c] );
             }
+#endif
+#if APP_ASRC_STAGE_PROFILE
+            {
+                const uint32_t stg_t3 = nora_high_res_timer_get_count();
+                stg_coef += ( stg_t1 - stg_t0 );
+                stg_ph   += ( stg_t0b - stg_t0 );
+                stg_bl   += ( stg_t1 - stg_t0b );
+                stg_mac  += ( stg_t2 - stg_t1 );
+                stg_conv += ( stg_t3 - stg_t2 );
+            }
+#endif
 #elif (ASRC_POLY_METHOD == ASRC_POLY_CEFF)
             float    c_eff[ASRC_POLY_M];
             uint32_t wbase;
-            asrc_poly_phase_ceff( a->rd, a->frac, &wbase, c_eff );   // blend coeff ONCE, shared
+            asrc_poly_phase_ceff( ASRC_RD_, ASRC_FRAC_, &wbase, c_eff );   // blend coeff ONCE, shared
             for( uint8_t c = 0u; c < ASRC_CH; c++ )
             {
                 float acc;
@@ -3109,7 +3457,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #error "ASRC_POLY_DUAL4X requires ASRC_CH multiple of 4"
 #endif
             asrc_phase_t ph;
-            asrc_poly_phase( a->rd, a->frac, &ph );   // c0/c1/wb/wbase shared by all channels
+            asrc_poly_phase( ASRC_RD_, ASRC_FRAC_, &ph );   // c0/c1/wb/wbase shared by all channels
             for( uint8_t c = 0u; c < ASRC_CH; c += 4u )   // coeff loaded once per 4-channel group
             {
                 float o8[8];
@@ -3150,7 +3498,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #error "ASRC_POLY_DUAL8X requires ASRC_CH multiple of 8"
 #endif
             asrc_phase_t ph;
-            asrc_poly_phase( a->rd, a->frac, &ph );
+            asrc_poly_phase( ASRC_RD_, ASRC_FRAC_, &ph );
             for( uint8_t c = 0u; c < ASRC_CH; c += 8u )
             {
                 float o16[16];
@@ -3196,7 +3544,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #endif
             const float* coeff;
             uint32_t     wbase;
-            asrc_poly_phase_nearest( a->rd, a->frac, &coeff, &wbase );
+            asrc_poly_phase_nearest( ASRC_RD_, ASRC_FRAC_, &coeff, &wbase );
             for( uint8_t c = 0u; c < ASRC_CH; c += 8u )
             {
                 float o8[8];
@@ -3241,7 +3589,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #error "ASRC_HISTORY_TILE8 currently supports ASRC_STREAM8_BASE only"
 #endif
             asrc_phase_t ph;
-            asrc_poly_phase( a->rd, a->frac, &ph );   // c0/c1/wb/wbase shared by all channels
+            asrc_poly_phase( ASRC_RD_, ASRC_FRAC_, &ph );   // c0/c1/wb/wbase shared by all channels
             for( uint8_t c = 0u; c < ASRC_CH; c += 8u ) // ce blended once/tap, fanned to 8 ch
             {
                 float o8[8];
@@ -3293,7 +3641,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #error "ASRC_POLY_DUAL2X requires an even ASRC_CH"
 #endif
             asrc_phase_t ph;
-            asrc_poly_phase( a->rd, a->frac, &ph );   // c0/c1/wb/wbase shared by all channels
+            asrc_poly_phase( ASRC_RD_, ASRC_FRAC_, &ph );   // c0/c1/wb/wbase shared by all channels
             for( uint8_t c = 0u; c < ASRC_CH; c += 2u )   // coeff loaded once per channel PAIR
             {
                 float o4[4];
@@ -3319,7 +3667,7 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #endif
 #else  // ASRC_POLY_DUAL
             asrc_phase_t ph;
-            asrc_poly_phase( a->rd, a->frac, &ph );   // phase calc ONCE, shared by all channels
+            asrc_poly_phase( ASRC_RD_, ASRC_FRAC_, &ph );   // phase calc ONCE, shared by all channels
             for( uint8_t c = 0u; c < ASRC_CH; c++ )
             {
                 out[c] = asrc_to_slot( asrc_poly_at( a->ch[c], &ph ) );
@@ -3340,11 +3688,11 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
             }
 #endif
 #endif  // ASRC_POLY_METHOD
-            a->frac += step;
-            while( a->frac >= 1.0f )
+            ASRC_FRAC_ += step;
+            while( ASRC_FRAC_ >= 1.0f )
             {
-                a->frac -= 1.0f;
-                a->rd++;
+                ASRC_FRAC_ -= 1.0f;
+                ASRC_RD_++;
             }
         }
         else
@@ -3419,6 +3767,9 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
 #endif
         }
 #endif
+#if APP_ASRC_STAGE_PROFILE
+        const uint32_t stg_t4 = nora_high_res_timer_get_count();
+#endif
 #if APP_ASRC_MEAS
         // Q50 ACQUIRE: mute the output while the fast-acquire transient settles (audio comes up clean
         // only at HANDOVER->TRACK). Servo/FIFO advance normally above; only the emitted slots are zeroed.
@@ -3433,8 +3784,17 @@ static void asrc_pull( asrc_t* a, int32_t* dst )
             d[s] = ( s < ASRC_CH ) ? out[s] : 0; // ch0/ch1 = real L/R; extra ch -> extra slots
         }
 #endif
+#if APP_ASRC_STAGE_PROFILE
+        stg_st += ( nora_high_res_timer_get_count() - stg_t4 );
+#endif
         d += APP_SLOTS_PER_FS;
     }
+#if APP_ASRC_Q31_HOIST_RDFRAC
+    a->rd   = rd_hoist;
+    a->frac = frac_hoist;
+#endif
+#undef ASRC_RD_
+#undef ASRC_FRAC_
 
     /*
      * Carry the frame just emitted so a starve on frame 0 of the NEXT pull can hold it.
@@ -3469,6 +3829,23 @@ asrc_output_done:
         const uint32_t elapsed_ticks = nora_high_res_timer_get_count() - t0_cnt;
         if( elapsed_ticks > a->dbg_pull_ticks_max ) { a->dbg_pull_ticks_max = elapsed_ticks; }
     }
+#if APP_ASRC_STAGE_PROFILE
+    // Peak-hold the three BLOCK TOTALS independently. They can therefore come from three
+    // different blocks, which is the right conservative reading for an optimisation estimate
+    // and the reason their sum may slightly exceed any single pull.
+    if( stg_coef > a->dbg_stg_coef_max ) { a->dbg_stg_coef_max = stg_coef; }
+    if( stg_mac  > a->dbg_stg_mac_max  ) { a->dbg_stg_mac_max  = stg_mac;  }
+    if( stg_conv > a->dbg_stg_conv_max ) { a->dbg_stg_conv_max = stg_conv; }
+    if( stg_ph   > a->dbg_stg_ph_max   ) { a->dbg_stg_ph_max   = stg_ph;   }
+    if( stg_bl   > a->dbg_stg_bl_max   ) { a->dbg_stg_bl_max   = stg_bl;   }
+    if( stg_st   > a->dbg_stg_st_max   ) { a->dbg_stg_st_max   = stg_st;   }
+    if( stg_coef < a->dbg_stg_coef_min ) { a->dbg_stg_coef_min = stg_coef; }
+    if( stg_mac  < a->dbg_stg_mac_min  ) { a->dbg_stg_mac_min  = stg_mac;  }
+    if( stg_conv < a->dbg_stg_conv_min ) { a->dbg_stg_conv_min = stg_conv; }
+    if( stg_ph   < a->dbg_stg_ph_min   ) { a->dbg_stg_ph_min   = stg_ph;   }
+    if( stg_bl   < a->dbg_stg_bl_min   ) { a->dbg_stg_bl_min   = stg_bl;   }
+    if( stg_st   < a->dbg_stg_st_min   ) { a->dbg_stg_st_min   = stg_st;   }
+#endif
 }
 
 
@@ -3488,13 +3865,21 @@ void audio_app_asrc_reset_all( void )
         if( !arm_line_done )
         {
             arm_line_done = 1u;
-            printf( " ASRC build: sample arm=%s poly=%d frontend=%s meas=%s\n",
+            printf( " ASRC build: sample arm=%s poly=%d coeff=%s frontend=%s meas=%s\n",
 #if ASRC_SAMPLE_Q31
                     "Q31",
 #else
                     "float",
 #endif
                     (int)ASRC_POLY_METHOD,
+                    // Which table is actually resident, so the board says it rather than
+                    // the reader inferring it from the preset.  The two arms have separate
+                    // knobs: ASRC_Q31_COEFF_STORAGE (default RAM) and ASRC_COEFF_STORAGE.
+#if ASRC_SAMPLE_Q31
+                    ASRC_POLY_Q31_STORAGE_NAME,
+#else
+                    ( ASRC_COEFF_STORAGE == ASRC_COEFF_STORAGE_FLASH ) ? "flash" : "ram",
+#endif
 #if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
                     "runtime-decimator",
 #else
@@ -3507,21 +3892,55 @@ void audio_app_asrc_reset_all( void )
 #endif
         }
     }
+    /* PUSH SELFTESTS: BOOT-TIME ONLY, AND THE GATE SAYS SO STRUCTURALLY.
+     *
+     * Both tests below use s_asrc[ASRC_ENGINE_AB] as their scratch, and
+     * asrc_push_frames_selftest() does not merely borrow it -- it drives the real engine
+     * (writes a->wr / a->rd / a->ratio, pushes into the live ring, then zero-clears all
+     * ASRC_CH channels).  That is only safe before any audio ISR has run.
+     *
+     * This function is not boot-only: the boot sequence calls it twice, a console `*ar` rate
+     * re-commit re-enters it via asrc_transport_reset(), and `*as 07` calls it directly.  On
+     * the `*ar` path leg A keeps streaming (it carries the AB push and the whole BA pull), so
+     * running these here would zero a live ring under the pull ISR.  Giving them dedicated
+     * scratch is not affordable: a second asrc_t is ~26 KB.  So they are gated -- and gated
+     * on "has an audio ISR ever executed", not on "is this the first call", because a call
+     * count is only the same guard by accident and stops being one the moment the boot
+     * sequence gains a third reset.
+     *
+     * The skip is PRINTED, not silent: a capture log must never be ambiguous about whether a
+     * selftest passed or never ran.  (The Q31 poly selftest below needs no gate -- since
+     * 2026-09-06 it owns its scratch outright.) */
+    if( !asrc_audio_path_isr_has_started() )
+    {
 #if ASRC_HAVE_FIXED_PUSH_BLOCK16
-    asrc_push_block_selftest();
+        asrc_push_block_selftest();
 #endif
 #if ( APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8 ) && \
     ( ASRC_HISTORY_LAYOUT != ASRC_HISTORY_TILE8 )
-    // Borrows s_asrc[AB].ch as scratch, like the Q31 poly selftest below; the reset
-    // at the end of this function clears it.
-    asrc_push_frames_selftest();
+        asrc_push_frames_selftest();
 #endif
+    }
+    else
+    {
+#if ASRC_HAVE_FIXED_PUSH_BLOCK16
+        printf( " ASRC push16/stereo + push8/TDM selftest: skipped"
+                " (runtime reset -- audio ISRs already live)\n" );
+#endif
+#if ( APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8 ) && \
+    ( ASRC_HISTORY_LAYOUT != ASRC_HISTORY_TILE8 )
+        printf( " ASRC push_frames selftest: skipped"
+                " (runtime reset -- audio ISRs already live)\n" );
+#endif
+    }
 #if (APP_ASRC_INTERP == ASRC_INTERP_POLY)
 #if ASRC_SAMPLE_Q31
     asrc_poly_build_q31();      // one-time: generate the Q31 polyphase table (app context)
 #if APP_ASRC_Q31_SELFTEST
-    // Runs BEFORE asrc_reset(): it borrows s_asrc[AB].ch as 16-channel scratch and
-    // the reset below clears it.  Failures are latched in s_poly_q31_fail.
+    // Owns its scratch: since 2026-09-06 it uses neither s_asrc[AB].ch nor any s_ceff_q31
+    // row, so it is safe here even though this function also runs with the audio ISRs live
+    // (second boot call, and `*as 07`).  Sharing them is what made the second run FAIL
+    // intermittently.  Failures are latched in s_poly_q31_fail.
     s_poly_q31_fails = asrc_poly_q31_selftest();
     // `ties` is the count of sacr.l rounding ties (exactly +-256 in LSB24 terms)
     // between the assembly kernels and the portable C reference.  A tie is not a
@@ -3538,6 +3957,32 @@ void audio_app_asrc_reset_all( void )
                 f->what, (unsigned long)f->vec, (unsigned long)f->idx,
                 (long)f->got, (long)f->expect );
     }
+#endif
+#if APP_ASRC_Q31_OPT_KERNELS
+    /* The A/B measurement is only meaningful if the fast pair computes the SAME samples,
+     * so prove it here rather than assume it.  Own local scratch (no engine, no s_ceff_q31
+     * row), so this needs no boot-time gate and re-proves on every `*ar` re-commit. */
+    s_q31_opt_fails = asrc_q31_opt_selftest();
+    printf( " ASRC Q31 opt-kernel bit-exactness selftest: %s (%lu cases, blend fails %lu,"
+            " row16 fails %lu, of which nch %lu)\n",
+            ( s_q31_opt_fails == 0u ) ? "pass" : "FAIL",
+            (unsigned long)s_q31_opt_cases,
+            (unsigned long)s_q31_opt_blend_fails,
+            (unsigned long)s_q31_opt_row16_fails,
+            (unsigned long)s_q31_opt_nch_fails );
+    if( s_q31_opt_fails != 0u )
+    {
+        printf( "  %s: case %lu idx %lu got %ld want %ld\n",
+                s_q31_opt_fail.what, (unsigned long)s_q31_opt_fail.caze,
+                (unsigned long)s_q31_opt_fail.idx,
+                (long)s_q31_opt_fail.got, (long)s_q31_opt_fail.expect );
+    }
+    /* Selectable = proven, per candidate: one bad kernel must not block pricing the
+     * other, and a delta between two DIFFERENT filters must never be measurable. */
+    printf( "  selectable: blend=%s row16=%s (`*au SS`, SS = bitmask)\n",
+            ( ( s_q31_opt_allow & ASRC_Q31_OPT_BIT_BLEND ) != 0u ) ? "yes" : "REFUSED",
+            ( ( s_q31_opt_allow & ASRC_Q31_OPT_BIT_ROW16 ) != 0u ) ? "yes" : "REFUSED" );
+    s_q31_opt = (uint8_t)( s_q31_opt & s_q31_opt_allow );
 #endif
 #else
     asrc_poly_build();          // one-time: generate the polyphase table (guarded, app context)
@@ -3710,6 +4155,24 @@ void audio_app_asrc_set_load_mult( uint8_t mult )
     s_load_mult = mult;
 }
 uint8_t audio_app_asrc_get_load_mult( void ) { return s_load_mult; }
+#endif
+
+#if APP_ASRC_Q31_OPT_KERNELS
+/*
+ * Kernel-pair select for the A/B measurement (`*au 00` baseline, `*au 01` optimised).
+ * No reset, no gate, no ratio disturbance: both pairs produce identical samples, proven
+ * at boot by asrc_q31_opt_selftest(), so a switch mid-stream is inaudible and the two
+ * arms can be timed minutes apart in the same running image.
+ */
+void audio_app_asrc_q31_opt_set( uint8_t mask )
+{
+    /* Drop bits the selftest did not prove.  The console refuses them with a message
+     * first; this is the backstop that makes the refusal structural. */
+    s_q31_opt = (uint8_t)( mask & s_q31_opt_allow & ASRC_Q31_OPT_BIT_ALL );
+}
+uint8_t audio_app_asrc_q31_opt_get( void )    { return s_q31_opt; }
+uint8_t audio_app_asrc_q31_opt_allow( void )  { return s_q31_opt_allow; }
+uint32_t audio_app_asrc_q31_opt_fails( void ) { return s_q31_opt_fails; }
 #endif
 
 #if APP_ASRC_MEAS
@@ -3947,6 +4410,17 @@ float   audio_app_asrc_get_step_state_ab( void )       { return s_asrc[ASRC_ENGI
 
 void audio_app_asrc_push_ab( const int32_t* src ) { asrc_push( &s_asrc[ASRC_ENGINE_AB], src ); }
 void audio_app_asrc_pull_ab( int32_t* dst )       { asrc_pull( &s_asrc[ASRC_ENGINE_AB], dst ); }
+#if APP_ASRC_FULL_IIR_48_TO_32
+void audio_app_asrc_push_ab_block_f32( const float* src, uint32_t ch_stride,
+                                      uint32_t frames, uint8_t from_frontend )
+{
+    if( ( src != NULL ) && ( ch_stride >= (uint32_t)APP_BLOCK_FRAMES ) &&
+        ( frames > 0u ) && ( frames <= ch_stride ) )
+    {
+        asrc_push_block_f32( &s_asrc[ASRC_ENGINE_AB], src, ch_stride, frames, from_frontend );
+    }
+}
+#endif
 #if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
 void audio_app_asrc_push_ab_frames( const int32_t* src, size_t frames, size_t stride )
 {
@@ -4067,6 +4541,16 @@ static void asrc_dbg_print_frontend_field( uint32_t num, uint32_t den, const cha
 // all of them -- a build with no front-end capability at all reports `fe=direct`.
 static void asrc_dbg_print_frontend_ab( void )
 {
+#if APP_ASRC_FULL_IIR_48_TO_32
+    /* The trial stage's ratio IS 1/1, so the shared field would print `fe=direct` -- true about
+     * the resampling ratio and a lie about the anti-alias stage, which is exactly the confusion
+     * that makes a log unreadable months later. Name it instead. */
+    if( asrc_full_iir_48_to_32_armed() )
+    {
+        printf(" fe=iir6@48k\n");
+        return;
+    }
+#endif
     // Only the runtime selector has more than one coefficient set per divider, so only it can
     // produce a non-empty tag; the fixed presets are unambiguous by construction.
 #if APP_ASRC_RUNTIME_48K_TO_8
@@ -4112,13 +4596,130 @@ static void asrc_dbg_print_frontend_ba( void )
 // Telemetry line(s), printed with the 2 s TDM report. fsA_hz/fsB_hz are the measured
 // per-domain block rates (from main.c's block-count deltas). Prints fill, resample step,
 // and peak asrc_pull time per direction; clears the peak for the next window.
+#if APP_ASRC_STAGE_PROFILE
+/*
+ * One extra line per direction with the per-stage BLOCK TOTALS (see APP_ASRC_STAGE_PROFILE in
+ * asrc_app_config.h).  The buckets, in the order the pull executes them:
+ *
+ *   ph    asrc_q31_phase_of + wbase + wb->Q31          phase/ratio bookkeeping
+ *   bl    mchp_asrc_q31_blend_row                      one 30-tap row blended per FRAME
+ *   mac   mchp_asrc_q31_row16                          one 30-tap dot per CHANNEL
+ *   conv  asrc_q31_to_slot over ASRC_CH                output mask/saturate
+ *   st    d[s] = (s<ASRC_CH) ? out[s] : 0              scatter into the TDM slot frame
+ *   coef  ph + bl, kept only so this line stays comparable with the E1-era reports
+ *
+ * `rest` is what pull costs on top of ph+bl+mac+conv+st: out[] init, the ring-window test,
+ * frac/rd advance, the servo/telemetry tail and the loop itself -- plus this instrumentation's
+ * own SEVEN timer reads per output frame (four before F1).  So `rest` is an upper bound on the
+ * real remainder, and absolute deadline figures must come from a APP_ASRC_STAGE_PROFILE=0
+ * image.  The instrument's own cost is not guessed: it is pull(profile) - pull(profile=0) for
+ * the same defines, which is why both images get flashed.
+ *
+ * Each bucket is peak-held INDEPENDENTLY, so they can come from different blocks; that is the
+ * conservative reading for an optimisation estimate, and the reason their sum may exceed any
+ * single pull and `rest` may go negative.  Printed signed rather than clamped, because a
+ * clamped 0 would hide exactly that.
+ */
+static void asrc_dbg_print_stage_profile( const char* dir, uint8_t engine, uint32_t pull_ticks )
+{
+    const uint32_t coef = s_asrc[engine].dbg_stg_coef_max;
+    const uint32_t mac  = s_asrc[engine].dbg_stg_mac_max;
+    const uint32_t conv = s_asrc[engine].dbg_stg_conv_max;
+    const uint32_t ph   = s_asrc[engine].dbg_stg_ph_max;
+    const uint32_t bl   = s_asrc[engine].dbg_stg_bl_max;
+    const uint32_t st   = s_asrc[engine].dbg_stg_st_max;
+    const uint32_t c10  = nora_high_res_timer_count_to_us_x10( coef );
+    const uint32_t m10  = nora_high_res_timer_count_to_us_x10( mac );
+    const uint32_t v10  = nora_high_res_timer_count_to_us_x10( conv );
+    const uint32_t p10  = nora_high_res_timer_count_to_us_x10( ph );
+    const uint32_t b10  = nora_high_res_timer_count_to_us_x10( bl );
+    const uint32_t s10  = nora_high_res_timer_count_to_us_x10( st );
+    const int32_t  r10  = (int32_t)nora_high_res_timer_count_to_us_x10( pull_ticks )
+                        - (int32_t)( p10 + b10 + m10 + v10 + s10 );
+    printf("[stg x%uch]%s coef=%lu.%luus (ph=%lu.%luus bl=%lu.%luus) mac=%lu.%luus"
+           " conv=%lu.%luus st=%lu.%luus rest=%s%ld.%ldus\n",
+           (unsigned)ASRC_CH, dir,
+           (unsigned long)(c10 / 10u), (unsigned long)(c10 % 10u),
+           (unsigned long)(p10 / 10u), (unsigned long)(p10 % 10u),
+           (unsigned long)(b10 / 10u), (unsigned long)(b10 % 10u),
+           (unsigned long)(m10 / 10u), (unsigned long)(m10 % 10u),
+           (unsigned long)(v10 / 10u), (unsigned long)(v10 % 10u),
+           (unsigned long)(s10 / 10u), (unsigned long)(s10 % 10u),
+           ( r10 < 0 ) ? "-" : "",
+           (long)( ( ( r10 < 0 ) ? -r10 : r10 ) / 10 ),
+           (long)( ( ( r10 < 0 ) ? -r10 : r10 ) % 10 ));
+    s_asrc[engine].dbg_stg_coef_max = 0u;
+    s_asrc[engine].dbg_stg_mac_max  = 0u;
+    s_asrc[engine].dbg_stg_conv_max = 0u;
+    /*
+     * Second line: the MIN-held totals, i.e. the block in which each bucket escaped leg-A
+     * preemption.  For a pull that runs in the lower-priority leg this is the only CPU figure
+     * on offer here.  No `rest` on this line -- the minima come from different blocks, so
+     * subtracting them from any single pull would not mean anything; `sum` is printed instead.
+     */
+    {
+        const uint32_t pn10 = nora_high_res_timer_count_to_us_x10( s_asrc[engine].dbg_stg_ph_min );
+        const uint32_t bn10 = nora_high_res_timer_count_to_us_x10( s_asrc[engine].dbg_stg_bl_min );
+        const uint32_t mn10 = nora_high_res_timer_count_to_us_x10( s_asrc[engine].dbg_stg_mac_min );
+        const uint32_t vn10 = nora_high_res_timer_count_to_us_x10( s_asrc[engine].dbg_stg_conv_min );
+        const uint32_t sn10 = nora_high_res_timer_count_to_us_x10( s_asrc[engine].dbg_stg_st_min );
+        const uint32_t tn10 = pn10 + bn10 + mn10 + vn10 + sn10;
+        printf("[stg x%uch]%s min ph=%lu.%luus bl=%lu.%luus mac=%lu.%luus conv=%lu.%luus"
+               " st=%lu.%luus sum=%lu.%luus\n",
+               (unsigned)ASRC_CH, dir,
+               (unsigned long)(pn10 / 10u), (unsigned long)(pn10 % 10u),
+               (unsigned long)(bn10 / 10u), (unsigned long)(bn10 % 10u),
+               (unsigned long)(mn10 / 10u), (unsigned long)(mn10 % 10u),
+               (unsigned long)(vn10 / 10u), (unsigned long)(vn10 % 10u),
+               (unsigned long)(sn10 / 10u), (unsigned long)(sn10 % 10u),
+               (unsigned long)(tn10 / 10u), (unsigned long)(tn10 % 10u));
+        printf("[stg x%uch]%s memo hit=%lu of %lu frames\n", (unsigned)ASRC_CH, dir,
+               (unsigned long)s_asrc[engine].dbg_memo_hit,
+               (unsigned long)s_asrc[engine].dbg_memo_tot);
+        printf("[stg x%uch]%s ceff steal=%lu of %lu frames\n", (unsigned)ASRC_CH, dir,
+               (unsigned long)s_asrc[engine].dbg_ceff_steal,
+               (unsigned long)s_asrc[engine].dbg_memo_tot);
+        s_asrc[engine].dbg_ceff_steal = 0u;
+        s_asrc[engine].dbg_memo_hit = 0u;
+        s_asrc[engine].dbg_memo_tot = 0u;
+    }
+    s_asrc[engine].dbg_stg_ph_max   = 0u;
+    s_asrc[engine].dbg_stg_bl_max   = 0u;
+    s_asrc[engine].dbg_stg_st_max   = 0u;
+    s_asrc[engine].dbg_stg_coef_min = 0xFFFFFFFFu;
+    s_asrc[engine].dbg_stg_mac_min  = 0xFFFFFFFFu;
+    s_asrc[engine].dbg_stg_conv_min = 0xFFFFFFFFu;
+    s_asrc[engine].dbg_stg_ph_min   = 0xFFFFFFFFu;
+    s_asrc[engine].dbg_stg_bl_min   = 0xFFFFFFFFu;
+    s_asrc[engine].dbg_stg_st_min   = 0xFFFFFFFFu;
+}
+#endif
+
 // ab is consumed by the B ISR (out = fs_B); ba is consumed by the A ISR (out = fs_A).
 // Each line ends with `fe=` (see above), which is why asrc_audio_path_dbg_print() no longer
 // emits the separate "ASRCpath <dir> front-end:" pair: the state now sits next to the engine
 // it belongs to, one line per direction instead of two.
+#if APP_ASRC_LEG_PROFILE
+/*
+ * The pull peak of the window that was just printed, kept because the LEG partition is
+ * printed by asrc_audio_path_dbg_print() and that runs AFTER this function, which clears the
+ * live peak.  Latching here rather than peeking there is what makes the two lines describe
+ * the same window: a peek would read the cleared 0.  Foreground-only, both sides.
+ */
+static uint32_t s_dbg_pull_ticks_last[2];
+
+uint32_t audio_app_asrc_dbg_pull_ticks_last( uint8_t engine )
+{
+    return ( engine < 2u ) ? s_dbg_pull_ticks_last[engine] : 0u;
+}
+#endif
+
 void audio_app_asrc_dbg_print( uint32_t fsA_hz, uint32_t fsB_hz )
 {
     const uint32_t p_ab_ticks = s_asrc[ASRC_ENGINE_AB].dbg_pull_ticks_max; s_asrc[ASRC_ENGINE_AB].dbg_pull_ticks_max = 0u;
+#if APP_ASRC_LEG_PROFILE
+    s_dbg_pull_ticks_last[ASRC_ENGINE_AB] = p_ab_ticks;
+#endif
     const uint32_t p_ab = nora_high_res_timer_count_to_us_x10( p_ab_ticks );
 #if APP_ASRC_48K_TO_8_INTEGRATION
     // The ovf/udf counters this line used to spell out as decim_ovf=/decim_udf= now arrive in
@@ -4155,8 +4756,17 @@ void audio_app_asrc_dbg_print( uint32_t fsA_hz, uint32_t fsB_hz )
     s_asrc[ASRC_ENGINE_AB].dbg_fill_min = 0xFFFFu;   // min-hold restarts each print window
     asrc_dbg_print_frontend_ab();
 #endif
+#if APP_ASRC_STAGE_PROFILE
+    asrc_dbg_print_stage_profile( "AB", ASRC_ENGINE_AB, p_ab_ticks );
+#endif
+#if APP_ASRC_FULL_IIR_48_TO_32
+    asrc_full_iir_48_to_32_dbg_print();   // silent unless the trial stage is armed
+#endif
 #if APP_B_ROUTE_USES_BA
     const uint32_t p_ba_ticks = s_asrc[ASRC_ENGINE_BA].dbg_pull_ticks_max; s_asrc[ASRC_ENGINE_BA].dbg_pull_ticks_max = 0u;
+#if APP_ASRC_LEG_PROFILE
+    s_dbg_pull_ticks_last[ASRC_ENGINE_BA] = p_ba_ticks;
+#endif
     const uint32_t p_ba = nora_high_res_timer_count_to_us_x10( p_ba_ticks );
     printf("[%s x%uch]BA hr=%ld set=%lu%s step=%.5f pull=%lu.%luus drop=%lu starve=%lu%s",
            ASRC_KERNEL_NAME, (unsigned)ASRC_CH,
@@ -4169,6 +4779,9 @@ void audio_app_asrc_dbg_print( uint32_t fsA_hz, uint32_t fsB_hz )
            ( (uint32_t)ASRC_FILL_JITTER > (uint32_t)s_asrc[ASRC_ENGINE_BA].dbg_jmax ) ? "!J" : "");
     s_asrc[ASRC_ENGINE_BA].dbg_fill_min = 0xFFFFu;   // min-hold restarts each print window
     asrc_dbg_print_frontend_ba();
+#if APP_ASRC_STAGE_PROFILE
+    asrc_dbg_print_stage_profile( "BA", ASRC_ENGINE_BA, p_ba_ticks );
+#endif
 #endif
 }
 

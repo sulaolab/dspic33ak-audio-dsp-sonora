@@ -107,6 +107,30 @@
 #define APP_BUILD_ASRC_MEAS_96K_A_TO_B  (22) /* tier: internal; artifact: asrc_meas_96k_a_to_b; display: ASRC measurement 96k A-to-B */
 #define APP_BUILD_ASRC_MEAS_96K_B_TO_A  (23) /* tier: internal; artifact: asrc_meas_96k_b_to_a; display: ASRC measurement 96k B-to-A */
 #define APP_BUILD_ASRC_AK128_CODEC_BIDIR (24) /* tier: internal; artifact: asrc_ak128_bi; display: ASRC AK128 Bi-Codec */
+/* 96 kHz leg A -> 32 kHz leg B, 12 channels each way, Q31 throughout.  This is the
+ * configuration measured on 2026-09-08 and accepted by the owner: Hard RT functional
+ * PASS -- worst leg B response 494.1 us against a 500 us block, +5.9 us -- while the
+ * 5 % engineering reserve FAILS.  That is why it is an INTERNAL preset and why the
+ * ASRC default below is unchanged: 48 -> 32 stays the shipping choice.
+ *
+ * It differs from 96K_A_TO_B on every axis that moves the deadline, which is why it is
+ * its own catalogue entry instead of a define set someone has to remember: ASRC_CH 12
+ * (not 8), two engines, the Q31 sample path, the rear polyphase at M=28, the HB31
+ * half-band pre-stage and the optimised Q31 row kernels.  asrc_app_build_config.h pins
+ * all of them, so selecting this preset is the whole recipe -- no -Define, and no
+ * -AsDefine either (asrc_fir_hb_kernel_dspic33ak.s no longer needs one).
+ *
+ * The ANALOG path is still one-way.  At 96 kHz the WM8904 cannot run ADC and DAC at
+ * once, so leg A is ADC-only and leg B DAC-only exactly as in 96K_A_TO_B.  Two engines
+ * is a DSP-width statement, not an analog one: the B->A engine resamples an idle
+ * capture line at full width on purpose, because that CPU cost is what was measured.
+ *
+ * RT CAVEAT: +5.9 us is ONE build layout.  This tree is not placement-reproducible --
+ * a stage nobody touched moves several us when Y placement changes -- so a rebuild can
+ * spend that margin.  Re-measure the leg B response after any change instead of
+ * quoting the number above.  Leg B is also runtime-variable (`*ar`); raising it above
+ * the 32 kHz this preset boots at is outside what was measured. */
+#define APP_BUILD_ASRC_CODEC_96K_12CH_32K (25) /* tier: internal; artifact: asrc_96k_12ch_32k; display: ASRC Codec 96k 12ch to 32k */
 /* Values 19/20 were used only on the pre-main M28 research branch and are
  * intentionally not public presets.  Flip this internal compile-time switch
  * only while building the standard BIDIR or MEAS preset to reproduce it. */
@@ -127,7 +151,7 @@
 
 #if (APP_BUILD >= APP_BUILD_STD_DEMO_1) && (APP_BUILD <= APP_BUILD_DEMO_96K)
   #define SONORA_APP  SONORA_APP_CLASSIC_AUDIO_DEMO
-#elif (APP_BUILD >= APP_BUILD_ASRC_CODEC_BIDIR) && (APP_BUILD <= APP_BUILD_ASRC_AK128_CODEC_BIDIR)
+#elif (APP_BUILD >= APP_BUILD_ASRC_CODEC_BIDIR) && (APP_BUILD <= APP_BUILD_ASRC_CODEC_96K_12CH_32K)
   #define SONORA_APP  SONORA_APP_ASRC
 #else
   #error "APP_BUILD is not a known Classic Audio Demo or ASRC App variation."
@@ -211,6 +235,9 @@
 #elif (APP_BUILD == APP_BUILD_ASRC_AK128_CODEC_BIDIR)
   #define APP_BUILD_NAME    "APP_BUILD_ASRC_AK128_CODEC_BIDIR"
   #define APP_BUILD_DETAIL  "ASRC AK128; TDM8 8ch A<->B; Codec-A/Codec-B master; Curiosity J3 DIM-Pxx U-jumpers"
+#elif (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K)
+  #define APP_BUILD_NAME    "APP_BUILD_ASRC_CODEC_96K_12CH_32K"
+  #define APP_BUILD_DETAIL  "ASRC 96 kHz leg A -> 32 kHz leg B; 12 ch each way, two engines; Q31, rear M=28, HB31 pre-stage, opt Q31 kernels; Hard RT PASS with 5 % reserve FAIL (internal)"
 #else
   /* The retired M28 research values 19/20 now fall inside the ASRC APP_BUILD
    * range, so an unnamed preset must fail loudly instead of building without

@@ -30,8 +30,11 @@
           <itemPath>../src/app/apps/asrc/asrc_clock_control.h</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_decimator_48_to_8.c</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_decimator_48_to_8.h</itemPath>
+          <itemPath>../src/app/apps/asrc/asrc_fir_hb_kernel_dspic33ak.s</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_fir_kernel_bench.c</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_fir_kernel_bench.h</itemPath>
+          <itemPath>../src/app/apps/asrc/asrc_full_iir_48_to_32.c</itemPath>
+          <itemPath>../src/app/apps/asrc/asrc_full_iir_48_to_32.h</itemPath>
           <itemPath>../src/app/apps/asrc/audio_app_asrc.c</itemPath>
           <itemPath>../src/app/apps/asrc/audio_app_asrc.h</itemPath>
           <itemPath>../src/app/apps/asrc/audio_app_asrc_poly_l128_flash.c</itemPath>
@@ -2083,6 +2086,22 @@
         <C30Global>
         </C30Global>
       </item>
+      <item path="../src/app/apps/asrc/asrc_full_iir_48_to_32.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
       <item path="../src/app/apps/asrc/audio_app_asrc.c" ex="true" overriding="false">
         <C30>
         </C30>
@@ -3895,7 +3914,39 @@
         <C30Global>
         </C30Global>
       </item>
+      <item path="../src/app/apps/asrc/asrc_fir_hb_kernel_dspic33ak.s"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
       <item path="../src/app/apps/asrc/asrc_fir_kernel_bench.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_full_iir_48_to_32.c"
             ex="true"
             overriding="false">
         <C30>
@@ -4620,6 +4671,22 @@
         <makeCustomizationNormalizeHexFile>false</makeCustomizationNormalizeHexFile>
       </makeCustomizationType>
       <item path="../src/app/apps/asrc/asrc_decimator_48_to_8.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_fir_hb_kernel_dspic33ak.s"
             ex="true"
             overriding="false">
         <C30>

@@ -22,6 +22,7 @@ MIDRATE_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_48_to_16_coeffs.inc"
 HALFRATE_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_48_to_24_coeffs.inc"
 QUARTER_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_48_to_12_coeffs.inc"
 PRESTAGE_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_96_to_48_coeffs.inc"
+PRESTAGE_HB_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_96_to_48_hb_coeffs.inc"
 POLY32_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_48_to_32_coeffs.inc"
 TONE_OUTPUT = ROOT / "src/app/apps/asrc/asrc_decimator_48_to_8_meas_tone.inc"
 
@@ -349,6 +350,47 @@ PRESTAGE48K_PASSBAND_HZ = 20000.0
 PRESTAGE48K_STOPBAND_HZ = 24000.0    # 48000 - 24000: the fold edge of a 48 kHz output
 PRESTAGE48K_TAPS = 169
 
+# A HALF-BAND replacement for the SHARED pre-stage, generated into its own include so that a
+# build which does not ask for it does not carry floats it never reads.  Measurement-only
+# when it landed (2026-09-06); production-permitted since 2026-09-08.
+#
+# It is the same windowed-sinc design as every other set here, with the cutoff pinned to
+# fs/4 = 24000 Hz -- (pass + stop) / 2 in design(), so pass 16000 / stop 32000.  That is what
+# makes it half-band: sinc(offset/2) is exactly zero at every EVEN offset from the centre, so
+# with taps = 4*half - 1 the centre M = 2*half - 1 is ODD and the surviving taps are the even
+# ABSOLUTE indices plus M -- 17 of 31 here.  The kernel skips the other 14 because the FILTER
+# STRUCTURE makes them zero, which is the only arithmetic this study is allowed to drop; no
+# channel and no slot is skipped anywhere.
+#
+# The stopband requirement it has to clear is the SHARED set's, 32000 Hz (48000 - 16000, a
+# 32 kHz output's fold edge).  Its passband edge lands at 16000 Hz rather than the shared
+# set's 15000 Hz -- the half-band mirror gives that away for free, and 16000 is wider than
+# the 15000 the composed chain needs.
+#
+# 35 -> 31 TAPS on 2026-09-08, with beta 11 -> 10.  This is a CPU decision taken against a
+# measured wall: the 96 kHz leg runs 3x inside one 500 us 32 kHz leg window, so the two MACs
+# per output that 31 taps saves are worth 3x that on the leg deadline that actually binds
+# (+2.74 us, taking the measured TDM2 margin from +1.3 us to +4.0 us).  It costs 6.9 dB of
+# protected-band alias floor, -107.4 -> -100.5 dBc, which is inside the documented gate's
+# "acceptable" class and nothing further was permitted: 27 taps reads -90.5 dBc and 23 taps
+# -76.4 dBc, both rejected by the owner on 2026-09-08.
+#
+# BETA MUST TRAVEL WITH THE TAP COUNT.  At this length the module default 11.0 reads
+# -96.4 dBc, which FAILS the gate; 10.0 reads -100.5 dBc and passes.  The two constants are
+# one decision -- do not change either alone.  Curve for every length and beta:
+# `[internal] report_ak512_96k32k_12ch_prestage_shorten_2026-09-08.md`, reproducible with
+# tools/asrc/asrc_96_to_32_prestage_shorten_study.py.
+#
+# The passband is untouched by the shortening (0..13 kHz floor stays -0.44 dB, 15 kHz stays
+# -10.1 dB) -- that 15 kHz droop belongs to the N97 rear stage, not to this filter, and is
+# tracked separately.
+PRESTAGE_HB_TAPS = 31
+PRESTAGE_HB_HALF = (PRESTAGE_HB_TAPS + 1) // 4          # 8; taps == 4*half - 1
+PRESTAGE_HB_KAISER_BETA = 10.0      # NOT the module default; see above
+PRESTAGE_HB_PASSBAND_HZ = 16000.0
+PRESTAGE_HB_STOPBAND_HZ = 32000.0   # cutoff (pass+stop)/2 == 24000 == fs/4: half-band
+
+
 # 48 kHz -> 32 kHz "Audio mode": the L=2/M=3 rational polyphase front end.
 #
 # WHAT THIS IS NOT.  It is not a strict 48->32 front end and must not be described as one: it
@@ -389,7 +431,15 @@ TONE_TABLE_LENGTH = 480
 TONE_DBFS = -1.0
 
 
-def design(taps: int, sample_rate: float, passband: float, stopband: float) -> np.ndarray:
+def design(taps: int, sample_rate: float, passband: float, stopband: float,
+           beta: float = KAISER_BETA) -> np.ndarray:
+    # BETA IS PER SET, defaulting to the module-wide KAISER_BETA so every existing set is
+    # bit-identical.  It became a parameter on 2026-09-08 because the single fixed 11.0 was
+    # chosen for the 41-tap dense pre-stage and is badly mistuned once a filter gets short:
+    # measured over the composed 96 -> 32 kHz chain, the 96 -> 48 kHz half-band loses 4.1 dB
+    # of protected-band alias floor at 31 taps and 27-30 dB at 23-27 taps against the best
+    # beta for that length.  A caller that shortens a set MUST re-choose beta with it.
+    # Curve and provenance: `[internal] report_ak512_96k32k_12ch_prestage_shorten_2026-09-08.md`.
     center = (passband + stopband) * 0.5
     offset = np.arange(taps, dtype=np.float64) - (taps - 1) * 0.5
     coeff = (
@@ -397,7 +447,7 @@ def design(taps: int, sample_rate: float, passband: float, stopband: float) -> n
         * center
         / sample_rate
         * np.sinc(2.0 * center / sample_rate * offset)
-        * np.kaiser(taps, KAISER_BETA)
+        * np.kaiser(taps, beta)
     )
     coeff /= np.sum(coeff)
     return coeff.astype("<f4")
@@ -567,6 +617,45 @@ def render_prestage(coeff: np.ndarray, crc: int,
     return "\n".join(lines)
 
 
+def render_prestage_hb(coeff: np.ndarray, crc: int, nonzero: int) -> str:
+    lines = [
+        "/* Generated by tools/asrc_decimator_48_to_8_design.py.  Do not edit. */",
+        "#ifndef ASRC_DECIMATOR_96_TO_48_HB_COEFFS_INC",
+        "#define ASRC_DECIMATOR_96_TO_48_HB_COEFFS_INC",
+        "",
+        "/* A HALF-BAND replacement for the SHARED 96 -> 48 kHz",
+        " * pre-stage, included only by a build that sets APP_ASRC_Q31_PRE_HALFBAND -- which is",
+        " * why it is a file of its own and not another array beside the three in",
+        " * asrc_decimator_96_to_48_coeffs.inc.",
+        " *",
+        " * The FULL tap set is emitted, all 4*half - 1 of it, INCLUDING the structural zeros.",
+        " * That is deliberate: the caller packs the surviving taps itself, by index, so this",
+        " * file stays an ordinary impulse response that can be plotted and CRC-checked like",
+        " * every other set here, and the packing rule lives next to the kernel that needs it.",
+        " *",
+        " * The zeros are zero BY CONSTRUCTION (sinc(offset/2) at an even offset), not by",
+        " * rounding, and the caller does not test them -- it addresses the survivors",
+        " * directly.  The generator prints the largest dropped magnitude so that a cutoff",
+        " * which drifted off fs/4 cannot pass unnoticed. */",
+        f"#define ASRC_DECIMATOR_96_TO_48_HB_COEFF_TAPS ({PRESTAGE_HB_TAPS}u)",
+        f"#define ASRC_DECIMATOR_96_TO_48_HB_COEFF_HALF ({PRESTAGE_HB_HALF}u)",
+        f"#define ASRC_DECIMATOR_96_TO_48_HB_COEFF_NONZERO ({nonzero}u)",
+        f"#define ASRC_DECIMATOR_96_TO_48_HB_GENERATED_CRC32 (0x{crc:08X}UL)",
+        f"#define ASRC_DECIMATOR_96_TO_48_HB_KAISER_BETA "
+        f"({PRESTAGE_HB_KAISER_BETA:.1f}f)",
+        "",
+        "/* Variant HALF_BAND (composed chains, production since 2026-09-08): passband "
+        f"{PRESTAGE_HB_PASSBAND_HZ:.0f} Hz, stopband {PRESTAGE_HB_STOPBAND_HZ:.0f} Hz, "
+        f"cutoff {(PRESTAGE_HB_PASSBAND_HZ + PRESTAGE_HB_STOPBAND_HZ) * 0.5:.0f} Hz = fs/4."
+        f"  Kaiser beta {PRESTAGE_HB_KAISER_BETA:.1f}, which is NOT the module default"
+        f" {KAISER_BETA:.1f}: beta travels with the tap count here, and 11.0 at"
+        f" {PRESTAGE_HB_TAPS} taps fails the protected-band gate. */",
+    ]
+    lines.extend(format_array("s_96_to_48_hb_coeff", coeff))
+    lines.extend(["", "#endif /* ASRC_DECIMATOR_96_TO_48_HB_COEFFS_INC */", ""])
+    return "\n".join(lines)
+
+
 def render_halfrate(coeff: np.ndarray, crc: int,
                     coeff_22k: np.ndarray, crc_22k: int) -> str:
     lines = [
@@ -726,6 +815,14 @@ def main() -> int:
         PRESTAGE48K_PASSBAND_HZ,
         PRESTAGE48K_STOPBAND_HZ,
     )
+    prestage_hb = design(
+        PRESTAGE_HB_TAPS,
+        PRESTAGE_INPUT_HZ,
+        PRESTAGE_HB_PASSBAND_HZ,
+        PRESTAGE_HB_STOPBAND_HZ,
+        PRESTAGE_HB_KAISER_BETA,
+    )
+
     poly32_phase0, poly32_phase1, poly32_proto = design_32k_polyphase()
     crc = coefficient_crc32(stage1, stage2)
     midrate_crc = coefficient_crc32(midrate)
@@ -736,6 +833,7 @@ def main() -> int:
     prestage_crc = coefficient_crc32(prestage)
     prestage_44k1_crc = coefficient_crc32(prestage_44k1)
     prestage_48k_crc = coefficient_crc32(prestage_48k)
+    prestage_hb_crc = coefficient_crc32(prestage_hb)
     poly32_crc = coefficient_crc32(poly32_phase0, poly32_phase1)
     expected_poly32 = render_poly32(poly32_phase0, poly32_phase1, poly32_crc)
     expected = render(stage1, stage2, crc)
@@ -747,6 +845,22 @@ def main() -> int:
     expected_prestage = render_prestage(prestage, prestage_crc,
                                         prestage_44k1, prestage_44k1_crc,
                                         prestage_48k, prestage_48k_crc)
+    # The survivors, derived from the half-band STRUCTURE and then checked against the
+    # design, not the other way round: a cutoff that drifted off fs/4 would still look like a
+    # filter, and the only symptom would be a kernel dropping taps that are not zero.
+    assert PRESTAGE_HB_TAPS == 4 * PRESTAGE_HB_HALF - 1, PRESTAGE_HB_TAPS
+    hb_structural = [i for i in range(PRESTAGE_HB_TAPS)
+                     if (i % 2 == 0) or (i == (2 * PRESTAGE_HB_HALF - 1))]
+    assert len(hb_structural) == 2 * PRESTAGE_HB_HALF + 1, len(hb_structural)
+    hb_worst_dropped = float(max(abs(float(prestage_hb[i]))
+                                 for i in range(PRESTAGE_HB_TAPS)
+                                 if i not in hb_structural))
+    hb_smallest_kept = float(min(abs(float(prestage_hb[i])) for i in hb_structural))
+    assert hb_worst_dropped < hb_smallest_kept * 1.0e-6, (hb_worst_dropped,
+                                                          hb_smallest_kept)
+    expected_prestage_hb = render_prestage_hb(prestage_hb, prestage_hb_crc,
+                                              len(hb_structural))
+
     expected_tone = render_tone()
     r1, s1 = response(stage1, STAGE1_INPUT_HZ, PASSBAND_HZ, STAGE1_STOPBAND_HZ)
     r2, s2 = response(stage2, STAGE2_INPUT_HZ, PASSBAND_HZ, STAGE2_STOPBAND_HZ)
@@ -902,6 +1016,49 @@ def main() -> int:
         f"dc0={float(np.sum(poly32_phase0)):.9f} dc1={float(np.sum(poly32_phase1)):.9f}"
     )
     print(f"poly32_crc32=0x{poly32_crc:08X}")
+    rhb, shb = response(
+        prestage_hb,
+        PRESTAGE_INPUT_HZ,
+        PRESTAGE_HB_PASSBAND_HZ,
+        PRESTAGE_HB_STOPBAND_HZ,
+    )
+    # READ THESE TWO NUMBERS TOGETHER OR THE FILTER LOOKS BROKEN.  A half-band is symmetric
+    # about fs/4, so its attenuation at the stopband edge EQUALS its passband ripple at the
+    # mirror frequency -- 0.0129 dB of ripple at 16000 Hz IS the -56.6 dB at 32000 Hz.  They
+    # are one number seen twice, not two independent measurements, and no amount of taps
+    # separates them while the cutoff stays pinned at fs/4.
+    #
+    # So the shipping set's gate (worst response from 48000 - final_Nyquist = 32000 Hz, where
+    # the 41-tap set reads -108.38 dB) is NOT the gate to judge this one by: content at the
+    # 32000 Hz edge folds to exactly 16000 Hz, the final Nyquist, which the L=2/M=3 second
+    # stage is already only ~-10 dB at.  The band that has to stay clean is the PROTECTED one,
+    # 0..13000 Hz, and energy reaches it only from 48000 - 13000 = 35000 Hz upward.
+    rhb_prot, shb_prot = response(
+        prestage_hb,
+        PRESTAGE_INPUT_HZ,
+        13000.0,
+        PRESTAGE_INPUT_HZ * 0.5 - 13000.0,
+    )
+    print(
+        f"prestage_hb: taps={PRESTAGE_HB_TAPS} half={PRESTAGE_HB_HALF} "
+        f"beta={PRESTAGE_HB_KAISER_BETA:.1f} "
+        f"nonzero={len(hb_structural)} fs={PRESTAGE_INPUT_HZ:.0f} "
+        f"pass={PRESTAGE_HB_PASSBAND_HZ:.0f} stop={PRESTAGE_HB_STOPBAND_HZ:.0f} "
+        f"ripple={rhb:.6f} dB stop={shb:.2f} dB (== ripple mirrored; see comment)"
+    )
+    print(
+        f"prestage_hb protected 0..13000 Hz: ripple={rhb_prot:.6f} dB "
+        f"alias_from_{PRESTAGE_INPUT_HZ * 0.5 - 13000.0:.0f}Hz={shb_prot:.2f} dB "
+        f"(shipping 41 tap reads -110.23 dB by the same scan; the composed 96 -> 32 kHz "
+        f"gate, which is what this set is judged by, reads -100.5 dBc = acceptable)"
+    )
+    print(
+        f"prestage_hb_crc32=0x{prestage_hb_crc:08X} "
+        f"dc={float(np.sum(prestage_hb)):.9f} "
+        f"worst_structural_zero={hb_worst_dropped:.3e} "
+        f"smallest_kept={hb_smallest_kept:.3e}"
+    )
+
 
     if args.write:
         # These generated files are declared eol=crlf in .gitattributes.
@@ -912,6 +1069,7 @@ def main() -> int:
         HALFRATE_OUTPUT.write_text(expected_halfrate, encoding="ascii", newline="\r\n")
         QUARTER_OUTPUT.write_text(expected_quarter, encoding="ascii", newline="\r\n")
         PRESTAGE_OUTPUT.write_text(expected_prestage, encoding="ascii", newline="\r\n")
+        PRESTAGE_HB_OUTPUT.write_text(expected_prestage_hb, encoding="ascii", newline="\r\n")
         POLY32_OUTPUT.write_text(expected_poly32, encoding="ascii", newline="\r\n")
         TONE_OUTPUT.write_text(expected_tone, encoding="ascii", newline="\r\n")
         print(f"wrote {OUTPUT.relative_to(ROOT)}")
@@ -919,6 +1077,7 @@ def main() -> int:
         print(f"wrote {HALFRATE_OUTPUT.relative_to(ROOT)}")
         print(f"wrote {QUARTER_OUTPUT.relative_to(ROOT)}")
         print(f"wrote {PRESTAGE_OUTPUT.relative_to(ROOT)}")
+        print(f"wrote {PRESTAGE_HB_OUTPUT.relative_to(ROOT)}")
         print(f"wrote {POLY32_OUTPUT.relative_to(ROOT)}")
         print(f"wrote {TONE_OUTPUT.relative_to(ROOT)}")
     elif args.check:
@@ -927,12 +1086,14 @@ def main() -> int:
         actual_halfrate = HALFRATE_OUTPUT.read_text(encoding="ascii") if HALFRATE_OUTPUT.exists() else ""
         actual_quarter = QUARTER_OUTPUT.read_text(encoding="ascii") if QUARTER_OUTPUT.exists() else ""
         actual_prestage = PRESTAGE_OUTPUT.read_text(encoding="ascii") if PRESTAGE_OUTPUT.exists() else ""
+        actual_prestage_hb = PRESTAGE_HB_OUTPUT.read_text(encoding="ascii") if PRESTAGE_HB_OUTPUT.exists() else ""
         actual_poly32 = POLY32_OUTPUT.read_text(encoding="ascii") if POLY32_OUTPUT.exists() else ""
         actual_tone = TONE_OUTPUT.read_text(encoding="ascii") if TONE_OUTPUT.exists() else ""
         if (actual != expected or actual_midrate != expected_midrate or
                 actual_halfrate != expected_halfrate or
                 actual_quarter != expected_quarter or
                 actual_prestage != expected_prestage or
+                actual_prestage_hb != expected_prestage_hb or
                 actual_poly32 != expected_poly32 or actual_tone != expected_tone):
             print(f"ERROR: stale generated file: {OUTPUT.relative_to(ROOT)}", file=sys.stderr)
             return 1

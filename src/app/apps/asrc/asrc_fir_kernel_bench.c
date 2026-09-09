@@ -62,8 +62,12 @@ typedef int asrc_fir_kernel_bench_unavailable_t;   // keep the translation unit 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
+#include "arm_math.h"
 #include "nora_high_res_timer.h"
+#include "asrc_h2_timing_coeffs.h"
+#include "asrc_fir_tradeoff_coeffs.h"
 
 // ---- the kernels under test -------------------------------------------------------------------
 // src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_*.s .  Each file's header block is
@@ -86,8 +90,25 @@ extern int32_t* fir_ring_q31_ymod_yonly_block( const int32_t* coeff, const int32
                                                uint32_t decim_bytes, const int32_t* ring,
                                                uint32_t ring_bytes );
 
+// MEASUREMENT ONLY, src/app/apps/asrc/asrc_fir_hb_kernel_dspic33ak.s (that file's header is the
+// specification).  Same shape as the yonly kernel above, but for a HALF-BAND prototype: it walks
+// only the non-zero taps, so the Y pointer's stride is 2 samples over most of the run.  `half`
+// replaces `taps`; the filter length is 4*half - 1 and coeff[] holds its 2*half+1 non-zero taps in
+// ascending index order.  Nothing on the audio path calls it.
+extern int32_t* fir_ring_q31_hb_ymod_yonly_block( const int32_t* coeff, const int32_t* hist,
+                                                  uint32_t half, int32_t* out, uint32_t outputs,
+                                                  uint32_t decim_bytes, const int32_t* ring,
+                                                  uint32_t ring_bytes );
+
 // float32, eight channels per pass, frame-major history: 17 instructions + one DTB per 8 MACs.
 extern void fir_ring_wide8_f32( const float* hist, const float* coeff, uint32_t taps, float* out8 );
+
+/* Project-owned DF2T scheduling variants.  They deliberately share the
+ * vendor-facing instance ABI and are already part of this configuration; the
+ * Phase-3 probe only calls them, it does not add any assembler. */
+extern void biquad_cascade_df2T_f32_dspic33ak_opt_v1(
+    const mchp_biquad_cascade_df2T_instance_f32* s,
+    const float32_t* src, float32_t* dst, uint32_t block_size );
 
 // ---- geometry ----------------------------------------------------------------------------------
 // 107 and 190 taps are the two shipping cases the report costs out: 107 is the AK128 `/2` front end,
@@ -669,5 +690,1588 @@ void asrc_fir_kernel_bench_run( uint32_t trials )
 
     printf( "    M6: %lu pass / %lu FAIL\n", (unsigned long)m6_pass, (unsigned long)m6_fail );
 }
+
+#if ASRC_H2_KERNEL_BENCH_AVAILABLE
+/* ---- Phase 2: H2 component timing --------------------------------------------------------------
+ *
+ * This deliberately remains a foreground microbenchmark.  It has exactly the
+ * candidate's 16 x 16 workload, but it neither reads from nor writes to the
+ * live ASRC engines.  The FIR is the project-owned wide8 implementation.  The
+ * The Phase-2 vendor DF2T attempt faulted because it bypassed this library's
+ * required instance initializer.  Therefore the timing below deliberately
+ * remains ordinary local float C: it is the conventional baseline.  Phase 3
+ * separately retests existing primitives with the documented initializer.
+ */
+#define H2B_CHANNELS          (16u)
+#define H2B_BLOCK_FRAMES      (16u)
+#define H2B_WIDE               (8u)
+#define H2B_FIR_HISTORY_FRAMES (2u * ASRC_H2_FIR49_TAPS)
+#define H2B_FIR_HISTORY_GROUP_FLOATS (H2B_FIR_HISTORY_FRAMES * H2B_WIDE)
+#define H2B_FIR_HISTORY_FLOATS (2u * H2B_FIR_HISTORY_GROUP_FLOATS)
+#define H2B_IIR_STATE_FLOATS   (H2B_CHANNELS * ASRC_H2_IIR_SOS * 2u)
+#define H2B_DEFAULT_TRIALS    (10000u)
+#define H2B_CYC_PER_TICK      (PLL1_CLK_HZ / FCY)
+#define H2B_FULL_SCALE        (8388607.0f)  /* float ASRC sample domain: signed 24-bit counts */
+#define H2B_TWO_PI            (6.2831853071795864769f)
+
+/* The existing wide8 float FIR requires a contiguous frame-major window.  It
+ * uses no modulo registers, so unlike mchp_fir_f32 it remains safe while the
+ * IPL4 streaming kernels execute.  Keep its two mirrored eight-channel
+ * histories in the same checked Y scratch arena as *aq: the two probes never
+ * run concurrently, and this avoids changing the serial-update image's
+ * permanent data layout. */
+#define H2B_Y_ARENA            (0x12240u)
+/* The reset diagnostics begin at 0x13e00.  The Phase-3 probe needs the same
+ * 6.9 KiB float history/state arena as Phase 2, but its additional validation
+ * is time-multiplexed instead of reserving a second state bank. */
+#define H2B_Y_ARENA_LIMIT      (0x13E00u)
+#define H2B_FIR_HISTORY        ( (float*)(uintptr_t)H2B_Y_ARENA )
+#define H2B_IIR_STATE          ( (float*)(uintptr_t)( H2B_Y_ARENA + ( H2B_FIR_HISTORY_FLOATS * sizeof(float) ) ) )
+#define H2B_Y_ARENA_END        ( H2B_Y_ARENA + ( ( H2B_FIR_HISTORY_FLOATS + H2B_IIR_STATE_FLOATS ) * sizeof(float) ) )
+#define H2B_OPT_IIR_STATE      H2B_IIR_STATE
+#define H2B_OPT_Y_ARENA_END    H2B_Y_ARENA_END
+#define H2B_Q31_HISTORY        ( (int32_t*)H2B_FIR_HISTORY )
+#define H2B_Q31_HISTORY_WORDS  (2u * ASRC_H2_FIR49_TAPS)
+#define H2B_Q31_SCALE          (256.0f)  /* float H2 counts -> signed-24-left Q31 */
+#define H2B_Q31_INV_SCALE      (1.0f / H2B_Q31_SCALE)
+#define H2B_VALIDATE_TOL_COUNTS (64.0f)
+
+_Static_assert( H2B_CHANNELS == ( 2u * H2B_WIDE ), "H2 FIR groups must cover all channels" );
+_Static_assert( H2B_Y_ARENA_END <= H2B_Y_ARENA_LIMIT, "H2 scratch exceeds the checked Y arena" );
+_Static_assert( H2B_OPT_Y_ARENA_END <= H2B_Y_ARENA_LIMIT, "H2 optimized IIR state exceeds checked Y arena" );
+
+typedef struct
+{
+    uint32_t min_ticks;
+    uint32_t max_ticks;
+    uint64_t sum_ticks;
+    uint32_t n;
+} h2b_stats_t;
+
+/* The local DF2T uses ordinary pointers.  Its fixed coefficients stay in X
+ * and each channel's two-float-per-SOS state stays in the checked Y scratch
+ * arena.  The vendor DF2T primitive cannot be used here: on this board it
+ * faults in a foreground run while IPL4 streaming remains enabled. */
+static float h2b_input[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static float h2b_prefir[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static float h2b_output[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static float h2b_opt_output[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static float h2b_reference[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static float h2b_wide_out[ H2B_WIDE ] __attribute__((space(xmemory)));
+static int32_t h2b_q31_input[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static int32_t h2b_q31_prefir[ H2B_CHANNELS ][ H2B_BLOCK_FRAMES ] __attribute__((space(xmemory)));
+static int32_t h2b_q31_coeff[ ASRC_H2_FIR49_TAPS ] __attribute__((space(xmemory)));
+static mchp_biquad_cascade_df2T_instance_f32 h2b_iir_instance[ H2B_CHANNELS ] __attribute__((space(xmemory)));
+static uint32_t h2b_fir_oldest;
+static uint32_t h2b_q31_fir_oldest;
+static uint32_t h2b_q31_saturations;
+
+static void h2b_stats_reset( h2b_stats_t* s )
+{
+    s->min_ticks = UINT32_MAX;
+    s->max_ticks = 0u;
+    s->sum_ticks = 0u;
+    s->n = 0u;
+}
+
+static void h2b_stats_add( h2b_stats_t* s, uint32_t ticks )
+{
+    if( ticks < s->min_ticks ) { s->min_ticks = ticks; }
+    if( ticks > s->max_ticks ) { s->max_ticks = ticks; }
+    s->sum_ticks += ticks;
+    s->n++;
+}
+
+static uint32_t h2b_stats_mean( const h2b_stats_t* s )
+{
+    return ( s->n != 0u ) ? (uint32_t)( s->sum_ticks / s->n ) : 0u;
+}
+
+static uint32_t h2b_subtract_overhead( uint32_t ticks, uint32_t overhead )
+{
+    return ( ticks > overhead ) ? ( ticks - overhead ) : 0u;
+}
+
+static const char* h2b_data_space( const void* p )
+{
+    return ( (uintptr_t)p >= 0xC000u ) ? "Y" : "X";
+}
+
+static void h2b_filters_reset( void )
+{
+    memset( H2B_FIR_HISTORY, 0, H2B_FIR_HISTORY_FLOATS * sizeof(float) );
+    memset( H2B_IIR_STATE, 0, H2B_IIR_STATE_FLOATS * sizeof(float) );
+    h2b_fir_oldest = 0u;
+}
+
+/* The shipping generic ASRC is float in this configuration and stores signed
+ * 24-bit counts in its float ring.  The existing Q31 FIR instead expects
+ * signed-24-left samples.  Keep both boundary conversions explicit: the
+ * Phase-3 timing prints them independently and the Q31 combined path includes
+ * both, rather than claiming that an isolated FIR timing is a frontend cost. */
+static int32_t h2b_count_to_q31( float counts )
+{
+    const float scaled = counts * H2B_Q31_SCALE;
+    if( scaled >= 2147483520.0f ) { return INT32_MAX; }
+    if( scaled <= -2147483648.0f ) { return INT32_MIN; }
+    return (int32_t)( scaled + ( ( scaled >= 0.0f ) ? 0.5f : -0.5f ) );
+}
+
+static int32_t h2b_coeff_to_q31( float coefficient )
+{
+    const float scaled = coefficient * 2147483648.0f;
+    if( scaled >= 2147483520.0f ) { return INT32_MAX; }
+    if( scaled <= -2147483648.0f ) { return INT32_MIN; }
+    return (int32_t)( scaled + ( ( scaled >= 0.0f ) ? 0.5f : -0.5f ) );
+}
+
+static void h2b_q31_prepare_coefficients( void )
+{
+    for( uint32_t tap = 0u; tap < ASRC_H2_FIR49_TAPS; tap++ )
+    {
+        h2b_q31_coeff[tap] = h2b_coeff_to_q31( asrc_h2_fir49[tap] );
+    }
+}
+
+static void h2b_q31_filters_reset( void )
+{
+    /* The Q31 channel-major mirrored histories deliberately overlay the
+     * float-wide FIR history.  The two candidate paths are serial probes, not
+     * a simultaneous shipping implementation, so this keeps the probe-local
+     * Y scratch within its already checked arena. */
+    memset( H2B_Q31_HISTORY, 0,
+            H2B_CHANNELS * H2B_Q31_HISTORY_WORDS * sizeof(int32_t) );
+    h2b_q31_fir_oldest = 0u;
+    h2b_q31_saturations = 0u;
+}
+
+static void h2b_float_to_q31_block( void )
+{
+    for( uint32_t channel = 0u; channel < H2B_CHANNELS; channel++ )
+    {
+        for( uint32_t frame = 0u; frame < H2B_BLOCK_FRAMES; frame++ )
+        {
+            h2b_q31_input[channel][frame] = h2b_count_to_q31( h2b_input[channel][frame] );
+        }
+    }
+}
+
+static void h2b_q31_fir_only( void )
+{
+    for( uint32_t frame = 0u; frame < H2B_BLOCK_FRAMES; frame++ )
+    {
+        for( uint32_t channel = 0u; channel < H2B_CHANNELS; channel++ )
+        {
+            int32_t* const history = &H2B_Q31_HISTORY[channel * H2B_Q31_HISTORY_WORDS];
+            int32_t* const write = &history[h2b_q31_fir_oldest];
+            const int32_t sample = h2b_q31_input[channel][frame];
+
+            write[0] = sample;
+            write[ASRC_H2_FIR49_TAPS] = sample;
+            /* The filter is symmetric.  Just as the float-wide path passes
+             * write + wide, this passes the contiguous next-oldest..newest
+             * window to the existing 1-MAC/cycle Q31 primitive. */
+            fir_ring_q31( h2b_q31_coeff, write + 1u, ASRC_H2_FIR49_TAPS,
+                          &h2b_q31_prefir[channel][frame] );
+            if( ( h2b_q31_prefir[channel][frame] == INT32_MAX ) ||
+                ( h2b_q31_prefir[channel][frame] == INT32_MIN ) )
+            {
+                h2b_q31_saturations++;
+            }
+        }
+        h2b_q31_fir_oldest++;
+        if( h2b_q31_fir_oldest == ASRC_H2_FIR49_TAPS ) { h2b_q31_fir_oldest = 0u; }
+    }
+}
+
+static void h2b_q31_to_float_block( void )
+{
+    for( uint32_t channel = 0u; channel < H2B_CHANNELS; channel++ )
+    {
+        for( uint32_t frame = 0u; frame < H2B_BLOCK_FRAMES; frame++ )
+        {
+            h2b_prefir[channel][frame] = (float)h2b_q31_prefir[channel][frame] * H2B_Q31_INV_SCALE;
+        }
+    }
+}
+
+/* The public DF2T struct must be initialized through this library's routine.
+ * Its assembler loads the word at the initializer's pState offset as the
+ * coefficient pointer and the next word as state.  Calling the initializer
+ * writes that ABI order; direct C field assignment was the Phase-2 BUS ERROR
+ * path.  Coefficients and instances are X, while the time-multiplexed state
+ * array is in the checked Y scratch arena; source and destination blocks are X. */
+static void h2b_optimized_iir_reset( void )
+{
+    memset( H2B_OPT_IIR_STATE, 0, H2B_IIR_STATE_FLOATS * sizeof(float) );
+    for( uint32_t channel = 0u; channel < H2B_CHANNELS; channel++ )
+    {
+        mchp_biquad_cascade_df2T_init_f32(
+            &h2b_iir_instance[channel], (uint8_t)ASRC_H2_IIR_SOS,
+            asrc_h2_df2t_sos,
+            &H2B_OPT_IIR_STATE[channel * ASRC_H2_IIR_SOS * 2u] );
+    }
+}
+
+static void h2b_fill_stimulus( uint8_t kind, uint32_t block_index )
+{
+    static const float sine_hz[] = { 1000.0f, 10000.0f, 15000.0f, 17000.0f };
+    for( uint32_t ch = 0u; ch < H2B_CHANNELS; ch++ )
+    {
+        for( uint32_t n = 0u; n < H2B_BLOCK_FRAMES; n++ )
+        {
+            const float t = (float)( block_index * H2B_BLOCK_FRAMES + n ) / 48000.0f;
+            const float phase = 0.03125f * (float)ch;
+            float x;
+            if( kind < 4u )
+            {
+                x = 0.999f * sinf( H2B_TWO_PI * sine_hz[kind] * t + phase );
+            }
+            else if( kind == 4u )
+            {
+                x = 0.999f * 0.25f *
+                    ( sinf( H2B_TWO_PI * 1000.0f * t + phase ) +
+                      sinf( H2B_TWO_PI * 7000.0f * t + 0.7f + phase ) +
+                      sinf( H2B_TWO_PI * 13000.0f * t + 1.1f + phase ) +
+                      sinf( H2B_TWO_PI * 15000.0f * t + 2.0f + phase ) );
+            }
+            else
+            {
+                x = ( ( block_index == 0u ) && ( n == 0u ) ) ? 0.999f : 0.0f;
+            }
+            h2b_input[ch][n] = x * H2B_FULL_SCALE;
+        }
+    }
+}
+
+static void h2b_fir_only( void )
+{
+    for( uint32_t n = 0u; n < H2B_BLOCK_FRAMES; n++ )
+    {
+        for( uint32_t group = 0u; group < ( H2B_CHANNELS / H2B_WIDE ); group++ )
+        {
+            float* const write = &H2B_FIR_HISTORY[
+                ( group * H2B_FIR_HISTORY_GROUP_FLOATS ) + ( h2b_fir_oldest * H2B_WIDE )];
+            float* const mirror = write + ( ASRC_H2_FIR49_TAPS * H2B_WIDE );
+            const uint32_t channel_base = group * H2B_WIDE;
+            for( uint32_t lane = 0u; lane < H2B_WIDE; lane++ )
+            {
+                const float x = h2b_input[channel_base + lane][n];
+                write[lane] = x;
+                mirror[lane] = x;
+            }
+
+            /* `write + 8` begins at the next-oldest frame and runs contiguously
+             * through the duplicate just written above.  Scatter back to the
+             * channel-major block shape that the existing DF2T primitive uses. */
+            fir_ring_wide8_f32( write + H2B_WIDE, asrc_h2_fir49, ASRC_H2_FIR49_TAPS, h2b_wide_out );
+            for( uint32_t lane = 0u; lane < H2B_WIDE; lane++ )
+            {
+                h2b_prefir[channel_base + lane][n] = h2b_wide_out[lane];
+            }
+        }
+        h2b_fir_oldest++;
+        if( h2b_fir_oldest == ASRC_H2_FIR49_TAPS ) { h2b_fir_oldest = 0u; }
+    }
+}
+
+static void h2b_iir_df2t_block( const float* src, float* dst, float* state )
+{
+    for( uint32_t n = 0u; n < H2B_BLOCK_FRAMES; n++ )
+    {
+        const float* coeff = asrc_h2_df2t_sos;
+        float* section_state = state;
+        float x = src[n];
+
+        for( uint32_t section = 0u; section < ASRC_H2_IIR_SOS; section++ )
+        {
+            const float d1 = section_state[0];
+            const float d2 = section_state[1];
+            const float y = coeff[0] * x + d1;
+
+            /* Coefficients are [b0, b1, b2, -a1, -a2], so the two
+             * feedback terms are additions here.  This is the normal
+             * transposed direct-form II recurrence, kept intentionally
+             * straightforward for the Stage-1 timing baseline. */
+            section_state[0] = coeff[1] * x + d2 + coeff[3] * y;
+            section_state[1] = coeff[2] * x + coeff[4] * y;
+            x = y;
+            coeff += 5u;
+            section_state += 2u;
+        }
+        dst[n] = x;
+    }
+}
+
+static void h2b_iir_only( void )
+{
+    for( uint32_t ch = 0u; ch < H2B_CHANNELS; ch++ )
+    {
+        h2b_iir_df2t_block( h2b_prefir[ch], h2b_output[ch],
+                             &H2B_IIR_STATE[ch * ASRC_H2_IIR_SOS * 2u] );
+    }
+}
+
+/* Keep these as direct calls, rather than measuring through a function-pointer
+ * dispatch.  A production selection would also call one known primitive, and
+ * the extra indirect-call cost would conceal the kernel difference we need to
+ * measure. */
+static void h2b_iir_vendor_only( void )
+{
+    for( uint32_t ch = 0u; ch < H2B_CHANNELS; ch++ )
+    {
+        mchp_biquad_cascade_df2T_f32( &h2b_iir_instance[ch], h2b_prefir[ch],
+                                       h2b_opt_output[ch], H2B_BLOCK_FRAMES );
+    }
+}
+
+static void h2b_iir_opt_v1_only( void )
+{
+    for( uint32_t ch = 0u; ch < H2B_CHANNELS; ch++ )
+    {
+        biquad_cascade_df2T_f32_dspic33ak_opt_v1(
+            &h2b_iir_instance[ch], h2b_prefir[ch], h2b_opt_output[ch], H2B_BLOCK_FRAMES );
+    }
+}
+
+static void h2b_combined( void )
+{
+    h2b_fir_only();
+    h2b_iir_only();
+}
+
+static void h2b_float_opt_v1_combined( void )
+{
+    h2b_fir_only();
+    h2b_iir_opt_v1_only();
+}
+
+static void h2b_q31_vendor_combined( void )
+{
+    h2b_float_to_q31_block();
+    h2b_q31_fir_only();
+    h2b_q31_to_float_block();
+    h2b_iir_vendor_only();
+}
+
+static void h2b_q31_opt_v1_combined( void )
+{
+    h2b_float_to_q31_block();
+    h2b_q31_fir_only();
+    h2b_q31_to_float_block();
+    h2b_iir_opt_v1_only();
+}
+
+static void h2b_print_timing( const char* name, const h2b_stats_t* s, uint32_t overhead )
+{
+    const uint32_t min_ticks  = h2b_subtract_overhead( s->min_ticks, overhead );
+    const uint32_t mean_ticks = h2b_subtract_overhead( h2b_stats_mean( s ), overhead );
+    const uint32_t max_ticks  = h2b_subtract_overhead( s->max_ticks, overhead );
+    printf( "    %-14s n=%lu cycles min/mean/max=%lu/%lu/%lu  us=%lu.%02lu/%lu.%02lu/%lu.%02lu\n",
+            name, (unsigned long)s->n,
+            (unsigned long)( min_ticks * H2B_CYC_PER_TICK ),
+            (unsigned long)( mean_ticks * H2B_CYC_PER_TICK ),
+            (unsigned long)( max_ticks * H2B_CYC_PER_TICK ),
+            (unsigned long)( min_ticks / 100u ), (unsigned long)( min_ticks % 100u ),
+            (unsigned long)( mean_ticks / 100u ), (unsigned long)( mean_ticks % 100u ),
+            (unsigned long)( max_ticks / 100u ), (unsigned long)( max_ticks % 100u ) );
+}
+
+static void h2b_headroom_report( void )
+{
+    static const char* const names[] = { "1k", "10k", "15k", "17k", "multitone", "impulse" };
+    for( uint8_t kind = 0u; kind < 6u; kind++ )
+    {
+        float max_output = 0.0f;
+        float max_state = 0.0f;
+        uint8_t nonfinite = 0u;
+        h2b_filters_reset();
+        for( uint32_t block = 0u; block < 128u; block++ )
+        {
+            h2b_fill_stimulus( kind, block );
+            h2b_combined();
+            for( uint32_t ch = 0u; ch < H2B_CHANNELS; ch++ )
+            {
+                for( uint32_t n = 0u; n < H2B_BLOCK_FRAMES; n++ )
+                {
+                    const float a = fabsf( h2b_output[ch][n] );
+                    if( !isfinite( h2b_output[ch][n] ) ) { nonfinite = 1u; }
+                    if( a > max_output ) { max_output = a; }
+                }
+                for( uint32_t s = 0u; s < ( ASRC_H2_IIR_SOS * 2u ); s++ )
+                {
+                    const float state = H2B_IIR_STATE[( ch * ASRC_H2_IIR_SOS * 2u ) + s];
+                    const float a = fabsf( state );
+                    if( !isfinite( state ) ) { nonfinite = 1u; }
+                    if( a > max_state ) { max_state = a; }
+                }
+            }
+        }
+        printf( "    headroom %-9s out=%lu.%03lu FS state=%lu.%03lu FS finite=%s\n",
+                names[kind],
+                (unsigned long)( max_output / H2B_FULL_SCALE ),
+                (unsigned long)( ( ( max_output / H2B_FULL_SCALE ) * 1000.0f ) ) % 1000u,
+                (unsigned long)( max_state / H2B_FULL_SCALE ),
+                (unsigned long)( ( ( max_state / H2B_FULL_SCALE ) * 1000.0f ) ) % 1000u,
+                nonfinite ? "FAIL" : "pass" );
+    }
+}
+
+void asrc_h2_timing_bench_run( uint32_t trials )
+{
+    h2b_stats_t empty, fir, iir, combined;
+    uint32_t sp_probe = 0u;
+    if( trials == 0u ) { trials = H2B_DEFAULT_TRIALS; }
+
+    if( ( H2B_Y_ARENA <= (uintptr_t)&sp_probe ) ||
+        ( ( H2B_Y_ARENA - (uintptr_t)&sp_probe ) < 4096u ) )
+    {
+        printf( "\n *ah REFUSING to run: Y scratch 0x%05lx, stack near 0x%05lx; 4096 B required.\n",
+                (unsigned long)H2B_Y_ARENA, (unsigned long)(uintptr_t)&sp_probe );
+        return;
+    }
+
+    h2b_filters_reset();
+    h2b_fill_stimulus( 4u, 0u );
+    h2b_stats_reset( &empty );
+    h2b_stats_reset( &fir );
+    h2b_stats_reset( &iir );
+    h2b_stats_reset( &combined );
+
+    /* No IPL masking: min is the uncontended floor while mean/max retain the
+     * real foreground preemption by TDM/DMA.  A p99 would require retaining a
+     * 10,000-element sample array, so this probe reports the full extrema and
+     * mean without adding that persistent RAM to the measurement image. */
+    for( uint32_t i = 0u; i < trials; i++ )
+    {
+        uint32_t t0 = nora_high_res_timer_get_count();
+        h2b_stats_add( &empty, nora_high_res_timer_get_count() - t0 );
+    }
+    for( uint32_t i = 0u; i < trials; i++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        h2b_fir_only();
+        h2b_stats_add( &fir, nora_high_res_timer_get_count() - t0 );
+    }
+    for( uint32_t i = 0u; i < trials; i++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        h2b_iir_only();
+        h2b_stats_add( &iir, nora_high_res_timer_get_count() - t0 );
+    }
+    h2b_filters_reset();
+    h2b_fill_stimulus( 4u, 0u );
+    for( uint32_t i = 0u; i < trials; i++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        h2b_combined();
+        h2b_stats_add( &combined, nora_high_res_timer_get_count() - t0 );
+    }
+
+    printf( "\n *ah H2 component timing  FIR49/fc16 + elliptic 5-SOS DF2T (no EQ)\n" );
+    printf( "    coeff crc=0x%08lx fir=0x%08lx sos=0x%08lx  CPU=%luMHz timer=%luMHz tick=0.01us cycles/tick=%lu\n",
+            (unsigned long)ASRC_H2_COEFF_CRC32, (unsigned long)ASRC_H2_FIR49_CRC32,
+            (unsigned long)ASRC_H2_DF2T_SOS_CRC32,
+            (unsigned long)( PLL1_CLK_HZ / 1000000UL ), (unsigned long)( FCY / 1000000UL ),
+            (unsigned long)H2B_CYC_PER_TICK );
+    printf( "    geometry=16ch x 16frames = 256 samples/block; FIR=12544 MAC/block; IIR=6400 mul + 5120 add/block\n" );
+    printf( "    flow=float ASRC-domain -> FIR49/wide8 -> float DF2T -> float generic ASRC; sample conversion=0\n" );
+    printf( "    placement: fir-coeff=0x%05lx (%s) fir-history=0x%05lx (%s)\n",
+            (unsigned long)(uintptr_t)&asrc_h2_fir49[0],
+            h2b_data_space( &asrc_h2_fir49[0] ),
+            (unsigned long)(uintptr_t)H2B_FIR_HISTORY, h2b_data_space( H2B_FIR_HISTORY ) );
+    printf( "               iir-coeff=0x%05lx (%s) iir-state=0x%05lx (%s), scratch end=0x%05lx\n",
+            (unsigned long)(uintptr_t)&asrc_h2_df2t_sos[0], h2b_data_space( &asrc_h2_df2t_sos[0] ),
+            (unsigned long)(uintptr_t)H2B_IIR_STATE, h2b_data_space( H2B_IIR_STATE ),
+            (unsigned long)H2B_Y_ARENA_END );
+    printf( "    raw timer pair ticks min/mean/max=%lu/%lu/%lu; printed component results subtract its minimum.\n",
+            (unsigned long)empty.min_ticks, (unsigned long)h2b_stats_mean( &empty ),
+            (unsigned long)empty.max_ticks );
+    h2b_print_timing( "FIR49", &fir, empty.min_ticks );
+    h2b_print_timing( "IIR 5-SOS", &iir, empty.min_ticks );
+    h2b_print_timing( "FIR+IIR", &combined, empty.min_ticks );
+    h2b_headroom_report();
+}
+
+/* ---- Phase 3: H2 existing optimized-kernel feasibility ---------------------------------------
+ *
+ * This remains a foreground microbenchmark.  It neither attaches the H2
+ * frontend to audio nor calls the generic ASRC.  Its narrow question is whether
+ * the existing DSP primitives plus all required float/Q31 boundaries leave a
+ * credible amount of a 333.33 us block for those unmeasured shipping steps.
+ */
+typedef void (*h2b_runner_t)( void );
+
+typedef struct
+{
+    float max_error;
+    float peak;
+    uint32_t saturations;
+    uint8_t nonfinite;
+} h2b_validation_t;
+
+static void h2b_validation_add( h2b_validation_t* v, float reference, float actual )
+{
+    const float error = fabsf( reference - actual );
+    const float magnitude = fabsf( actual );
+    if( !isfinite( actual ) || !isfinite( reference ) ) { v->nonfinite = 1u; }
+    if( error > v->max_error ) { v->max_error = error; }
+    if( magnitude > v->peak ) { v->peak = magnitude; }
+}
+
+static void h2b_validation_check_opt_state( h2b_validation_t* v )
+{
+    for( uint32_t word = 0u; word < H2B_IIR_STATE_FLOATS; word++ )
+    {
+        if( !isfinite( H2B_OPT_IIR_STATE[word] ) ) { v->nonfinite = 1u; }
+    }
+}
+
+static void h2b_validation_print( const char* name, const h2b_validation_t* v )
+{
+    const uint32_t error_milli_fs = (uint32_t)( ( v->max_error * 1000.0f ) / H2B_FULL_SCALE );
+    const uint32_t peak_milli_fs = (uint32_t)( ( v->peak * 1000.0f ) / H2B_FULL_SCALE );
+    const uint8_t pass = ( !v->nonfinite ) && ( v->saturations == 0u ) &&
+                         ( v->max_error <= H2B_VALIDATE_TOL_COUNTS );
+    printf( "    validate %-13s err<=%lu counts (%lu.%03lu FS) peak=%lu.%03lu FS sat=%lu finite=%s %s\n",
+            name,
+            (unsigned long)v->max_error,
+            (unsigned long)( error_milli_fs / 1000u ), (unsigned long)( error_milli_fs % 1000u ),
+            (unsigned long)( peak_milli_fs / 1000u ), (unsigned long)( peak_milli_fs % 1000u ),
+            (unsigned long)v->saturations, v->nonfinite ? "FAIL" : "pass", pass ? "PASS" : "FAIL" );
+}
+
+/* IIR-only numerical check.  The Phase-3 state shares the Phase-2 state arena
+ * so that the probe remains below the reset diagnostics.  Replay deterministic
+ * checkpoints from reset: reference and candidate then see identical FIR input
+ * and IIR history without needing a second permanent Y-state bank. */
+static void h2b_validate_float_iir( const char* name, h2b_runner_t runner )
+{
+    static const uint8_t kinds[] = { 0u, 1u, 2u, 3u, 5u };  /* 1k, 10k, 15k, 17k, impulse */
+    static const uint8_t checkpoints[] = { 0u, 1u, 8u, 32u, 127u };
+    h2b_validation_t v = { 0.0f, 0.0f, 0u, 0u };
+
+    for( uint32_t test = 0u; test < ( sizeof(kinds) / sizeof(kinds[0]) ); test++ )
+    {
+        for( uint32_t point = 0u; point < ( sizeof(checkpoints) / sizeof(checkpoints[0]) ); point++ )
+        {
+            const uint32_t last = checkpoints[point];
+            h2b_filters_reset();
+            for( uint32_t block = 0u; block <= last; block++ )
+            {
+                h2b_fill_stimulus( kinds[test], block );
+                h2b_fir_only();
+                h2b_iir_only();
+            }
+            memcpy( h2b_reference, h2b_output, sizeof(h2b_reference) );
+
+            h2b_filters_reset();
+            h2b_optimized_iir_reset();
+            for( uint32_t block = 0u; block <= last; block++ )
+            {
+                h2b_fill_stimulus( kinds[test], block );
+                h2b_fir_only();
+                runner();
+            }
+            for( uint32_t channel = 0u; channel < H2B_CHANNELS; channel++ )
+            {
+                for( uint32_t frame = 0u; frame < H2B_BLOCK_FRAMES; frame++ )
+                {
+                    h2b_validation_add( &v, h2b_reference[channel][frame], h2b_opt_output[channel][frame] );
+                }
+            }
+            h2b_validation_check_opt_state( &v );
+        }
+    }
+    h2b_validation_print( name, &v );
+}
+
+/* The Q31 FIR overlays the float-wide history, so compare deterministic
+ * checkpoints by replaying the short sequence from reset.  This covers the
+ * impulse onset and tail as well as steady 1/10/15/17 kHz states without adding
+ * a large persistent reference buffer to this measurement-only image. */
+static void h2b_validate_q31_frontend( const char* name, h2b_runner_t runner )
+{
+    static const uint8_t kinds[] = { 0u, 1u, 2u, 3u, 5u };
+    static const uint8_t checkpoints[] = { 0u, 1u, 8u, 32u, 127u };
+    h2b_validation_t v = { 0.0f, 0.0f, 0u, 0u };
+
+    for( uint32_t test = 0u; test < ( sizeof(kinds) / sizeof(kinds[0]) ); test++ )
+    {
+        for( uint32_t point = 0u; point < ( sizeof(checkpoints) / sizeof(checkpoints[0]) ); point++ )
+        {
+            const uint32_t last = checkpoints[point];
+            h2b_filters_reset();
+            for( uint32_t block = 0u; block <= last; block++ )
+            {
+                h2b_fill_stimulus( kinds[test], block );
+                h2b_fir_only();
+                h2b_iir_only();
+            }
+            memcpy( h2b_reference, h2b_output, sizeof(h2b_reference) );
+
+            h2b_q31_filters_reset();
+            h2b_optimized_iir_reset();
+            for( uint32_t block = 0u; block <= last; block++ )
+            {
+                h2b_fill_stimulus( kinds[test], block );
+                h2b_float_to_q31_block();
+                h2b_q31_fir_only();
+                h2b_q31_to_float_block();
+                runner();
+            }
+            for( uint32_t channel = 0u; channel < H2B_CHANNELS; channel++ )
+            {
+                for( uint32_t frame = 0u; frame < H2B_BLOCK_FRAMES; frame++ )
+                {
+                    h2b_validation_add( &v, h2b_reference[channel][frame], h2b_opt_output[channel][frame] );
+                }
+            }
+            v.saturations += h2b_q31_saturations;
+            h2b_validation_check_opt_state( &v );
+        }
+    }
+    h2b_validation_print( name, &v );
+}
+
+static void h2b_print_speedup( const char* name, const h2b_stats_t* s,
+                                uint32_t overhead, uint32_t baseline_ticks )
+{
+    const uint32_t mean_ticks = h2b_subtract_overhead( h2b_stats_mean( s ), overhead );
+    const uint32_t speedup_x100 = ( mean_ticks != 0u ) ?
+        (uint32_t)( ( (uint64_t)baseline_ticks * 100u ) / mean_ticks ) : 0u;
+    printf( "    speedup %-14s vs baseline = %lu.%02lux\n", name,
+            (unsigned long)( speedup_x100 / 100u ), (unsigned long)( speedup_x100 % 100u ) );
+}
+
+#define H2B_MEASURE_DIRECT(stats_, trials_, call_) \
+    do { \
+        h2b_stats_reset( &(stats_) ); \
+        for( uint32_t h2b_trial = 0u; h2b_trial < (trials_); h2b_trial++ ) \
+        { \
+            const uint32_t h2b_t0 = nora_high_res_timer_get_count(); \
+            call_; \
+            h2b_stats_add( &(stats_), nora_high_res_timer_get_count() - h2b_t0 ); \
+        } \
+    } while(0)
+
+void asrc_h2_optimized_kernel_bench_run( uint32_t trials )
+{
+    h2b_stats_t empty;
+    h2b_stats_t iir_v1;
+    h2b_stats_t float_v1;
+    uint32_t sp_probe = 0u;
+    if( trials == 0u ) { trials = H2B_DEFAULT_TRIALS; }
+
+    if( ( H2B_Y_ARENA <= (uintptr_t)&sp_probe ) ||
+        ( ( H2B_Y_ARENA - (uintptr_t)&sp_probe ) < 4096u ) )
+    {
+        printf( "\n *ao REFUSING to run: Y scratch 0x%05lx, stack near 0x%05lx; 4096 B required.\n",
+                (unsigned long)H2B_Y_ARENA, (unsigned long)(uintptr_t)&sp_probe );
+        return;
+    }
+
+    h2b_q31_prepare_coefficients();
+    h2b_fill_stimulus( 4u, 0u );
+
+    printf( "\n *ao H2 Phase-3 existing-kernel feasibility  FIR49/fc16 + fixed elliptic 5-SOS (no EQ)\n" );
+    printf( "    geometry=16ch x 16frames = 256 samples/block; FIR=12544 MAC/block; IIR=1280 SOS/block\n" );
+    printf( "    flow=shipping float ASRC counts -> [float FIR | float-to-Q31 -> Q31 FIR -> Q31-to-float] -> float DF2T -> float ASRC\n" );
+    printf( "    DF2T setup=library initializer; coeff/instance=X, state=Y, src/dst=X; trials=%lu\n",
+            (unsigned long)trials );
+
+    /* Do this before timing.  A BUS ERROR here is the requested one-shot
+     * vendor feasibility probe; no shipping code or library source changes. */
+    h2b_validate_float_iir( "vendor DF2T", h2b_iir_vendor_only );
+    h2b_validate_float_iir( "opt DF2T v1", h2b_iir_opt_v1_only );
+    /* opt v2 is deliberately excluded after its one-shot validation caused a
+     * BUS ERROR at _biquad_cascade_df2T_f32_dspic33ak_opt_v2+0x40.  Phase 3
+     * records it as unavailable rather than debugging or modifying it. */
+
+    h2b_stats_reset( &empty );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        h2b_stats_add( &empty, nora_high_res_timer_get_count() - t0 );
+    }
+
+    /* The vendor DF2T passed the short numerical validation above but one
+     * 16ch x 16-sample timed call raised BUS ERROR at
+     * _mchp_biquad_cascade_df2T_f32+0x34.  Do not invoke it again: this phase
+     * classifies it as unavailable rather than debugging the library. */
+    h2b_optimized_iir_reset();
+    H2B_MEASURE_DIRECT( iir_v1, trials, h2b_iir_opt_v1_only() );
+
+    h2b_filters_reset();
+    h2b_optimized_iir_reset();
+    H2B_MEASURE_DIRECT( float_v1, trials, h2b_float_opt_v1_combined() );
+
+    printf( "    timer pair ticks min/mean/max=%lu/%lu/%lu; all component values subtract the minimum.\n",
+            (unsigned long)empty.min_ticks, (unsigned long)h2b_stats_mean( &empty ),
+            (unsigned long)empty.max_ticks );
+    printf( "    Phase-2 float-C baseline mean: FIR49=261.92 us  IIR5=330.01 us  combined=592.14 us\n" );
+    printf( "  Q31 FIR candidate: REJECT before timing: validation has saturation/quantization error; prior 10000-trial attempt trapped in fir_ring_q31.\n" );
+    printf( "  vendor DF2T: UNAVAILABLE: short validation PASS, but one 16ch x 16 timed call BUS ERROR at +0x34; excluded without debug.\n" );
+    printf( "  opt DF2T v2: UNAVAILABLE: one validation caused BUS ERROR at its +0x40; excluded without debug.\n" );
+    printf( "  5-SOS IIR candidates:\n" );
+    h2b_print_timing( "opt DF2T v1", &iir_v1, empty.min_ticks );
+    h2b_print_speedup( "opt DF2T v1", &iir_v1, empty.min_ticks, 33001u );
+    printf( "  Combined float frontend candidates:\n" );
+    h2b_print_timing( "float + opt v1", &float_v1, empty.min_ticks );
+    h2b_print_speedup( "float + opt v1", &float_v1, empty.min_ticks, 59214u );
+    printf( "    generic ASRC step~=1.5 = NOT RUN (no full-chain or ASRC integration in Phase 3)\n" );
+    printf( " *ao complete\n" );
+}
+
+#undef H2B_MEASURE_DIRECT
+#endif /* ASRC_H2_KERNEL_BENCH_AVAILABLE */
+
+/* ---- Short /2 FIR versus IIR CPU trade-off -----------------------------------------------------
+ *
+ * This is deliberately a kernel-only calibration.  It reproduces the existing
+ * Q31 /2 front end's one-call-per-channel batch geometry, but does not attach a
+ * coefficient set to any live rate or alter the audio path.  Its answer is
+ * therefore "what CPU does a shorter existing kernel buy?", not "is this a
+ * 48->32 filter?"  The latter requires its own topology and spectral gate.
+ */
+#define FIRT_CHANNELS       (16u)
+#define FIRT_INPUT_FRAMES   (16u)
+#define FIRT_DECIMATION     (2u)
+#define FIRT_OUTPUTS        (FIRT_INPUT_FRAMES / FIRT_DECIMATION)
+#define FIRT_BLOCK_CALLS    (FIRT_CHANNELS)
+#define FIRT_RING_SAMPLES   (209u)  /* shipping Q31 /2 ring allocation */
+#define FIRT_DEFAULT_TRIALS (10000u)
+#define FIRT_Y_ARENA        (0x12240u) /* same checked probe-local Y region as H2 */
+#define FIRT_Y_ARENA_LIMIT  (0x13E00u)
+#define FIRT_Y_RING         ((int32_t*)(uintptr_t)FIRT_Y_ARENA)
+#define FIRT_Y_RING_END     (FIRT_Y_ARENA + (FIRT_RING_SAMPLES * sizeof(int32_t)))
+#define FIRT_CYC_PER_TICK   (PLL1_CLK_HZ / FCY)
+
+_Static_assert( FIRT_OUTPUTS == 8u, "16-frame /2 probe must emit eight outputs" );
+_Static_assert( FIRT_Y_RING_END <= FIRT_Y_ARENA_LIMIT, "trade-off ring exceeds checked Y scratch" );
+
+typedef struct
+{
+    uint32_t min_ticks;
+    uint32_t max_ticks;
+    uint64_t sum_ticks;
+    uint32_t n;
+} firt_stats_t;
+
+static void firt_stats_reset( firt_stats_t* s )
+{
+    s->min_ticks = UINT32_MAX;
+    s->max_ticks = 0u;
+    s->sum_ticks = 0u;
+    s->n = 0u;
+}
+
+static void firt_stats_add( firt_stats_t* s, uint32_t ticks )
+{
+    if( ticks < s->min_ticks ) { s->min_ticks = ticks; }
+    if( ticks > s->max_ticks ) { s->max_ticks = ticks; }
+    s->sum_ticks += ticks;
+    s->n++;
+}
+
+static uint32_t firt_stats_mean( const firt_stats_t* s )
+{
+    return ( s->n != 0u ) ? (uint32_t)( s->sum_ticks / s->n ) : 0u;
+}
+
+static uint32_t firt_subtract_overhead( uint32_t ticks, uint32_t overhead )
+{
+    return ( ticks > overhead ) ? ( ticks - overhead ) : 0u;
+}
+
+static void firt_print_timing( const char* name, const firt_stats_t* s, uint32_t overhead )
+{
+    const uint32_t min_ticks  = firt_subtract_overhead( s->min_ticks, overhead );
+    const uint32_t mean_ticks = firt_subtract_overhead( firt_stats_mean( s ), overhead );
+    const uint32_t max_ticks  = firt_subtract_overhead( s->max_ticks, overhead );
+    printf( "    %-6s n=%lu cycles/block min/mean/max=%lu/%lu/%lu  us/block=%lu.%02lu/%lu.%02lu/%lu.%02lu\n",
+            name, (unsigned long)s->n,
+            (unsigned long)( min_ticks * FIRT_CYC_PER_TICK ),
+            (unsigned long)( mean_ticks * FIRT_CYC_PER_TICK ),
+            (unsigned long)( max_ticks * FIRT_CYC_PER_TICK ),
+            (unsigned long)( min_ticks / 100u ), (unsigned long)( min_ticks % 100u ),
+            (unsigned long)( mean_ticks / 100u ), (unsigned long)( mean_ticks % 100u ),
+            (unsigned long)( max_ticks / 100u ), (unsigned long)( max_ticks % 100u ) );
+}
+
+typedef struct
+{
+    const char* name;
+    uint16_t taps;
+    const int32_t* coeff_flash;
+    int64_t sum_q31;
+} firt_candidate_t;
+
+static const firt_candidate_t firt_candidates[] = {
+    { "FIR107", 107u, firt_coeff_107, FIRT_COEFF_107_SUM_Q31 },
+    { "FIR81",   81u, firt_coeff_81,  FIRT_COEFF_81_SUM_Q31  },
+    { "FIR65",   65u, firt_coeff_65,  FIRT_COEFF_65_SUM_Q31  },
+    { "FIR49",   49u, firt_coeff_49,  FIRT_COEFF_49_SUM_Q31  },
+    { "FIR33",   33u, firt_coeff_33,  FIRT_COEFF_33_SUM_Q31  },
+};
+
+static volatile int32_t firt_sink;
+
+static uint8_t firt_coefficients_valid( const firt_candidate_t* c )
+{
+    uint32_t nonzero = 0u;
+    int64_t sum = 0;
+    for( uint32_t k = 0u; k < c->taps; k++ )
+    {
+        if( c->coeff_flash[k] != c->coeff_flash[c->taps - 1u - k] ) { return 0u; }
+        if( c->coeff_flash[k] != 0 ) { nonzero++; }
+        sum += c->coeff_flash[k];
+    }
+    return ( nonzero == c->taps ) && ( sum == c->sum_q31 ) &&
+           ( c->coeff_flash[c->taps / 2u] != INT32_MAX );
+}
+
+/* The shipping /2 stage has 16 input frames, emits eight outputs per channel,
+ * and calls the Y-modulo kernel once per channel.  Its static history arena is
+ * 209 samples/channel even though the active /2 batch spans only taps+14;
+ * retaining that ring size preserves the real modulo setup and call shape. */
+static void firt_prepare_candidate( const firt_candidate_t* c )
+{
+    memcpy( firb_coeff, c->coeff_flash, (size_t)c->taps * sizeof(firb_coeff[0]) );
+    firb_fill_samples( FIRT_Y_RING, FIRT_RING_SAMPLES, 0xF1A24000u + c->taps );
+}
+
+static void firt_q31_half_block( uint32_t taps )
+{
+    int32_t tmp[FIRT_OUTPUTS];
+    const uint32_t span = taps + ( ( FIRT_OUTPUTS - 1u ) * FIRT_DECIMATION );
+    const int32_t* const window = FIRT_Y_RING + ( FIRT_RING_SAMPLES - span );
+    int32_t checksum = 0;
+
+    for( uint32_t channel = 0u; channel < FIRT_CHANNELS; channel++ )
+    {
+        (void)fir_ring_q31_ymod_yonly_block( firb_coeff, window, taps, tmp,
+                                              FIRT_OUTPUTS, FIRT_DECIMATION * 4u,
+                                              FIRT_Y_RING, FIRT_RING_SAMPLES * 4u );
+        checksum ^= tmp[channel & ( FIRT_OUTPUTS - 1u )];
+    }
+    /* The external assembly call itself cannot be removed, but keep an explicit
+     * observable dependency on all sixteen calls.  This one store is tap
+     * invariant and is outside the inner FIR loops. */
+    firt_sink ^= checksum;
+}
+
+static int32_t firt_validate_candidate( uint32_t taps )
+{
+    int32_t tmp[FIRT_OUTPUTS];
+    const uint32_t span = taps + ( ( FIRT_OUTPUTS - 1u ) * FIRT_DECIMATION );
+    const int32_t* const window = FIRT_Y_RING + ( FIRT_RING_SAMPLES - span );
+    const int32_t reference = firb_ref_q31_ring( firb_coeff, FIRT_Y_RING,
+                                                  FIRT_RING_SAMPLES,
+                                                  FIRT_RING_SAMPLES - span, taps );
+    (void)fir_ring_q31_ymod_yonly_block( firb_coeff, window, taps, tmp,
+                                          FIRT_OUTPUTS, FIRT_DECIMATION * 4u,
+                                          FIRT_Y_RING, FIRT_RING_SAMPLES * 4u );
+    return tmp[0] - reference;
+}
+
+void asrc_fir_tradeoff_bench_run( uint32_t trials )
+{
+    firt_stats_t empty;
+    uint32_t sp_probe = 0u;
+    if( trials == 0u ) { trials = FIRT_DEFAULT_TRIALS; }
+
+    if( ( FIRT_Y_ARENA <= (uintptr_t)&sp_probe ) ||
+        ( ( FIRT_Y_ARENA - (uintptr_t)&sp_probe ) < 4096u ) )
+    {
+        printf( "\n *ad REFUSING to run: Y scratch 0x%05lx, stack near 0x%05lx; 4096 B required.\n",
+                (unsigned long)FIRT_Y_ARENA, (unsigned long)(uintptr_t)&sp_probe );
+        return;
+    }
+
+    firt_stats_reset( &empty );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        firt_stats_add( &empty, nora_high_res_timer_get_count() - t0 );
+    }
+
+    printf( "\n *ad short-/2 FIR CPU trade-off (calibration only; no live filter change)\n" );
+    printf( "    geometry=16ch x 16 input frames -> 8 outputs/ch; calls/block=16, MAC/block=128*taps\n" );
+    printf( "    kernel=fir_ring_q31_ymod_yonly_block; coeff=X RAM, history=Y modulo, ring=209 samples/ch\n" );
+    printf( "    candidate family=48kHz, pass=8850Hz, stop=12000Hz, Kaiser beta=11; trials=%lu\n",
+            (unsigned long)trials );
+    printf( "    timer pair ticks min/mean/max=%lu/%lu/%lu; values subtract the minimum.\n",
+            (unsigned long)empty.min_ticks, (unsigned long)firt_stats_mean( &empty ),
+            (unsigned long)empty.max_ticks );
+
+    for( uint32_t candidate = 0u;
+         candidate < ( sizeof(firt_candidates) / sizeof(firt_candidates[0]) ); candidate++ )
+    {
+        const firt_candidate_t* const c = &firt_candidates[candidate];
+        firt_stats_t stats;
+        const uint32_t macs = FIRT_CHANNELS * FIRT_OUTPUTS * c->taps;
+        const uint8_t coeff_ok = firt_coefficients_valid( c );
+
+        if( !coeff_ok )
+        {
+            printf( "    %-6s INVALID coefficient bank; not timed.\n", c->name );
+            continue;
+        }
+        firt_prepare_candidate( c );
+        const int32_t error = firt_validate_candidate( c->taps );
+        if( ( error < -4 ) || ( error > 4 ) )
+        {
+            printf( "    %-6s validation err=%ld LSB; not timed.\n", c->name, (long)error );
+            continue;
+        }
+
+        /* Warm code and the modulo path outside the measured set.  Interrupts stay
+         * enabled: min captures the uncontended floor and mean/max retain normal
+         * foreground preemption, exactly as the Stage-1 timing probe does. */
+        for( uint32_t warm = 0u; warm < 8u; warm++ ) { firt_q31_half_block( c->taps ); }
+        firt_stats_reset( &stats );
+        for( uint32_t trial = 0u; trial < trials; trial++ )
+        {
+            const uint32_t t0 = nora_high_res_timer_get_count();
+            firt_q31_half_block( c->taps );
+            firt_stats_add( &stats, nora_high_res_timer_get_count() - t0 );
+        }
+        printf( "    %-6s taps=%lu calls=%lu outputs=%lu MAC=%lu q31sum=unit err=%ld LSB\n",
+                c->name, (unsigned long)c->taps, (unsigned long)FIRT_BLOCK_CALLS,
+                (unsigned long)( FIRT_CHANNELS * FIRT_OUTPUTS ), (unsigned long)macs,
+                (long)error );
+        firt_print_timing( c->name, &stats, empty.min_ticks );
+    }
+    printf( "    FIR-only scope: history push and output format stores are tap-invariant and excluded.\n" );
+    printf( " *ad complete sink=%ld\n", (long)firt_sink );
+}
+
+
+/* ---- E-family half-band /2 kernel: measured block difference -----------------------------------
+ *
+ * MEASUREMENT ONLY.  Nothing here changes a live filter, a rate, or a default.
+ *
+ * WHAT QUESTION THIS ANSWERS.  The host CPU model
+ * ([internal] study_fir_lightweight_96k32k_2026-09-06.md, candidate E) says that
+ * replacing the shipping 41-tap /2 pre-stage with a 35-tap HALF-BAND prototype
+ * drops 22 of its 35 taps as structural zeros and should save 10.69 us/block at
+ * 12 channels.  That figure assumes the measured 1.012 cycles/MAC applies to the
+ * shorter run too -- i.e. that the fixed cost per output does not grow when the
+ * Y pointer has to stride two samples and step around the lone odd-index tap.
+ * The model cannot settle that; only the hardware can.  So this probe measures
+ * the BLOCK DIFFERENCE directly, which is the number the 500 us TDM chain
+ * actually cares about, and reports cycles/MAC only as secondary evidence.
+ *
+ * It is not a filter design and makes no claim about the response.  The
+ * coefficients are the same synthetic parabolic shape the rest of this file
+ * uses, with the half-band structural zeros forced exactly to zero; the kernels
+ * have no data-dependent branches, so timing is a function of the geometry only
+ * and synthetic taps time identically to a real 35-tap beta=11 design.  The
+ * SPECTRAL side of candidate E stays on the host, where it already is.
+ *
+ * THREE CANDIDATES, so the two effects can be separated:
+ *
+ *   DENSE41  the shipping /2 geometry.  The baseline the chain is measured against.
+ *   DENSE35  the same half-band filter, run densely -- 35 MACs, 16 of them by zero.
+ *            Its gap to DENSE41 is what merely shortening the filter buys.
+ *   HB35     the same filter again, run by the half-band kernel -- 19 MACs.
+ *            Its gap to DENSE35 is what skipping the structural zeros buys.
+ *
+ * DENSE35 and HB35 must agree BIT FOR BIT: they are one filter computed two
+ * ways.  That equality, swept over every window start in the ring, is also the
+ * correctness test for the thing that could not be reasoned about -- whether the
+ * Y AGU's modulo folds correctly when an increment of 8 can step OVER the ring
+ * end rather than landing on it.  The earlier M6 sweep only exercised increment
+ * 4.  The sweep therefore runs on the shipping 209-sample ring, whose 836 bytes
+ * are NOT a multiple of 8, and again on a 210-sample ring, whose 840 bytes are.
+ */
+#define FIRE_TAPS_DENSE     (41u)                               /* shipping /2 pre-stage */
+#define FIRE_TAPS_HB        (35u)                               /* candidate E */
+#define FIRE_HB_HALF        ((FIRE_TAPS_HB + 1u) / 4u)          /* kernel argument, = 9 */
+#define FIRE_HB_NONZERO     ((2u * FIRE_HB_HALF) + 1u)          /* = 19 */
+#define FIRE_DECIMATION     (2u)
+#define FIRE_INPUT_FRAMES   (16u)                               /* APP_BLOCK_FRAMES */
+#define FIRE_OUTPUTS        (FIRE_INPUT_FRAMES / FIRE_DECIMATION)
+#define FIRE_CH_TARGET      (12u)   /* the 96->32 kHz decision geometry */
+#define FIRE_CH_LEGACY      (16u)   /* keeps continuity with *ad's 16 ch numbers */
+#define FIRE_DEFAULT_TRIALS (10000u)
+#define FIRE_RING_ODD       (209u)  /* shipping allocation: 836 B, NOT a multiple of 8 */
+#define FIRE_RING_EVEN      (210u)  /* 840 B = 105 * 8, so stride 8 always LANDS on the end */
+#define FIRE_Y_ARENA        (0x12240u) /* same checked probe-local Y region as *ad */
+#define FIRE_Y_ARENA_LIMIT  (0x13E00u)
+#define FIRE_Y_RING         ((int32_t*)(uintptr_t)FIRE_Y_ARENA)
+
+/* All three banks live in X space at once, at fixed offsets in the shared
+ * coefficient array, so the wrap sweep can call both kernels for the same window
+ * start without swapping banks between them.  X modulo is off in both kernels,
+ * so no start-address rule applies to these offsets. */
+#define FIRE_X_DENSE41      (&firb_coeff[0])
+#define FIRE_X_DENSE35      (&firb_coeff[64])
+#define FIRE_X_HB35         (&firb_coeff[128])
+
+_Static_assert( FIRE_OUTPUTS == 8u, "16-frame /2 probe must emit eight outputs" );
+_Static_assert( ( 4u * FIRE_HB_HALF ) - 1u == FIRE_TAPS_HB,
+                "a half-band length must be 4*half-1 so its centre index is odd" );
+_Static_assert( 64u >= FIRE_TAPS_DENSE, "dense41 bank overruns the dense35 bank" );
+_Static_assert( 128u >= ( 64u + FIRE_TAPS_HB ), "dense35 bank overruns the half-band bank" );
+_Static_assert( ( 128u + FIRE_HB_NONZERO ) <= 256u, "half-band bank overruns firb_coeff" );
+_Static_assert( ( FIRE_Y_ARENA + ( FIRE_RING_EVEN * sizeof(int32_t) ) ) <= FIRE_Y_ARENA_LIMIT,
+                "half-band ring exceeds checked Y scratch" );
+
+static volatile int32_t fire_sink;
+static uint32_t fire_ring_samples = FIRE_RING_ODD;
+
+/* Builds the three banks.  Returns the number of non-zero taps actually packed,
+ * which the caller checks against FIRE_HB_NONZERO -- that equality is the proof
+ * that the bank's zero pattern is the one the kernel's stride assumes, and it is
+ * derived from the half-band definition here rather than hard-coded twice. */
+static uint32_t fire_build_banks( void )
+{
+    float          shape[FIRE_TAPS_HB];
+    const uint32_t centre = ( FIRE_TAPS_HB - 1u ) / 2u;   /* 17, odd by construction */
+    float          sum    = 0.0f;
+    uint32_t       packed = 0u;
+
+    /* DENSE41 goes to firb_coeff[0 ..] by construction of firb_fill_coeff(). */
+    firb_fill_coeff( FIRE_TAPS_DENSE );
+
+    for( uint32_t i = 0u; i < FIRE_TAPS_HB; i++ )
+    {
+        const uint32_t d = ( i < centre ) ? ( centre - i ) : ( i - centre );
+        /* A half-band prototype is exactly zero at every EVEN offset from the
+         * centre, the centre itself excepted.  Force that, do not approximate
+         * it: it is the structure the kernel skips over. */
+        if( ( d != 0u ) && ( ( d & 1u ) == 0u ) )
+        {
+            shape[i] = 0.0f;
+            continue;
+        }
+        const float env = (float)( ( i + 1u ) * ( FIRE_TAPS_HB - i ) );
+        shape[i] = ( ( ( d / 5u ) & 1u ) != 0u ) ? -env : env;
+        sum += ( shape[i] < 0.0f ) ? -shape[i] : shape[i];
+    }
+
+    /* sum|h| = 0.5 keeps the int64 reference below an accumulator overflow, the
+     * same bound firb_fill_coeff() maintains. */
+    const float scale = 0.5f / sum;
+    for( uint32_t i = 0u; i < FIRE_TAPS_HB; i++ )
+    {
+        const int32_t q = (int32_t)( shape[i] * scale * 2147483648.0f );
+        const uint32_t d = ( i < centre ) ? ( centre - i ) : ( i - centre );
+        FIRE_X_DENSE35[i] = q;
+        if( ( d == 0u ) || ( ( d & 1u ) != 0u ) )
+        {
+            /* ascending index order, which puts the centre between taps 16 and
+             * 18 -- exactly the order the kernel walks with its plain +=4 */
+            FIRE_X_HB35[packed] = q;
+            packed++;
+        }
+    }
+    return packed;
+}
+
+static void fire_dense_block( uint32_t channels, const int32_t* xcoeff, uint32_t taps )
+{
+    int32_t              tmp[FIRE_OUTPUTS];
+    const uint32_t       span   = taps + ( ( FIRE_OUTPUTS - 1u ) * FIRE_DECIMATION );
+    const int32_t* const window = FIRE_Y_RING + ( fire_ring_samples - span );
+    int32_t              checksum = 0;
+
+    for( uint32_t ch = 0u; ch < channels; ch++ )
+    {
+        (void)fir_ring_q31_ymod_yonly_block( xcoeff, window, taps, tmp, FIRE_OUTPUTS,
+                                             FIRE_DECIMATION * 4u, FIRE_Y_RING,
+                                             fire_ring_samples * 4u );
+        checksum ^= tmp[ch & ( FIRE_OUTPUTS - 1u )];
+    }
+    fire_sink ^= checksum;
+}
+
+static void fire_hb_block( uint32_t channels )
+{
+    int32_t              tmp[FIRE_OUTPUTS];
+    const uint32_t       span   = FIRE_TAPS_HB + ( ( FIRE_OUTPUTS - 1u ) * FIRE_DECIMATION );
+    const int32_t* const window = FIRE_Y_RING + ( fire_ring_samples - span );
+    int32_t              checksum = 0;
+
+    for( uint32_t ch = 0u; ch < channels; ch++ )
+    {
+        (void)fir_ring_q31_hb_ymod_yonly_block( FIRE_X_HB35, window, FIRE_HB_HALF, tmp,
+                                                FIRE_OUTPUTS, FIRE_DECIMATION * 4u,
+                                                FIRE_Y_RING, fire_ring_samples * 4u );
+        checksum ^= tmp[ch & ( FIRE_OUTPUTS - 1u )];
+    }
+    fire_sink ^= checksum;
+}
+
+/* Sweeps EVERY window start in the current ring.  At each start it runs the same
+ * filter through both kernels and against the int64 reference, so it reports two
+ * independent facts: whether the dense path still matches arithmetic done
+ * without any AGU (max_ref_err), and whether the stride-8 path matches the
+ * stride-4 path bit for bit (mismatches).  A wrap that the AGU folded wrongly
+ * shows up in the second even if the first is clean. */
+static void fire_wrap_sweep( uint32_t* max_ref_err, uint32_t* mismatches, uint32_t* first_bad_start )
+{
+    int32_t        od[FIRE_OUTPUTS];
+    int32_t        oh[FIRE_OUTPUTS];
+    const uint32_t n     = fire_ring_samples;
+    uint32_t       worst = 0u;
+    uint32_t       bad   = 0u;
+    uint32_t       first = UINT32_MAX;
+
+    for( uint32_t start = 0u; start < n; start++ )
+    {
+        (void)fir_ring_q31_ymod_yonly_block( FIRE_X_DENSE35, FIRE_Y_RING + start, FIRE_TAPS_HB,
+                                             od, FIRE_OUTPUTS, FIRE_DECIMATION * 4u,
+                                             FIRE_Y_RING, n * 4u );
+        (void)fir_ring_q31_hb_ymod_yonly_block( FIRE_X_HB35, FIRE_Y_RING + start, FIRE_HB_HALF,
+                                                oh, FIRE_OUTPUTS, FIRE_DECIMATION * 4u,
+                                                FIRE_Y_RING, n * 4u );
+        for( uint32_t j = 0u; j < FIRE_OUTPUTS; j++ )
+        {
+            const uint32_t s = ( start + ( j * FIRE_DECIMATION ) ) % n;
+            const int32_t  r = firb_ref_q31_ring( FIRE_X_DENSE35, FIRE_Y_RING, n, s,
+                                                  FIRE_TAPS_HB );
+            const int32_t  e = od[j] - r;
+            const uint32_t a = (uint32_t)( ( e < 0 ) ? -e : e );
+
+            if( a > worst ) { worst = a; }
+            if( oh[j] != od[j] )
+            {
+                bad++;
+                if( first == UINT32_MAX ) { first = start; }
+            }
+        }
+    }
+    *max_ref_err     = worst;
+    *mismatches      = bad;
+    *first_bad_start = first;
+}
+
+/* Ticks are 100 MHz, so one tick is exactly 0.01 us and the split below is not a
+ * conversion.  Cycles are 200 MHz (1 tick = 2 instruction cycles). */
+static void fire_print_delta( const char* label, int32_t delta_ticks, const char* note )
+{
+    const uint32_t mag = (uint32_t)( ( delta_ticks < 0 ) ? -delta_ticks : delta_ticks );
+    printf( "      %-22s %s%lu.%02lu us/block   %s\n", label,
+            ( delta_ticks < 0 ) ? "-" : "+",
+            (unsigned long)( mag / 100u ), (unsigned long)( mag % 100u ), note );
+}
+
+static void fire_print_per_mac( const char* name, const firt_stats_t* s, uint32_t overhead,
+                                uint32_t macs )
+{
+    const uint32_t ticks  = firt_subtract_overhead( s->min_ticks, overhead );
+    const uint32_t cycles = ticks * FIRT_CYC_PER_TICK;
+    const uint32_t milli  = ( macs != 0u ) ? (uint32_t)( ( (uint64_t)cycles * 1000u ) / macs ) : 0u;
+    printf( "      %-8s MAC/block=%-5lu cycles/MAC=%lu.%03lu\n", name, (unsigned long)macs,
+            (unsigned long)( milli / 1000u ), (unsigned long)( milli % 1000u ) );
+}
+
+static void fire_time_one( const char* name, uint32_t channels, uint32_t taps, uint32_t macs,
+                           uint8_t half_band, uint32_t trials, uint32_t overhead,
+                           firt_stats_t* out )
+{
+    /* Warm the code and the modulo path outside the measured set.  Interrupts stay
+     * enabled, as in *ad: min is the uncontended floor, mean/max keep normal
+     * foreground preemption. */
+    for( uint32_t warm = 0u; warm < 8u; warm++ )
+    {
+        if( half_band ) { fire_hb_block( channels ); }
+        else            { fire_dense_block( channels, ( taps == FIRE_TAPS_DENSE ) ? FIRE_X_DENSE41
+                                                                                 : FIRE_X_DENSE35,
+                                            taps ); }
+    }
+    firt_stats_reset( out );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        if( half_band ) { fire_hb_block( channels ); }
+        else            { fire_dense_block( channels, ( taps == FIRE_TAPS_DENSE ) ? FIRE_X_DENSE41
+                                                                                 : FIRE_X_DENSE35,
+                                            taps ); }
+        firt_stats_add( out, nora_high_res_timer_get_count() - t0 );
+    }
+    printf( "      %-8s taps=%lu non-zero=%lu calls=%lu outputs=%lu\n", name,
+            (unsigned long)taps,
+            (unsigned long)( half_band ? FIRE_HB_NONZERO : taps ),
+            (unsigned long)channels, (unsigned long)( channels * FIRE_OUTPUTS ) );
+    firt_print_timing( name, out, overhead );
+    fire_print_per_mac( name, out, overhead, macs );
+}
+
+void asrc_hb_kernel_bench_run( uint32_t trials )
+{
+    firt_stats_t empty;
+    uint32_t     sp_probe = 0u;
+    if( trials == 0u ) { trials = FIRE_DEFAULT_TRIALS; }
+
+    if( ( FIRE_Y_ARENA <= (uintptr_t)&sp_probe ) ||
+        ( ( FIRE_Y_ARENA - (uintptr_t)&sp_probe ) < 4096u ) )
+    {
+        printf( "\n *ae REFUSING to run: Y scratch 0x%05lx, stack near 0x%05lx; 4096 B required.\n",
+                (unsigned long)FIRE_Y_ARENA, (unsigned long)(uintptr_t)&sp_probe );
+        return;
+    }
+
+    const uint32_t packed = fire_build_banks();
+
+    printf( "\n *ae half-band /2 kernel, measured block difference (measurement only; no live filter change)\n" );
+    printf( "    geometry=%luch and %luch x %lu input frames -> %lu outputs/ch, decimation %lu\n",
+            (unsigned long)FIRE_CH_TARGET, (unsigned long)FIRE_CH_LEGACY,
+            (unsigned long)FIRE_INPUT_FRAMES, (unsigned long)FIRE_OUTPUTS,
+            (unsigned long)FIRE_DECIMATION );
+    printf( "    coeff=X RAM, history=Y modulo; dense=fir_ring_q31_ymod_yonly_block  half-band=fir_ring_q31_hb_ymod_yonly_block\n" );
+    printf( "    candidate E: %lu tap half-band, half=%lu, non-zero=%lu of %lu (even indices + centre %lu)\n",
+            (unsigned long)FIRE_TAPS_HB, (unsigned long)FIRE_HB_HALF, (unsigned long)packed,
+            (unsigned long)FIRE_TAPS_HB, (unsigned long)( ( FIRE_TAPS_HB - 1u ) / 2u ) );
+    printf( "    coefficients are synthetic: this probe times the geometry, it does not qualify a response.\n" );
+
+    if( packed != FIRE_HB_NONZERO )
+    {
+        printf( "    REFUSING to run: bank packed %lu non-zero taps, kernel stride assumes %lu.\n",
+                (unsigned long)packed, (unsigned long)FIRE_HB_NONZERO );
+        return;
+    }
+
+    firt_stats_reset( &empty );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        firt_stats_add( &empty, nora_high_res_timer_get_count() - t0 );
+    }
+    printf( "    trials=%lu; timer pair ticks min/mean/max=%lu/%lu/%lu; values subtract the minimum.\n",
+            (unsigned long)trials, (unsigned long)empty.min_ticks,
+            (unsigned long)firt_stats_mean( &empty ), (unsigned long)empty.max_ticks );
+
+    /* ---- correctness first, on both ring lengths ---- */
+    static const uint32_t fire_rings[2] = { FIRE_RING_ODD, FIRE_RING_EVEN };
+    uint32_t              wrap_ok = 1u;
+
+    printf( "    stride-8 modulo wrap sweep (every window start; dense and half-band are one filter):\n" );
+    for( uint32_t r = 0u; r < 2u; r++ )
+    {
+        uint32_t max_ref_err = 0u;
+        uint32_t mismatches  = 0u;
+        uint32_t first_bad   = UINT32_MAX;
+
+        fire_ring_samples = fire_rings[r];
+        firb_fill_samples( FIRE_Y_RING, fire_ring_samples, 0xE1B24000u + fire_ring_samples );
+        fire_wrap_sweep( &max_ref_err, &mismatches, &first_bad );
+
+        printf( "      ring=%lu samples (%lu B%s): starts=%lu  dense-vs-int64ref max|err|=%lu LSB  hb-vs-dense mismatches=%lu",
+                (unsigned long)fire_ring_samples,
+                (unsigned long)( fire_ring_samples * 4u ),
+                ( ( ( fire_ring_samples * 4u ) % 8u ) == 0u ) ? ", a multiple of 8"
+                                                              : ", NOT a multiple of 8",
+                (unsigned long)fire_ring_samples, (unsigned long)max_ref_err,
+                (unsigned long)mismatches );
+        if( mismatches != 0u ) { printf( " first at start=%lu", (unsigned long)first_bad ); }
+        printf( "\n" );
+
+        if( ( mismatches != 0u ) || ( max_ref_err > 4u ) ) { wrap_ok = 0u; }
+    }
+
+    if( !wrap_ok )
+    {
+        printf( "    NOT TIMED: the half-band kernel does not reproduce the dense result, so any\n" );
+        printf( "    cycle count would be the cost of a wrong answer.  The stride-8 AGU wrap is the\n" );
+        printf( "    first suspect; see the first failing start above.\n" );
+        printf( " *ae complete sink=%ld\n", (long)fire_sink );
+        return;
+    }
+
+    /* ---- timing, on the shipping ring only (tap geometry, not ring length, sets the cost) ---- */
+    fire_ring_samples = FIRE_RING_ODD;
+    firb_fill_samples( FIRE_Y_RING, fire_ring_samples, 0xE1B24000u + fire_ring_samples );
+
+    static const uint32_t fire_channel_sets[2] = { FIRE_CH_TARGET, FIRE_CH_LEGACY };
+    for( uint32_t c = 0u; c < 2u; c++ )
+    {
+        const uint32_t ch = fire_channel_sets[c];
+        firt_stats_t   d41;
+        firt_stats_t   d35;
+        firt_stats_t   hb;
+
+        printf( "    %luch, ring=%lu samples:\n", (unsigned long)ch,
+                (unsigned long)fire_ring_samples );
+        fire_time_one( "DENSE41", ch, FIRE_TAPS_DENSE, ch * FIRE_OUTPUTS * FIRE_TAPS_DENSE, 0u,
+                       trials, empty.min_ticks, &d41 );
+        fire_time_one( "DENSE35", ch, FIRE_TAPS_HB, ch * FIRE_OUTPUTS * FIRE_TAPS_HB, 0u,
+                       trials, empty.min_ticks, &d35 );
+        fire_time_one( "HB35", ch, FIRE_TAPS_HB, ch * FIRE_OUTPUTS * FIRE_HB_NONZERO, 1u,
+                       trials, empty.min_ticks, &hb );
+
+        const int32_t t41 = (int32_t)firt_subtract_overhead( d41.min_ticks, empty.min_ticks );
+        const int32_t t35 = (int32_t)firt_subtract_overhead( d35.min_ticks, empty.min_ticks );
+        const int32_t thb = (int32_t)firt_subtract_overhead( hb.min_ticks, empty.min_ticks );
+
+        fire_print_delta( "HB35 - DENSE41", thb - t41,
+                          "PRIMARY: what candidate E buys against the shipping pre-stage" );
+        fire_print_delta( "HB35 - DENSE35", thb - t35,
+                          "the structural-zero saving alone, same filter both sides" );
+        fire_print_delta( "DENSE35 - DENSE41", t35 - t41,
+                          "the shortening alone, before any zero is skipped" );
+    }
+
+    printf( "    host model for comparison (%luch): DENSE41 19.92 us, HB35 9.23 us, difference -10.69 us\n",
+            (unsigned long)FIRE_CH_TARGET );
+    printf( "    host model bands, secondary evidence only: cycles/MAC <=1.088 -> about 10 us saved,\n" );
+    printf( "    <=1.307 -> about 8 us saved, >1.307 -> the half-band gain thins out.\n" );
+    printf( "    The judgement is the measured HB35 - DENSE41 block delta above, not cycles/MAC.\n" );
+    printf( "    Scope: FIR kernel only.  History push, format stores and the rest of the leg are\n" );
+    printf( "    tap-invariant and excluded, so this delta transfers to the chain but the absolute\n" );
+    printf( "    figures are not a leg time.\n" );
+    printf( " *ae complete sink=%ld\n", (long)fire_sink );
+}
+
+
+/* ---- Full-IIR precheck: six-SOS 48 kHz anti-alias LPF ------------------------------------------
+ *
+ * Phase-4 qualified a six-SOS elliptic LPF for the topology
+ *
+ *     48 kHz -> IIR only -> unchanged generic ASRC at step about 1.5 -> 32 kHz
+ *
+ * and estimated its cost as 6 x 25.7 = 154.2 us/block by scaling the Phase-3
+ * FIVE-SOS measurement linearly.  That estimate is what this probe replaces: it
+ * times SIX sections with the same kernel, the same 16 ch x 16 frame geometry and
+ * the same placement, so the sixth section's real marginal cost is measured
+ * rather than assumed.
+ *
+ * It measures the IIR ONLY.  The rest of the Full-IIR budget -- removing the N97
+ * front end and moving the generic ASRC from step about 1.0 to step about 1.5 --
+ * is not a kernel question and is deliberately not modelled here: it is measured
+ * as the difference between two runtime images (APP_ASRC_RUNTIME_48K_TO_8 = 1
+ * and 0) at A = 48 kHz / B = 32 kHz, from the same max_demand / pull telemetry
+ * the existing CPU-margin study used.  Timing a bench replica of either would
+ * answer a different question than "what does the shipping system cost".
+ *
+ * Like every probe in this file it is foreground-only, opt-in, touches no
+ * streaming state, and never enters the audio path.
+ */
+#if ASRC_H2_KERNEL_BENCH_AVAILABLE
+
+#include "asrc_full_iir_precheck_coeffs.h"
+
+#define FIP_CHANNELS         H2B_CHANNELS
+#define FIP_BLOCK_FRAMES     H2B_BLOCK_FRAMES
+#define FIP_DEFAULT_TRIALS   (10000u)
+#define FIP_STATE_FLOATS     (FIP_CHANNELS * ASRC_FULL_IIR_SOS * 2u)
+#define FIP_STATE            ( (float*)(uintptr_t)( H2B_Y_ARENA + \
+                               ( H2B_FIR_HISTORY_FLOATS * sizeof(float) ) ) )
+#define FIP_Y_ARENA_END      ( H2B_Y_ARENA + \
+                               ( ( H2B_FIR_HISTORY_FLOATS + FIP_STATE_FLOATS ) * sizeof(float) ) )
+#define FIP_EXPECTED_CRC32   (0x67AE5F41u)
+#define FIP_PHASE3_FIVE_SOS_MEAN_TICKS (12864u)
+
+/* The six-SOS state needs 128 B more than the five-SOS H2 bank it shares the
+ * arena with.  Assert it rather than trust the arithmetic: the region above is
+ * the reset diagnostics, and overrunning it would corrupt them silently. */
+_Static_assert( FIP_Y_ARENA_END <= H2B_Y_ARENA_LIMIT,
+                "full-IIR six-SOS state exceeds the checked Y scratch arena" );
+_Static_assert( ASRC_FULL_IIR_SOS == 6u, "the Phase-4 candidate is six sections" );
+_Static_assert( ASRC_FULL_IIR_DF2T_SOS_CRC32 == FIP_EXPECTED_CRC32,
+                "generated coefficient header is not the Phase-4 six-SOS candidate" );
+
+/* NO new X-space buffers.  The AK512 ASRC image links with the data spaces full:
+ * a 16x16 float output block plus sixteen DF2T instances (about 1.15 KB) is enough
+ * to fail the link outright.  The H2 probe already owns exactly those two objects,
+ * the two probes are foreground-only and never run concurrently, and both re-init
+ * the instances before use -- so they are shared rather than duplicated. */
+#define fip_instance  h2b_iir_instance
+#define fip_output    h2b_opt_output
+
+static void fip_reset( void )
+{
+    memset( FIP_STATE, 0, FIP_STATE_FLOATS * sizeof(float) );
+    for( uint32_t channel = 0u; channel < FIP_CHANNELS; channel++ )
+    {
+        /* Through the library initializer, never by field assignment: direct
+         * assignment was the Phase-2 BUS ERROR path (see h2b_optimized_iir_reset). */
+        mchp_biquad_cascade_df2T_init_f32(
+            &fip_instance[channel], (uint8_t)ASRC_FULL_IIR_SOS,
+            asrc_full_iir_df2t_sos,
+            &FIP_STATE[ channel * ASRC_FULL_IIR_SOS * 2u ] );
+    }
+}
+
+/* Reuses the H2 probe's input block and stimulus generator: same channel count,
+ * same block length, same 48 kHz time base, same full-scale convention. */
+static void fip_opt_v1_only( void )
+{
+    for( uint32_t ch = 0u; ch < FIP_CHANNELS; ch++ )
+    {
+        biquad_cascade_df2T_f32_dspic33ak_opt_v1(
+            &fip_instance[ch], h2b_input[ch], fip_output[ch], FIP_BLOCK_FRAMES );
+    }
+}
+
+static void fip_local_c_only( void )
+{
+    for( uint32_t ch = 0u; ch < FIP_CHANNELS; ch++ )
+    {
+        float* state = &FIP_STATE[ ch * ASRC_FULL_IIR_SOS * 2u ];
+        for( uint32_t n = 0u; n < FIP_BLOCK_FRAMES; n++ )
+        {
+            const float* coeff = asrc_full_iir_df2t_sos;
+            float* section_state = state;
+            float x = h2b_input[ch][n];
+            for( uint32_t section = 0u; section < ASRC_FULL_IIR_SOS; section++ )
+            {
+                const float d1 = section_state[0];
+                const float d2 = section_state[1];
+                const float y  = coeff[0] * x + d1;
+                section_state[0] = coeff[1] * x + d2 + coeff[3] * y;
+                section_state[1] = coeff[2] * x + coeff[4] * y;
+                x = y;
+                coeff += 5u;
+                section_state += 2u;
+            }
+            fip_output[ch][n] = x;
+        }
+    }
+}
+
+/* Peak and finiteness over the same stimulus set the H2 headroom report used, so
+ * the host float64 internal peak 1.096476 and the final-output peak have an
+ * on-target counterpart in the arithmetic the MCU actually performs. */
+static void fip_headroom_report( void )
+{
+    static const char* const names[] = { "1k-sine", "10k-sine", "15k-sine",
+                                         "17k-sine", "multitone", "impulse" };
+    printf( "    numerical headroom, opt v1, six SOS (values are x full scale):\n" );
+    for( uint8_t kind = 0u; kind < 6u; kind++ )
+    {
+        float peak_out   = 0.0f;
+        float peak_state = 0.0f;
+        uint8_t finite   = 1u;
+        fip_reset();
+        for( uint32_t block = 0u; block < 64u; block++ )
+        {
+            h2b_fill_stimulus( kind, block );
+            fip_opt_v1_only();
+            for( uint32_t ch = 0u; ch < FIP_CHANNELS; ch++ )
+            {
+                for( uint32_t n = 0u; n < FIP_BLOCK_FRAMES; n++ )
+                {
+                    const float v = fip_output[ch][n];
+                    if( !isfinite( v ) ) { finite = 0u; }
+                    else if( fabsf( v ) > peak_out ) { peak_out = fabsf( v ); }
+                }
+            }
+            for( uint32_t k = 0u; k < FIP_STATE_FLOATS; k++ )
+            {
+                const float v = FIP_STATE[k];
+                if( !isfinite( v ) ) { finite = 0u; }
+                else if( fabsf( v ) > peak_state ) { peak_state = fabsf( v ); }
+            }
+        }
+        {
+            const uint32_t out_milli   = (uint32_t)( ( peak_out / H2B_FULL_SCALE ) * 1000.0f );
+            const uint32_t state_milli = (uint32_t)( ( peak_state / H2B_FULL_SCALE ) * 1000.0f );
+            printf( "      %-10s out=%lu.%03lu FS  state=%lu.%03lu FS  finite=%s\n",
+                    names[kind],
+                    (unsigned long)( out_milli / 1000u ), (unsigned long)( out_milli % 1000u ),
+                    (unsigned long)( state_milli / 1000u ), (unsigned long)( state_milli % 1000u ),
+                    ( finite != 0u ) ? "PASS" : "FAIL" );
+        }
+    }
+}
+
+void asrc_full_iir_precheck_bench_run( uint32_t trials )
+{
+    h2b_stats_t empty;
+    h2b_stats_t opt_v1;
+    h2b_stats_t local_c;
+    uint32_t sp_probe = 0u;
+
+    if( trials == 0u ) { trials = FIP_DEFAULT_TRIALS; }
+
+    if( ( H2B_Y_ARENA <= (uintptr_t)&sp_probe ) ||
+        ( ( H2B_Y_ARENA - (uintptr_t)&sp_probe ) < 4096u ) )
+    {
+        printf( "\n *ai REFUSING to run: Y scratch 0x%05lx, stack near 0x%05lx; 4096 B required.\n",
+                (unsigned long)H2B_Y_ARENA, (unsigned long)(uintptr_t)&sp_probe );
+        return;
+    }
+
+    h2b_stats_reset( &empty );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        h2b_stats_add( &empty, nora_high_res_timer_get_count() - t0 );
+    }
+
+    printf( "\n *ai Full-IIR precheck: six-SOS 48 kHz anti-alias LPF, IIR only\n" );
+    printf( "    candidate=elliptic n12 fp15k rp0.25 rs120; SOS=%u; order=low-Q-first [0..5]\n",
+            (unsigned)ASRC_FULL_IIR_SOS );
+    printf( "    coeff CRC32(LE f32)=0x%08lX; max|coeff| x1e6=%lu\n",
+            (unsigned long)ASRC_FULL_IIR_DF2T_SOS_CRC32,
+            (unsigned long)( ASRC_FULL_IIR_MAX_ABS_COEFF * 1000000.0f ) );
+    printf( "    geometry=%uch x %u frames/block; 48 kHz block deadline=333.33 us; trials=%lu\n",
+            (unsigned)FIP_CHANNELS, (unsigned)FIP_BLOCK_FRAMES, (unsigned long)trials );
+    printf( "    SOS evaluations/block=%lu; state=Y 0x%05lx..0x%05lx, coeff=X\n",
+            (unsigned long)( FIP_CHANNELS * FIP_BLOCK_FRAMES * ASRC_FULL_IIR_SOS ),
+            (unsigned long)(uintptr_t)FIP_STATE, (unsigned long)FIP_Y_ARENA_END );
+    printf( "    timer pair ticks min/mean/max=%lu/%lu/%lu; values subtract the minimum.\n",
+            (unsigned long)empty.min_ticks, (unsigned long)h2b_stats_mean( &empty ),
+            (unsigned long)empty.max_ticks );
+
+    /* Interrupts stay enabled, as in Phase 2/3: min is the uncontended floor and
+     * mean/max keep real foreground preemption, so these numbers are directly
+     * comparable to the five-SOS 79.00 / 128.64 / 213.65 us reference. */
+    h2b_fill_stimulus( 1u, 0u );   /* 10 kHz sine: the host worst-headroom stimulus */
+    fip_reset();
+    for( uint32_t warm = 0u; warm < 8u; warm++ ) { fip_opt_v1_only(); }
+    h2b_stats_reset( &opt_v1 );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        fip_opt_v1_only();
+        h2b_stats_add( &opt_v1, nora_high_res_timer_get_count() - t0 );
+    }
+
+    fip_reset();
+    for( uint32_t warm = 0u; warm < 8u; warm++ ) { fip_local_c_only(); }
+    h2b_stats_reset( &local_c );
+    for( uint32_t trial = 0u; trial < trials; trial++ )
+    {
+        const uint32_t t0 = nora_high_res_timer_get_count();
+        fip_local_c_only();
+        h2b_stats_add( &local_c, nora_high_res_timer_get_count() - t0 );
+    }
+
+    printf( "  six-SOS IIR, all %u channels:\n", (unsigned)FIP_CHANNELS );
+    h2b_print_timing( "opt v1 6SOS", &opt_v1, empty.min_ticks );
+    h2b_print_timing( "localC 6SOS", &local_c, empty.min_ticks );
+    printf( "    reference, Phase-3 opt v1 FIVE SOS: 79.00 / 128.64 / 213.65 us (min/mean/max)\n" );
+    printf( "    reference, Phase-2 local C FIVE SOS: 220.30 / 330.22 / 446.76 us\n" );
+    printf( "    Phase-4 estimated six SOS by linear scaling: 154.20 us mean\n" );
+    {
+        /* The marginal cost of the sixth section against the Phase-3 five-SOS
+         * mean, differenced in ticks so the printed value keeps the 0.01 us
+         * resolution of the rows above rather than a re-rounded difference. */
+        const uint32_t mean_ticks = h2b_subtract_overhead( h2b_stats_mean( &opt_v1 ),
+                                                           empty.min_ticks );
+        const uint32_t per_sos    = mean_ticks / ASRC_FULL_IIR_SOS;
+        const uint32_t delta      = ( mean_ticks >= FIP_PHASE3_FIVE_SOS_MEAN_TICKS )
+                                    ? ( mean_ticks - FIP_PHASE3_FIVE_SOS_MEAN_TICKS )
+                                    : ( FIP_PHASE3_FIVE_SOS_MEAN_TICKS - mean_ticks );
+        printf( "    measured mean=%lu.%02lu us -> %lu.%02lu us/SOS; sixth-section marginal "
+                "vs Phase-3 five-SOS mean=%c%lu.%02lu us\n",
+                (unsigned long)( mean_ticks / 100u ), (unsigned long)( mean_ticks % 100u ),
+                (unsigned long)( per_sos / 100u ), (unsigned long)( per_sos % 100u ),
+                ( mean_ticks >= FIP_PHASE3_FIVE_SOS_MEAN_TICKS ) ? '+' : '-',
+                (unsigned long)( delta / 100u ), (unsigned long)( delta % 100u ) );
+    }
+
+    fip_headroom_report();
+    printf( "    scope: IIR only.  Front-end removal and generic ASRC step 1.0 -> 1.5 are\n" );
+    printf( "           measured as runtime telemetry across two images, not benched here.\n" );
+    printf( " *ai complete\n" );
+}
+
+#endif /* ASRC_H2_KERNEL_BENCH_AVAILABLE */
 
 #endif /* ASRC_FIR_KERNEL_BENCH_AVAILABLE */

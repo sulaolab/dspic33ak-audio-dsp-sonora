@@ -140,6 +140,17 @@ mask into four per-instance, per-RX-block counters read via `get_status()`:
 `frmerr_consecutive_blocks`. See the root README for the full ownership contract and counter
 semantics.
 
+`frmerr_consecutive_blocks` is a LIVE signal: observing one clean block zeroes it. That makes it
+self-maintaining while blocks keep arriving, but it also means a burst that ends with the leg quiet
+(no further block ISRs) leaves the run standing, and later readers see "misframed right now" for an
+event that is over. `nora_spi_i2s_tdm_inst_clear_error_counts(inst)` (and the primary-leg singleton
+`nora_spi_i2s_tdm_clear_error_counts()`) exists for that case: it zeroes the four error counters
+above and **nothing else** — `block_count`, `block_deadline_miss_count`, the RX-DMA cause counters
+and the ISR load peaks all survive, so a caller cannot erase the evidence that a leg is dead or
+missing deadlines by asking for the frame-error history to be dropped. Note that the `clear_peak`
+argument of `get_status()` / `get_load()` never touched these counters: it is the ISR load
+min/max/event peaks only.
+
 ## 7. Interrupt ownership
 
 - `NORA_TDM_DEFINE_DMA_VECTORS=1` (default): the HAL defines the RX DMA interrupt

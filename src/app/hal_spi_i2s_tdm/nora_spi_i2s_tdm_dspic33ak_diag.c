@@ -222,6 +222,29 @@ void nora_spi_i2s_tdm_diag_note_errflags( nora_spi_i2s_tdm_diag_t* d, uint32_t f
 
 
 /*
+ * Forget the framed-transport error history of this instance (see the header for why the
+ * block/deadline/DMA counters survive).
+ *
+ * The consecutive-FRMERR run is a LIVE signal -- one clean block resets it -- so it only reads
+ * non-zero while errors are still arriving, or while the leg has stopped producing blocks
+ * altogether (its last observation was an error and no clean block can follow). A caller that
+ * has just re-initialised the clock source therefore has to be able to drop it; otherwise a
+ * burst that ended with the leg quiet keeps asserting "misframed right now" forever.
+ */
+void nora_spi_i2s_tdm_diag_clear_errflags( nora_spi_i2s_tdm_diag_t* d )
+{
+    if( d == NULL )
+    {
+        return;
+    }
+    d->err_rov_block_count       = 0u;
+    d->err_tur_block_count       = 0u;
+    d->err_frm_block_count       = 0u;
+    d->frmerr_consecutive_blocks = 0u;
+}
+
+
+/*
  * Update deadline-miss diagnostics from this instance's DMA status snapshot.
  *
  * HALF+DONE together means software missed a ping-pong service deadline for THIS

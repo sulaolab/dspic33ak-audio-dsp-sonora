@@ -11,6 +11,11 @@
  * nothing at reset and drops the float32 Bessel/sinc build entirely.
  *
  * max |quantisation error| vs the float64 design: 2.327e-10 (0.50 Q31 LSB)
+ *
+ * The include guard is deliberately NOT geometry-dependent: a build
+ * includes exactly one of these tables (see asrc_poly_q31.inc), and if two
+ * were ever included the second becomes a no-op and the L/M #error fires
+ * against the first -- loud, rather than a silently mixed table.
  */
 #ifndef ASRC_POLY_Q31_TABLE_H
 #define ASRC_POLY_Q31_TABLE_H

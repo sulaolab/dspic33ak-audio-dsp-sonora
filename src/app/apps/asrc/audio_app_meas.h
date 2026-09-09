@@ -27,6 +27,19 @@ void audio_app_meas_gen_input( int32_t* block );
 // While armed, capture one just-resampled A->B output block's L channel into the buffer.
 void audio_app_meas_capture( const int32_t* out_block );
 
+// Real-clamp observation on the 32 kHz A->B OUTPUT block (MEAS builds only). Counts
+// unconditionally, whether or not a capture is armed.
+//
+// Why this exists: the Full-IIR stage's over_fs counts FS exceedance of a FLOAT intermediate at
+// 48 kHz, in a place where nothing clamps. The only real saturation is the float->int24 slot
+// conversion, which in a 16-channel build happens inside hand-written ASM with no counter and no
+// scannable float output array. This tally sees exactly the int24 samples the codec receives, so a
+// transient that the one-shot 64 ms capture window misses is still counted.
+//
+// at_fs: samples at or beyond +-full scale. frames: output frames inspected. peak: max |sample|.
+void audio_app_meas_out_fs_stats( uint32_t* at_fs, uint32_t* frames, int32_t* peak );
+void audio_app_meas_out_fs_clear( void );
+
 // Console control. arm: start a one-shot capture. dump: print the captured buffer for FFT.
 void audio_app_meas_arm( void );
 void audio_app_meas_dump( void );

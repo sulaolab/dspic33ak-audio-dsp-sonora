@@ -21,6 +21,11 @@ Usage:
   python asrc_q31_resampler_model.py compare
   python asrc_q31_resampler_model.py freq
   python asrc_q31_resampler_model.py vectors --out ../../src/app/apps/asrc/asrc_poly_q31_vectors.h
+
+Geometry (L / M / fc / Kaiser beta) defaults to the shipping filter and is
+overridable on every subcommand:
+  python asrc_q31_resampler_model.py table --taps 28 --fc 0.4632 --beta 10.55 \\
+      --out ../../src/app/apps/asrc/asrc_poly_q31_table_m28.h
 """
 
 import argparse
@@ -30,11 +35,50 @@ import sys
 import numpy as np
 
 # ---------------------------------------------------------------- config -----
+# DEFAULTS = the shipping geometry.  Every subcommand accepts --taps / --fc /
+# --beta / --phases, and set_geometry() rewrites these module globals before
+# dispatch, because every routine in this file reads them as globals rather than
+# taking them as arguments.  The defaults are what `table --out ...` with no
+# geometry flags emits, so the production header stays regenerable from the command
+# in its own banner and byte-identical.
+#
+# fc/beta are NOT free parameters of the resampler -- they are properties of one
+# accepted filter.  The 96 kHz profile's M=28 alternative is fc 0.4632 / beta 10.55,
+# which is asrc_headroom_filter_check.CANDIDATES[2] ("headroom-m28-kaiser10.55") and
+# equals ASRC_POLY_FC / ASRC_POLY_KAISER_BETA under APP_ASRC_EXPERIMENTAL_M28 in
+# asrc_app_build_config.h.  A geometry no C profile declares produces a table no
+# build can use: asrc_poly_q31.inc #errors on the L/M pair, but it CANNOT check fc
+# or beta, so those are recorded in the generated banner and must be read from it.
 L = 128           # ASRC_POLY_L
 M = 30            # ASRC_POLY_M
-FC = 0.465        # ASRC_POLY_FC   -- fixed by the specification, do not move
+FC = 0.465        # ASRC_POLY_FC
 BETA = 11.0       # ASRC_POLY_KAISER_BETA
 MH = (M // 2) - 1  # ASRC_POLY_MH == 14
+
+
+def set_geometry(args):
+    """Rewrite the geometry globals from the CLI, then recompute the derived MH."""
+    global L, M, FC, BETA, MH
+    L = int(args.phases)
+    M = int(args.taps)
+    FC = float(args.fc)
+    BETA = float(args.beta)
+    if (M % 2) != 0:
+        # asrc_poly_q31.inc asserts this too (the unrolled blend tiles taps in
+        # pairs); refusing here keeps a table no build could accept from existing.
+        sys.exit("M must be even: %d" % M)
+    MH = (M // 2) - 1
+
+
+def add_geometry_args(p):
+    p.add_argument('--taps', type=int, default=M,
+                   help='ASRC_POLY_M (default %(default)s, the shipping value)')
+    p.add_argument('--fc', type=float, default=FC,
+                   help='ASRC_POLY_FC (default %(default)s)')
+    p.add_argument('--beta', type=float, default=BETA,
+                   help='ASRC_POLY_KAISER_BETA (default %(default)s)')
+    p.add_argument('--phases', type=int, default=L,
+                   help='ASRC_POLY_L (default %(default)s)')
 Q31_ONE = 1 << 31
 SAMP_MAX = 8388607.0
 SAMP_MIN = -8388608.0
@@ -706,6 +750,11 @@ def cmd_table(args):
                  " * nothing at reset and drops the float32 Bessel/sinc build entirely.\n"
                  " *\n"
                  " * max |quantisation error| vs the float64 design: %.3e (%.2f Q31 LSB)\n"
+                 " *\n"
+                 " * The include guard is deliberately NOT geometry-dependent: a build\n"
+                 " * includes exactly one of these tables (see asrc_poly_q31.inc), and if two\n"
+                 " * were ever included the second becomes a no-op and the L/M #error fires\n"
+                 " * against the first -- loud, rather than a silently mixed table.\n"
                  " */\n"
                  "#ifndef ASRC_POLY_Q31_TABLE_H\n#define ASRC_POLY_Q31_TABLE_H\n\n"
                  % (L, M, FC, BETA, float(qerr.max()), float(qerr.max()) * Q31_ONE))
@@ -726,17 +775,21 @@ def cmd_table(args):
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
-    p = sub.add_parser('coeff');   p.set_defaults(fn=cmd_coeff)
-    p = sub.add_parser('compare'); p.add_argument('--nout', type=int, default=192); p.set_defaults(fn=cmd_compare)
-    p = sub.add_parser('freq');    p.add_argument('--nout', type=int, default=512); p.set_defaults(fn=cmd_freq)
+    subs = []
+    p = sub.add_parser('coeff');   p.set_defaults(fn=cmd_coeff); subs.append(p)
+    p = sub.add_parser('compare'); p.add_argument('--nout', type=int, default=192); p.set_defaults(fn=cmd_compare); subs.append(p)
+    p = sub.add_parser('freq');    p.add_argument('--nout', type=int, default=512); p.set_defaults(fn=cmd_freq); subs.append(p)
     p = sub.add_parser('table')
     p.add_argument('--out', required=True)
-    p.set_defaults(fn=cmd_table)
+    p.set_defaults(fn=cmd_table); subs.append(p)
     p = sub.add_parser('vectors')
     p.add_argument('--out', required=True)
     p.add_argument('--vec-nout', type=int, default=32)
-    p.set_defaults(fn=cmd_vectors)
+    p.set_defaults(fn=cmd_vectors); subs.append(p)
+    for p in subs:
+        add_geometry_args(p)
     args = ap.parse_args()
+    set_geometry(args)
     args.fn(args)
 
 

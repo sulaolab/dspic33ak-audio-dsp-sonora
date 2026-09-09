@@ -49,6 +49,13 @@ void nora_spi_i2s_tdm_diag_isr_end( nora_spi_i2s_tdm_diag_t* d );
 // Count one completed block for this instance's RX-block ISR.
 void nora_spi_i2s_tdm_diag_note_block( nora_spi_i2s_tdm_diag_t* d );
 
+// Zero ONLY the SPI framed-transport error counters (SPIROV / SPITUR / FRMERR block counts and
+// the consecutive-FRMERR run). block_count, block_deadline_miss_count, the RX-DMA cause counters
+// and the ISR load peaks are deliberately NOT touched: those are the liveness / harm evidence a
+// caller uses to decide a leg is dead, and a "forget the frame errors" request must not erase it.
+// Not atomic vs the block ISR -- the CALLER masks it, exactly as for the read helpers.
+void nora_spi_i2s_tdm_diag_clear_errflags( nora_spi_i2s_tdm_diag_t* d );
+
 // Fold one RX-block ISR's SPI framed-transport health flags into this instance's diagnostics.
 // `flags` is the NORA_SPI_I2S_TDM_STAT_* mask returned by the backend hardware helper.
 void nora_spi_i2s_tdm_diag_note_errflags( nora_spi_i2s_tdm_diag_t* d,

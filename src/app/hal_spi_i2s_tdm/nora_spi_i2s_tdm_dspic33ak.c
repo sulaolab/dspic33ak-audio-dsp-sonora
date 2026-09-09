@@ -1981,6 +1981,45 @@ bool nora_spi_i2s_tdm_inst_get_status( nora_spi_i2s_tdm_inst_t* inst,
 
 
 /*
+ * Drop ONE instance's framed-transport error history. Masks this instance's RX-block ISR for the
+ * writes, like every other public reader/writer of the diag block: the counters are 32-bit on a
+ * 16-bit core, so a plain store races the ISR that increments them.
+ */
+bool nora_spi_i2s_tdm_inst_clear_error_counts( nora_spi_i2s_tdm_inst_t* inst )
+{
+    bool rxie_bak;
+
+    if( inst == NULL )
+    {
+        tdm_set_error( NORA_SPI_I2S_TDM_ERR_BAD_INSTANCE );
+        return false;
+    }
+
+    rxie_bak = tdm_rx_ie_disable( inst->rx_dma_ch );
+    nora_spi_i2s_tdm_diag_clear_errflags( &inst->diag );
+    tdm_rx_ie_restore( inst->rx_dma_ch, rxie_bak );
+
+    tdm_set_error( NORA_SPI_I2S_TDM_ERR_NONE );
+    return true;
+}
+
+
+/*
+ * Singleton form: the PRIMARY leg, same rule as the other singleton wrappers below.
+ */
+bool nora_spi_i2s_tdm_clear_error_counts( void )
+{
+    if( s_stream.primary_leg_index >= s_stream.leg_count )
+    {
+        tdm_set_error( NORA_SPI_I2S_TDM_ERR_BAD_INSTANCE );
+        return false;
+    }
+    return nora_spi_i2s_tdm_inst_clear_error_counts(
+        &s_stream.legs[s_stream.primary_leg_index] );
+}
+
+
+/*
  * Singleton load/status readers: report the PRIMARY leg (primary_leg_index, default logical leg 0).
  * Thin wrappers over the per-instance readers; behaviour is unchanged from before the
  * per-instance API was added. They go through s_stream.legs (the stream is the single

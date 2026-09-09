@@ -99,7 +99,26 @@
  * controller clock and BRG when the dsPIC owns the clock; endpoint/external
  * clocks retain their commanded nominal value rather than an assumed measurement.
  */
+/*
+ * MEASUREMENT-ONLY OVERRIDE of leg B's boot rate (build condition, default unchanged).
+ *
+ * A rate PAIR is normally reached by console command from the boot pair, and that is
+ * the right default: one nominal rate records application intent for both legs. But a
+ * load study whose transit pair costs more CPU than the pair under test cannot get
+ * there -- the console lives in the foreground, so a transit pair at 100 % load never
+ * dispatches the command that would leave it. Booting straight into the pair under
+ * test is the only way to measure it, and it is a build condition, not a signal-path
+ * change: no coefficient, filter order, headroom or algorithm is touched.
+ *
+ * NOTE it also moves AUDIO_TRANSPORT_LEG_B_ROLE (audio_transport.c), which is derived
+ * from this rate at compile time: below 88.2 kHz leg B is full-duplex ADC+DAC instead
+ * of DAC-only. Compare only against images built with the SAME override.
+ */
+#if defined(APP_TRANSPORT_LEG_B_BOOT_RATE_HZ)
+#define RESOLVED_TRANSPORT_LEG_B_INITIAL_NOMINAL_RATE_HZ  (APP_TRANSPORT_LEG_B_BOOT_RATE_HZ)
+#else
 #define RESOLVED_TRANSPORT_LEG_B_INITIAL_NOMINAL_RATE_HZ  (APP_SAMPLE_RATE_HZ)
+#endif
 
 #if APP_USE_SPI2_INDEPENDENT_MASTER
 #if APP_Q27B_COHERENT_OFFSET
@@ -246,8 +265,16 @@ _Static_assert(
 #if APP_USE_SPI2_AUDIO
 _Static_assert( RESOLVED_TRANSPORT_LEG_B_SPI_INSTANCE == APP_TDM_PHYS_B_NUM,
                 "resolved leg B SPI binding must match APP_TDM_PHYS_B_NUM" );
+/* The override above is the ONE sanctioned way for the two legs' startup intent to
+ * differ; without it this stays the strict equality it has always been. */
+#if defined(APP_TRANSPORT_LEG_B_BOOT_RATE_HZ)
+_Static_assert( RESOLVED_TRANSPORT_LEG_B_INITIAL_NOMINAL_RATE_HZ ==
+                    APP_TRANSPORT_LEG_B_BOOT_RATE_HZ,
+                "resolved leg B nominal rate must match the requested boot-rate override" );
+#else
 _Static_assert( RESOLVED_TRANSPORT_LEG_B_INITIAL_NOMINAL_RATE_HZ == APP_SAMPLE_RATE_HZ,
                 "resolved leg B nominal rate must match current startup intent" );
+#endif
 #if APP_USE_SPI2_INDEPENDENT_MASTER
 _Static_assert( RESOLVED_TRANSPORT_LEG_B_CONTROLLER_CLOCK_HZ != 0u,
                 "controller-owned leg B requires a controller clock fact" );

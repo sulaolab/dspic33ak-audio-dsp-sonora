@@ -29,6 +29,10 @@
 #include "nora_gpio.h"
 #include "nora_pps.h"
 #include "timer_app.h"
+/* Yield hook registration only. This file already prints through the same retarget; it does
+ * not reach a UART register, and the dependency stays one-way (app -> uart_platform), the
+ * same direction src/app/uart_app/system_console.c uses it in. */
+#include "uart_platform_stdio.h"
 
 #define I2C_INST_A  (2u)
 #if APP_AK128_J3_TDM_B
@@ -102,6 +106,15 @@ typedef struct {
     volatile uint16_t     period_read;
     volatile uint32_t     period_overrun_count;
     volatile uint32_t     period_queue[CCPDET_PERIOD_QUEUE_LENGTH];
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+    /* Producer-side (ISR): a compare and a store per capture, at fs/16. */
+    volatile uint16_t     period_occupancy_max;
+    volatile uint32_t     period_enqueued;
+    /* Consumer-side (foreground only). */
+    uint32_t              period_dequeued;
+    uint32_t              period_boot_discarded;
+    uint16_t              period_batch_max;
+#endif
     bool                  inited;
     float                 ema_period;
 } ccpdet_t;
@@ -141,6 +154,19 @@ ccpdet_capture_isr( ccpdet_t* detector, uint32_t timestamp )
                 detector->period_queue[write & CCPDET_PERIOD_QUEUE_MASK] =
                     period;
                 detector->period_write = (uint16_t)( write + 1u );
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+                {
+                    /* Occupancy AFTER this enqueue, so the max-hold reaches exactly
+                     * CCPDET_PERIOD_QUEUE_LENGTH on the enqueue that fills the queue -- the
+                     * one before the first discard. */
+                    const uint16_t used = (uint16_t)( write + 1u - read );
+                    if( used > detector->period_occupancy_max )
+                    {
+                        detector->period_occupancy_max = used;
+                    }
+                    detector->period_enqueued++;
+                }
+#endif
             }
             else
             {
@@ -161,6 +187,10 @@ static void ccpdet_process_periods( ccpdet_t* detector )
          * service is not yet running.  Preserve liveness and the latest period,
          * but intentionally discard that unbounded boot backlog.
          */
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+        detector->period_boot_discarded +=
+            (uint16_t)( detector->period_write - detector->period_read );
+#endif
         detector->period_read = detector->period_write;
         const uint32_t latest = detector->latest_period;
         detector->period_queue_enabled = true;
@@ -174,6 +204,11 @@ static void ccpdet_process_periods( ccpdet_t* detector )
 
     uint16_t read = detector->period_read;
     const uint16_t write = detector->period_write;
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+    const uint16_t batch = (uint16_t)( write - read );
+    if( batch > detector->period_batch_max ) { detector->period_batch_max = batch; }
+    detector->period_dequeued += batch;
+#endif
 
     while( read != write )
     {
@@ -194,6 +229,94 @@ static void ccpdet_process_periods( ccpdet_t* detector )
         }
     }
 }
+
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+/*
+ * Drain-interval max-hold, in GetTicks() milliseconds. Global rather than per detector
+ * because both legs are drained by the same call, so one number describes both -- and it is
+ * the number the queue budget is spent against: leg A stores 256 periods at fs/16 = 3 kHz,
+ * i.e. 85.3 ms, leg B 128 ms at 2 kHz.
+ */
+static uint32_t s_drain_last_ms;
+static uint32_t s_drain_calls;
+static uint16_t s_drain_gap_max_ms;
+static bool     s_drain_gap_seeded;
+#endif
+
+static void ccpdet_drain_both( void )
+{
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+    const uint32_t now = GetTicks();
+    if( s_drain_gap_seeded )
+    {
+        const uint32_t gap = now - s_drain_last_ms;
+        const uint16_t gap16 = ( gap > 0xFFFFu ) ? 0xFFFFu : (uint16_t)gap;
+        if( gap16 > s_drain_gap_max_ms ) { s_drain_gap_max_ms = gap16; }
+    }
+    s_drain_last_ms = now;
+    s_drain_gap_seeded = true;
+    s_drain_calls++;
+#endif
+    ccpdet_process_periods( &s_det_a );
+    ccpdet_process_periods( &s_det_b );
+}
+
+/*
+ * Drain from inside a long blocking console write.
+ *
+ * WHY THIS EXISTS. The periodic telemetry report is one uninterrupted foreground operation:
+ * write() blocks per byte on UART1 (43.4 us at 230400) plus a blocking UART2 mirror, and at
+ * 94 % ISR load the foreground only gets the gaps between block ISRs, so the report stretches
+ * well past its baud-rate cost -- 105 ms of wall time measured on target for ~590 characters,
+ * against 31 ms for the same report at 84 % load. Draining once per main-loop pass therefore
+ * means not draining for that whole span.
+ *
+ * That is enough to overrun leg A: 256 slots at its fs/16 = 3 kHz capture rate hold 85.3 ms.
+ * Leg B holds 128 ms at 2 kHz and never overran, which is exactly the A-only, higher-load-only
+ * asymmetry the counter showed. Per-chunk draining bounds the gap to a fraction of a line, so
+ * the fix is where the stall is and changes no capture cadence, EMA constant or servo term.
+ *
+ * SINGLE-CONSUMER INVARIANT. ccpdet_process_periods() is the only consumer and must stay the
+ * only one. s_in_drain covers the whole body, so an ISR-context printf that lands mid-drain
+ * skips instead of becoming a second consumer; one that lands outside a drain cannot race a
+ * consumer that is not running.
+ *
+ * THE ENABLED TEST IS NOT AN OPTIMISATION. The first ccpdet_process_periods() call is what
+ * discards the boot backlog and starts the queue. That decision belongs to
+ * asrc_clock_control_tick(); a boot banner printf must not be able to move the start of the
+ * measurement window, so this hook returns until the tick has made it.
+ */
+void asrc_clock_control_drain_yield( void )
+{
+    static volatile bool s_in_drain = false;
+
+    if( s_in_drain ) { return; }
+    if( !s_det_a.period_queue_enabled || !s_det_b.period_queue_enabled ) { return; }
+
+    s_in_drain = true;
+    ccpdet_drain_both();
+    s_in_drain = false;
+}
+
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+void asrc_clock_control_queue_stats_clear( void )
+{
+    s_det_a.period_occupancy_max = 0u;
+    s_det_b.period_occupancy_max = 0u;
+    s_det_a.period_enqueued = 0u;
+    s_det_b.period_enqueued = 0u;
+    s_det_a.period_dequeued = 0u;
+    s_det_b.period_dequeued = 0u;
+    s_det_a.period_boot_discarded = 0u;
+    s_det_b.period_boot_discarded = 0u;
+    s_det_a.period_batch_max = 0u;
+    s_det_b.period_batch_max = 0u;
+    s_drain_calls = 0u;
+    s_drain_gap_max_ms = 0u;
+    s_drain_gap_seeded = false;
+    /* period_overrun_count is intentionally left alone -- see the header. */
+}
+#endif
 
 /*
  * ASRC owns these vectors directly instead of entering the callback-oriented
@@ -353,10 +476,21 @@ void asrc_clock_control_init_reset( void )
             printf(" CCP detect init failed (a=%d b=%d)\n", (int)ok_a, (int)ok_b);
         }
         initialized = ok_a && ok_b;
+#if APP_ASRC_CCP_QUEUE_DRAIN_ON_WRITE
+        /* Keep the queues fed across a long blocking print. Idempotent, and harmless before
+         * the queues start: the hook returns until asrc_clock_control_tick() enables them. */
+        uart_platform_stdio_set_yield_hook( asrc_clock_control_drain_yield );
+#endif
     }
 
     ccpdet_reset( &s_det_a );
     ccpdet_reset( &s_det_b );
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+    /* ccpdet_reset() already zeroes period_overrun_count here, so every audio restart is a
+     * fresh window for the overrun counter too; keep the observation tallies in step with it
+     * rather than letting them span restarts the counter does not. */
+    asrc_clock_control_queue_stats_clear();
+#endif
 #if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
     s_ff_candidate = 0.0f;
     s_ff_stable_count = 0u;
@@ -400,9 +534,10 @@ void asrc_clock_control_tick( void )
 #endif
     static uint32_t last = UINT32_MAX;
 
-    /* Drain on every foreground pass; only the ratio publication stays 50 Hz. */
-    ccpdet_process_periods( &s_det_a );
-    ccpdet_process_periods( &s_det_b );
+    /* Drain on every foreground pass; only the ratio publication stays 50 Hz. A blocking
+     * console print can hold the foreground far longer than the queue's time span, so the
+     * same drain also runs from the stdio yield hook -- see asrc_clock_control_drain_yield(). */
+    ccpdet_drain_both();
 
     const uint32_t current = GetTicks();
     if( (uint32_t)( current - last ) < APP_ASRC_FF_PERIOD_MS ) { return; }
@@ -562,6 +697,28 @@ void asrc_clock_control_debug_print( uint32_t fs_a_hz,
                (unsigned long)s_det_a.period_overrun_count,
                (unsigned long)s_det_b.period_overrun_count );
     }
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+    /* One line, once per report. `used` is the live occupancy at print time; `max` is the
+     * max-hold since the last audio restart or "*aj02". enq/deq/bootdisc account for every
+     * captured period: enq + overrun + bootdisc == captures that reached the queue stage. */
+    printf("CCPq used=%u/%u max=%u/%u of %u  enq=%lu/%lu deq=%lu/%lu bootdisc=%lu/%lu"
+           "  drain n=%lu gapmax=%ums batchmax=%u/%u\n",
+           (unsigned)(uint16_t)( s_det_a.period_write - s_det_a.period_read ),
+           (unsigned)(uint16_t)( s_det_b.period_write - s_det_b.period_read ),
+           (unsigned)s_det_a.period_occupancy_max,
+           (unsigned)s_det_b.period_occupancy_max,
+           (unsigned)CCPDET_PERIOD_QUEUE_LENGTH,
+           (unsigned long)s_det_a.period_enqueued,
+           (unsigned long)s_det_b.period_enqueued,
+           (unsigned long)s_det_a.period_dequeued,
+           (unsigned long)s_det_b.period_dequeued,
+           (unsigned long)s_det_a.period_boot_discarded,
+           (unsigned long)s_det_b.period_boot_discarded,
+           (unsigned long)s_drain_calls,
+           (unsigned)s_drain_gap_max_ms,
+           (unsigned)s_det_a.period_batch_max,
+           (unsigned)s_det_b.period_batch_max );
+#endif
     const bool capture_overrun_a =
         nora_ccp_icap_overflow( NORA_CCP1, false );
     const bool capture_overrun_b =
@@ -578,6 +735,10 @@ void asrc_clock_control_debug_print( uint32_t fs_a_hz,
 
 void asrc_clock_control_init_reset( void ) { }
 void asrc_clock_control_tick( void ) { }
+void asrc_clock_control_drain_yield( void ) { }
+#if APP_ASRC_CCP_QUEUE_OBSERVE
+void asrc_clock_control_queue_stats_clear( void ) { }
+#endif
 uint32_t asrc_clock_control_capture_count_a( void ) { return 0u; }
 uint32_t asrc_clock_control_capture_count_b( void ) { return 0u; }
 void asrc_clock_control_debug_print( uint32_t fs_a_hz,

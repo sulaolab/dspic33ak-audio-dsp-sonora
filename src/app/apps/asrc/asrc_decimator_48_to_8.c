@@ -17,6 +17,12 @@
 #include "asrc_decimator_48_to_32_coeffs.inc"
 #if ASRC_DECIMATOR_HAS_96_TO_48   /* pre-stage coefficients: only where leg A can be 96 kHz */
 #include "asrc_decimator_96_to_48_coeffs.inc"
+#if APP_ASRC_Q31_PRE_HALFBAND
+/* MEASUREMENT ONLY, and included only under the gate so that a build which does not
+ * ask for the half-band pre-stage carries none of its coefficients.  See
+ * APP_ASRC_Q31_PRE_HALFBAND in asrc_app_config.h for why it is not shippable. */
+#include "asrc_decimator_96_to_48_hb_coeffs.inc"
+#endif
 #endif /* ASRC_DECIMATOR_HAS_96_TO_48 */
 
 _Static_assert(ASRC_DECIMATOR_STAGE1_TAPS == ASRC_DECIMATOR_48_TO_8_STAGE1_TAPS,

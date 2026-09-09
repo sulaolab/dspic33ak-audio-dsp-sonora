@@ -37,7 +37,10 @@ RATE_INDEX = {
 }
 
 TDM_RE = re.compile(
-    r"TDM(\d):resp=([\d.]+)us margin=([\d.]+)us(?: fs=(\d+)Hz)? "
+    # `resp=` is the console spelling; tdm_console.to_legacy_all() rewrites it to the
+    # pre-S26 `max=`, so this driver saw ZERO TDM lines while every other pattern matched
+    # (found 2026-09-05). Accept both rather than depending on which side is translated.
+    r"TDM(\d):(?:resp|max)=([\d.]+)us margin=([\d.]+)us(?: fs=(\d+)Hz)? "
     r"\(run,act,blk,miss\)=\((\d+),(\d+),(\d+),(\d+)\)")
 TDMSUM_RE = re.compile(
     r"TDMsum:max=([\d.]+)us\(([\d.]+)%\)margin=([\d.]+)us sat=(\d+)")
@@ -54,6 +57,18 @@ PATH_RE = re.compile(
     r"cbB=([\d.]+)us pushBA=([\d.]+)us ledB=([\d.]+)us")
 CCP_RE = re.compile(r"CCP\s+fsA=([\d.]+) fsB=([\d.]+) Hz\s+ratioAB=([\d.]+) recover=(\d+)")
 MISC_RE = re.compile(r"ovf=(\d+) udf=(\d+)")
+CCPQ_RE = re.compile(r"CCP  period queue overrun A/B=(\d+)/(\d+)")
+# DSPload is the AUTHORITATIVE load metric in this build, and TDMsum is not emitted at all
+# any more (it saturated -- see the two-metric note in the 16ch mixed-rate work).  This driver
+# used to REQUIRE a TDMsum line and printed "NO TELEMETRY" on a perfectly healthy board
+# (found 2026-09-05).  `bad=` is the four per-leg anomaly counters.
+DSPLOAD_RE = re.compile(
+    r"DSPload:A=([\d.]+)% B=([\d.]+)% max=([\d.]+)%"
+    r"(?: stolen=([\d.]+)% max_demand=([\d.]+)%)? bad=(\d+)/(\d+)/(\d+)/(\d+)")
+# The trial Full-IIR 48 -> 32 stage's own line, when that stage is armed.
+FULLIIR_RE = re.compile(
+    r"\[full-iir x(\d+)ch\]AB (\d+) SOS gain=(-?\d+)\.(\d+)m?dB "
+    r"out=([\d.]+) state=([\d.]+) FS (?:clip|over_fs)=(\d+) nan=(\d+) blk=(\d+)")
 
 
 class Monitor:
@@ -121,6 +136,7 @@ def main() -> int:
     lines = [l for l in mon.log(args.tail) if l[:STAMP_LEN] >= mark]
 
     tdm = {1: [], 2: []}
+    tdm_margin = {1: [], 2: []}
     miss = {1: [], 2: []}
     tdmsum, margin, sat = [], [], []
     poly = {"AB": [], "BA": []}
@@ -128,10 +144,15 @@ def main() -> int:
     cb = {"A": [], "B": []}
     push = {"AB": [], "BA": []}
     ccp = []
+    dsp = []
+    ccpq = []
+    bad = []
+    fiir = []
     for line in lines:
         m = TDM_RE.search(line)
         if m:
             tdm[int(m.group(1))].append(float(m.group(2)))
+            tdm_margin[int(m.group(1))].append(float(m.group(3)))
             miss[int(m.group(1))].append(int(m.group(8)))
         m = TDMSUM_RE.search(line)
         if m:
@@ -164,21 +185,48 @@ def main() -> int:
         m = CCP_RE.search(line)
         if m:
             ccp.append((float(m.group(1)), float(m.group(2)), float(m.group(3)), int(m.group(4))))
+        m = CCPQ_RE.search(line)
+        if m:
+            ccpq.append((int(m.group(1)), int(m.group(2))))
+        m = DSPLOAD_RE.search(line)
+        if m:
+            demand = m.group(5)
+            dsp.append({"a": float(m.group(1)), "b": float(m.group(2)),
+                        "max_self": float(m.group(3)),
+                        "stolen": float(m.group(4)) if m.group(4) else float("nan"),
+                        "max_demand": float(demand) if demand else float("nan")})
+            bad.append(tuple(int(m.group(i)) for i in (6, 7, 8, 9)))
+        m = FULLIIR_RE.search(line)
+        if m:
+            fiir.append({"ch": int(m.group(1)), "sos": int(m.group(2)),
+                         "gain_db": float("%s.%s" % (m.group(3), m.group(4))),
+                         "out_fs": float(m.group(5)), "state_fs": float(m.group(6)),
+                         "clip": int(m.group(7)), "nan": int(m.group(8)),
+                         "blk": int(m.group(9))})
 
     print("=" * 88)
-    print("%s   windows=%d  (settle %.0fs, soak %.0fs)"
-          % (args.label or "measurement", len(tdmsum), args.settle, args.soak))
+    print("%s   report windows=%d  (settle %.0fs, soak %.0fs)"
+          % (args.label or "measurement", len(tdm[1]) or len(poly["AB"]),
+             args.settle, args.soak))
     print("=" * 88)
-    if not tdmsum:
+    if not ( tdm[1] or poly["AB"] ):
         print("NO TELEMETRY in the window -- is the ASRC app running?")
         return 1
 
     print("TDM1     worst peak = %7.1f us   TDM2 worst peak = %7.1f us  (n=%d/%d)"
           % (stat(tdm[1], "max"), stat(tdm[2], "max"), len(tdm[1]), len(tdm[2])))
-    print("TDMsum   worst peak = %7.1f us   min margin      = %7.1f us"
-          % (max(tdmsum), min(margin)))
-    print("         mean       = %7.1f us   window spread   = %7.1f us"
-          % (sum(tdmsum) / len(tdmsum), max(tdmsum) - min(tdmsum)))
+    if tdm[1]:
+        print("TDM1     min margin  = %7.1f us   TDM2 min margin = %7.1f us"
+              % (stat(tdm_margin[1], "min"), stat(tdm_margin[2], "min")))
+    if dsp:
+        print("DSPload  max_demand = %7.1f %%    max_self        = %7.1f %%   "
+              "(A %.1f / B %.1f, stolen %.1f)"
+              % (max(d["max_demand"] for d in dsp), max(d["max_self"] for d in dsp),
+                 max(d["a"] for d in dsp), max(d["b"] for d in dsp),
+                 max(d["stolen"] for d in dsp)))
+    if tdmsum:
+        print("TDMsum   worst peak = %7.1f us   min margin      = %7.1f us   (SATURATES -- "
+              "not a verdict metric)" % (max(tdmsum), min(margin)))
     for leg in ("AB", "BA"):
         s = poly[leg]
         if not s:
@@ -196,6 +244,10 @@ def main() -> int:
     print("cbA worst = %6.1f us   cbB worst = %6.1f us   pushAB = %5.1f  pushBA = %5.1f"
           % (stat(cb["A"], "max"), stat(cb["B"], "max"),
              stat(push["AB"], "max"), stat(push["BA"], "max")))
+    if fiir:
+        print("full-IIR stage: x%dch %dSOS gain=%+.3f dB   peak out=%.3f FS   peak state=%.3f FS"
+              % (fiir[-1]["ch"], fiir[-1]["sos"], fiir[-1]["gain_db"],
+                 max(f["out_fs"] for f in fiir), max(f["state_fs"] for f in fiir)))
     print("-" * 88)
     print("cumulative counters, read as last - first over the window (NOT absolutes)")
     for name, series in (("AB drop", [x["drop"] for x in poly["AB"]]),
@@ -204,13 +256,24 @@ def main() -> int:
                          ("BA starve", [x["starve"] for x in poly["BA"]]),
                          ("TDM1 miss", miss[1]),
                          ("TDM2 miss", miss[2]),
-                         ("CCP recover", [c[3] for c in ccp])):
+                         ("CCP recover", [c[3] for c in ccp]),
+                         ("bad[0]", [b[0] for b in bad]),
+                         ("bad[1]", [b[1] for b in bad]),
+                         ("bad[2]", [b[2] for b in bad]),
+                         ("bad[3]", [b[3] for b in bad]),
+                         ("IIR clip", [f["clip"] for f in fiir]),
+                         ("IIR nan", [f["nan"] for f in fiir]),
+                         ("IIR blocks", [f["blk"] for f in fiir]),
+                         ("CCPq ovr A", [c[0] for c in ccpq]),
+                         ("CCPq ovr B", [c[1] for c in ccpq])):
         if not series:
             print("  %-12s no telemetry" % name)
             continue
         print("  %-12s first=%-10d last=%-10d delta=%d"
               % (name, series[0], series[-1], series[-1] - series[0]))
-    print("  %-12s max per window=%d  sum over windows=%d" % ("TDMsum sat", max(sat), sum(sat)))
+    if sat:   # TDMsum is not emitted at all in the current build; do not crash on its absence
+        print("  %-12s max per window=%d  sum over windows=%d"
+              % ("TDMsum sat", max(sat), sum(sat)))
     if ccp:
         print("CCP last: fsA=%.2f fsB=%.2f ratioAB=%.6f" % ccp[-1][:3])
     return 0

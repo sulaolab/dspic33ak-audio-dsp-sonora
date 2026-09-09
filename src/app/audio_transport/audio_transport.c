@@ -687,6 +687,84 @@ static bool audio_transport_bind_transport_once( void )
     return true;
 }
 
+// Per-leg framed-transport error evidence, for the log lines only. frmerr_worst_consecutive()
+// answers "is something misframed NOW" but hides WHICH leg, and the two legs fail for different
+// reasons on this board: leg A is the ADC codec-master, already configured when the transport is
+// armed, while leg B is the DAC codec-master whose BCLK/FS only appears ~0.7 s later, near the end
+// of the start sequence. Printing both totals AND both live runs is what makes a boot log
+// attributable without a debugger.
+typedef struct {
+    uint32_t frm_a;      // leg A: blocks where FRMERR was observed since this stream started
+    uint32_t run_a;      // leg A: consecutive-FRMERR run standing right now
+    uint32_t frm_b;      // leg B: same; have_b is false when B is absent or its block ISR is gated
+    uint32_t run_b;
+    bool     have_b;
+} frmerr_legs_t;
+
+static void frmerr_read_legs( frmerr_legs_t* out )
+{
+    nora_spi_i2s_tdm_status_t st;
+
+    out->frm_a  = 0u;
+    out->run_a  = 0u;
+    out->frm_b  = 0u;
+    out->run_b  = 0u;
+    out->have_b = false;
+
+    if( nora_spi_i2s_tdm_get_status( &st, false ) )
+    {
+        out->frm_a = st.err_frm_block_count;
+        out->run_a = st.frmerr_consecutive_blocks;
+    }
+#if NORA_TDM_USE_SPI2 && !RESOLVED_TRANSPORT_LEG_B_BLOCK_IRQ_GATED
+    {
+        nora_spi_i2s_tdm_inst_t*  leg_b = audio_transport_tdm_leg_b();
+        nora_spi_i2s_tdm_status_t st_b;
+        if( ( leg_b != NULL ) && nora_spi_i2s_tdm_inst_get_status( leg_b, &st_b, false ) )
+        {
+            out->frm_b  = st_b.err_frm_block_count;
+            out->run_b  = st_b.frmerr_consecutive_blocks;
+            out->have_b = true;
+        }
+    }
+#endif
+}
+
+// One attributed frame-error line; `tag` names the moment it describes.
+static void frmerr_print_legs( const char* tag )
+{
+    frmerr_legs_t legs;
+    frmerr_read_legs( &legs );
+    if( legs.have_b )
+    {
+        printf(" [tdm-frmerr] %s A:frm=%lu run=%lu  B:frm=%lu run=%lu\n", tag,
+               (unsigned long)legs.frm_a, (unsigned long)legs.run_a,
+               (unsigned long)legs.frm_b, (unsigned long)legs.run_b );
+    }
+    else
+    {
+        printf(" [tdm-frmerr] %s A:frm=%lu run=%lu  B:n/a\n", tag,
+               (unsigned long)legs.frm_a, (unsigned long)legs.run_a );
+    }
+}
+
+// Forget the framed-transport error history on BOTH legs. The consecutive-FRMERR run is only
+// self-clearing while blocks keep coming (one clean block zeroes it); a burst that ends with the
+// leg quiet leaves it standing, so every later reader keeps seeing "misframed right now" for an
+// event that is over. Block counts / deadline misses / DMA causes are untouched by the HAL call,
+// so liveness -- the detector that CAN tell a dead leg from a stale flag -- keeps its evidence.
+static void frmerr_history_clear( void )
+{
+    (void)nora_spi_i2s_tdm_clear_error_counts();          // primary leg (A)
+#if NORA_TDM_USE_SPI2
+    {
+        nora_spi_i2s_tdm_inst_t* leg_b = audio_transport_tdm_leg_b();
+        if( leg_b != NULL ) { (void)nora_spi_i2s_tdm_inst_clear_error_counts( leg_b ); }
+    }
+#endif
+}
+
+
 #if RESOLVED_TRANSPORT_DUAL_CLOCK_PROGRESS_ENABLED
 // Main-loop liveness watchdog. FRMERR is sampled from the RX-block ISR, so it cannot detect a
 // transport whose RX DMA has stopped completely. The client's clock-progress source is independent
@@ -992,6 +1070,7 @@ void audio_transport_frmerr_recover_tick( void )
         printf(" [tdm-recover] trigger=%s frm_run=%lu\n",
                stalled ? "liveness" : ( forced ? "forced" : "frmerr" ),
                (unsigned long)frm_run );
+        frmerr_print_legs( "trigger" );
         s_frmerr_recovering = true;
         s_frmerr_restarts   = 0u;
         tdm_liveness_watch_reset();
@@ -1036,19 +1115,17 @@ void audio_transport_frmerr_recover_tick( void )
 void audio_transport_frmerr_reset( void )
 {
 #if RESOLVED_TRANSPORT_FRMERR_AUTORECOVERY_ENABLED
-    // Clear the HAL's consecutive-frmerr counters (clear=true) on both legs and reseed the liveness
-    // watch, then drop any in-flight recovery bookkeeping. After a *ap B-only restart, B's clock has
-    // returned and clean blocks are flowing, so this leaves the manage loop with nothing to recover
-    // from -- no log-flooding full-transport restart.
-    nora_spi_i2s_tdm_status_t st;
-    (void)nora_spi_i2s_tdm_get_status( &st, true );
-#if NORA_TDM_USE_SPI2
-    {
-        nora_spi_i2s_tdm_inst_t*  leg_b = audio_transport_tdm_leg_b();
-        nora_spi_i2s_tdm_status_t st2;
-        if( leg_b != NULL ) { (void)nora_spi_i2s_tdm_inst_get_status( leg_b, &st2, true ); }
-    }
-#endif
+    // Clear the HAL's frame-error counters on both legs and reseed the liveness watch, then drop any
+    // in-flight recovery bookkeeping. After a *ap B-only restart, B's clock has returned and clean
+    // blocks are flowing, so this leaves the manage loop with nothing to recover from -- no
+    // log-flooding full-transport restart.
+    //
+    // This used to call get_status(..., clear=true) for the clearing, which did NOT do it: that
+    // flag is clear_PEAK and resets the ISR load min/max/event peaks only, never the error
+    // counters. So this function used to clear the liveness watch and the episode state and leave
+    // the standing FRMERR run untouched -- and a run that is standing because its leg went quiet
+    // cannot clear itself (only observing a clean block does that).
+    frmerr_history_clear();
     tdm_liveness_watch_reset();
     s_frmerr_recovering = false;
     s_frmerr_restarts   = 0u;
@@ -1210,6 +1287,46 @@ bool audio_transport_snapshot_take_window( audio_transport_snapshot_t* out )
 }
 
 
+#if NORA_TDM_USE_SPI2 && (RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE)
+// The sync domain a leg was committed to, or -1 when it cannot be read back.
+//
+// Read from the HAL's committed setup, never assumed: the domain map is the board system table's
+// property (board/audio/tdm.c), and a build that co-clocks the legs must fall back to whole-stream
+// behaviour rather than act on a guessed id.
+static int audio_transport_leg_domain( nora_spi_i2s_tdm_inst_t* leg )
+{
+    nora_spi_i2s_tdm_leg_setup_t set;
+
+    if( ( leg == NULL ) || !nora_spi_i2s_tdm_inst_get_setup( leg, &set ) )
+    {
+        return -1;
+    }
+    return (int)set.sync_domain;
+}
+
+// Leg B's sync domain, or -1 when leg B must not be started/stopped on its own.
+//
+// Both the deferred ARM below and the declick PARK further down are only sound where leg B is the
+// sole member of its own domain: a domain is a phase-locked UNIT, so touching a domain that also
+// contains leg A would touch leg A's live audio. The A/B comparison is what makes a future
+// co-clocked topology fall back to the old whole-stream behaviour instead of killing leg A.
+static int audio_transport_leg_b_own_domain( void )
+{
+    const int dom_b = audio_transport_leg_domain( audio_transport_tdm_leg_b() );
+    const int dom_a = audio_transport_leg_domain( audio_transport_tdm_leg_a() );
+
+    if( dom_b < 0 )
+    {
+        return -1;
+    }
+    if( dom_a == dom_b )
+    {
+        return -1;   // co-clocked with A: this domain carries leg A too
+    }
+    return dom_b;
+}
+#endif // leg B is an independently startable/stoppable endpoint-clocked domain
+
 static void audio_transport_start_hal_transport( void )
 {
     const audio_transport_client_t* client = audio_transport_client_get();
@@ -1313,7 +1430,54 @@ static void audio_transport_start_hal_transport( void )
 #else
     if( ok )
     {
+#if NORA_TDM_USE_SPI2 && \
+    (RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE) && \
+    !RESOLVED_TRANSPORT_LEG_B_BLOCK_IRQ_GATED
+        /*
+         * DEFER leg B's domain until its codec drives BCLK/FS.
+         *
+         * This is the mirror image of the declick PARK further down, and it exists for the same
+         * reason: an endpoint-clocked leg B has NO clock until wm8904_init*(I2C_INST_B) has run,
+         * and that runs ~0.7 s after this point (leg A's codec-master apply, the PLL2/CCP
+         * re-sourcing, the is_running gate, delay_ms(50)+delay_ms(100)). Arming B here therefore
+         * released a framed SPI2 slave, RX/TX DMA armed, onto a dead bus -- so the transport
+         * recorded the whole bring-up window as frame errors. Measured on AK512 96 kHz A->B
+         * (2026-09-04): the first recover tick after the start read a consecutive-FRMERR run of
+         * exactly 1642 and opened a recovery episode (STREAM epoch=2
+         * transition=frmerr-recovery) on every boot, with every harm counter -- miss, drop,
+         * starve, bad -- at 0.
+         *
+         * Arming B AFTER its clock exists removes the window instead of forgiving it. The
+         * frmerr_history_clear() at the end of the start stays: it is the fallback for the
+         * topologies this deferral does not cover (co-clocked B, and the phase-locked start
+         * above, where the domain is the phase-lock UNIT and must be armed together).
+         *
+         * Only leg A's domain is armed here, by id read back from the committed setup -- not
+         * start_all_domains(), which by contract arms every STOPPED domain and would take B with
+         * it. Fall back to the old behaviour whenever the ids cannot be read or B is not alone in
+         * its domain: a guessed domain id is worse than the window this removes.
+         *
+         * Excluded when leg B's block IRQ is gated (RESOLVED_TRANSPORT_LEG_B_BLOCK_IRQ_GATED):
+         * that mask is applied right after this call, and start_domain()'s arm path re-enables
+         * the leg's interrupts, so a deferred arm would silently un-gate it.
+         */
+        const int dom_a = audio_transport_leg_domain( audio_transport_tdm_leg_a() );
+        const int dom_b = audio_transport_leg_b_own_domain();
+        if( ( dom_a >= 0 ) && ( dom_b >= 0 ) )
+        {
+            ok = nora_spi_i2s_tdm_start_domain( (uint8_t)dom_a );
+            printf(" audio_transport_start: leg-A domain %d armed, leg-B domain %d DEFERRED"
+                   " until codec B drives BCLK/FS (ok=%d)\n", dom_a, dom_b, ok ? 1 : 0 );
+        }
+        else
+        {
+            printf(" audio_transport_start: leg-B domain not independently startable"
+                   " -- arming every domain (frame errors expected until codec B clocks)\n");
+            ok = nora_spi_i2s_tdm_start_all_domains();
+        }
+#else
         ok = nora_spi_i2s_tdm_start_all_domains();
+#endif // leg B is an independently armable endpoint-clocked domain
     }
 #endif // resolved startup phase-lock policy
     if( !ok )
@@ -1395,16 +1559,6 @@ static bool audio_transport_start_route_impl(
         return false;
     }
 
-    // (Phase D) Tune the A-side DSP to the A-domain codec rate. In the codec-master build A is
-    // runtime rate-settable, so read its current rate (default 48k); other builds keep the
-    // compile-time SAMPLE_RATE (e.g. the 96k test path). The fs-aware guard inside re-tunes only
-    // when the rate actually changed.
-#if RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE
-    audio_transport_prepare_client( wm8904_get_rate_hz( I2C_INST_A ) );
-#else
-    audio_transport_prepare_client(
-        RESOLVED_TRANSPORT_LEG_A_INITIAL_NOMINAL_RATE_HZ );
-#endif
     if( !audio_transport_bind_transport_once() )
     {
         audio_transport_mark_transition_failed(
@@ -1466,6 +1620,34 @@ static bool audio_transport_start_route_impl(
 #endif // NORA_TDM_USE_SPI2
         }
     }
+
+    /*
+     * (Phase D) Tune the A-side DSP to the A-domain codec rate. In the codec-master build A is
+     * runtime rate-settable, so read its current rate; other builds keep the compile-time
+     * SAMPLE_RATE (e.g. the 96k test path). The fs-aware guard inside re-tunes only when the
+     * rate actually changed.
+     *
+     * AFTER THE SEED ABOVE, AND THAT ORDER IS THE POINT. wm8904_get_rate_hz() answers from the
+     * driver's per-instance state, whose boot default is 48000 -- so while this ran ahead of the
+     * seed, the very first start handed the client 48 kHz on EVERY build, and a 48 kHz build could
+     * not tell: its default equalled its real rate. The 96 kHz preset could, and did -- measured
+     * 2026-09-04 on AK512, banner `Config: rate=96000Hz` against ` LED meter: fs=48000Hz`, which
+     * put the LED meter's update period at 3 blocks (500 us) instead of the 0.8 ms it asks for.
+     * Only the LED meter reads fs in the ASRC client today, which is why this stayed cheap; the
+     * hook is fs-parameterized for whatever tunes next, so it must not be fed a stale rate.
+     *
+     * Still before the first codec init and before the transport start, so nothing that runs on
+     * the audio callbacks can observe an untuned client. NOT fixed the other way round (seeding
+     * above Phase D) on purpose: the seed's one-shot flag sits behind the fail-closed
+     * audio_transport_bind_transport_once() check, and moving it in front of that would spend the
+     * one shot on a start that never programmed a codec.
+     */
+#if RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE
+    audio_transport_prepare_client( wm8904_get_rate_hz( I2C_INST_A ) );
+#else
+    audio_transport_prepare_client(
+        RESOLVED_TRANSPORT_LEG_A_INITIAL_NOMINAL_RATE_HZ );
+#endif
 
     // How this image configures the codec. Printed unconditionally and before any
     // codec is touched: it describes the image, not a leg. (This line once lived
@@ -1725,6 +1907,49 @@ static bool audio_transport_start_route_impl(
         return false;
     }
 #endif // resolved rate and leg-B clock ownership
+
+#if (RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE) && \
+    !RESOLVED_TRANSPORT_LEG_B_BLOCK_IRQ_GATED
+    /*
+     * Codec B is configured and driving BCLK/FS from its own XTAL, so arm the domain the start
+     * above deferred. Same call, same reasoning and same idempotence as the declick startup
+     * primitive: start_domain() returns success on an already-running domain, so a build that
+     * fell back to start_all_domains() (co-clocked B, unreadable domain ids) passes through here
+     * unchanged, and the arm path runs diag_reset() so B's counters begin on a clocked bus.
+     */
+    {
+        const int dom_b = audio_transport_leg_b_own_domain();
+        if( dom_b >= 0 )
+        {
+            if( !nora_spi_i2s_tdm_start_domain( (uint8_t)dom_b ) )
+            {
+                audio_transport_mark_transition_failed(
+                    AUDIO_TRANSPORT_TRANSITION_ERROR_START_FAILED );
+                printf(" audio_transport_start: leg-B domain %d start FAILED (err=%d)"
+                       " -- mute-held teardown\n",
+                       dom_b, (int)nora_spi_i2s_tdm_get_last_error() );
+                (void)audio_transport_stop_route( route );
+                return false;
+            }
+            /*
+             * Leg A produced into the client across the whole codec-B bring-up window while leg B
+             * had no blocks at all, so the client's cross-leg state (ASRC FIFO centring + ratio
+             * servo) is seeded from a one-legged stream. Re-lock it on the freshly armed pair --
+             * the same re-lock the declick startup primitive does after its park, and the same one
+             * a full restart performs at the end of audio_transport_start_hal_transport().
+             *
+             * This is where the deferral's cost is paid: it trades leg B's frame-error window for
+             * a leg-A-only window, and only an explicit re-lock keeps that from becoming the
+             * ratio servo's problem instead of the framer's.
+             */
+            const audio_transport_client_t* relock_client = audio_transport_client_get();
+            if( ( relock_client != NULL ) && ( relock_client->reset_stream_state != NULL ) )
+            {
+                relock_client->reset_stream_state( relock_client->user );
+            }
+        }
+    }
+#endif // deferred leg-B domain arm
 #else
     printf("---------------------------------------------\n");
     printf("WM8904 on MikroB is disabled.\n");
@@ -1749,6 +1974,26 @@ static bool audio_transport_start_route_impl(
     // post-restart transient block (the verify window never touches the counter).
     s_mirror_unresolved_run = 0u;
 #endif // RESOLVED_TRANSPORT_STARTUP_PHASE_LOCK_ENABLED
+    // Frame-error history from the muted startup window is reported and then dropped, for the same
+    // reason the phase-fault latch above is cleared: nothing observed up to this point describes the
+    // running stream. The transport is armed BEFORE the codecs are configured (leg A's DC servo and
+    // leg B's own-XTAL master both need the sequence in that order), so leg B's SPI slave spends
+    // ~0.7 s with no BCLK/FS and the framed transport records that as frame errors.
+    //
+    // Measured on AK512 96 kHz A->B (2026-09-04): the FIRST recover tick, 2 ms after this point,
+    // read a consecutive-FRMERR run of exactly 1642 on every boot and opened a recovery episode
+    // (STREAM epoch=2 transition=frmerr-recovery) although every harm counter -- miss, drop,
+    // starve, bad -- was 0. The run cannot decay on its own: one clean block would zero it, so a
+    // burst that ends with the leg quiet keeps reporting "misframed right now" forever.
+    //
+    // Dropping it does NOT weaken the detector. The error counters are the only thing cleared;
+    // block_count and the deadline/DMA evidence survive, so a leg that really is dead or misframed
+    // is still caught -- by liveness (clock advances, blocks do not: 20 ms) or by a fresh FRMERR run
+    // rebuilt from live blocks. The difference is that the recovery then fires on evidence from the
+    // running stream, with trigger=liveness/frmerr telling the operator which it was.
+    frmerr_print_legs( "startup" );
+    frmerr_history_clear();
+
     // A recovery start deliberately stays muted until a separate clean-frame/liveness check
     // succeeds. Normal starts preserve the original behavior and unmute here.
     if( unmute_on_success )
@@ -2499,6 +2744,7 @@ bool audio_transport_restart_codec_b_only_declick( uint8_t declick_mask )
 #endif
 }
 
+
 // Phase-split B-only declick (for isolating SHUTDOWN vs STARTUP pop). The measurement harness arms the
 // pop meter, runs one phase, reads the meter, then runs the other -- so each phase's pop is attributed
 // separately. Same topology guard / synchronous-context reasoning as the combined call above.
@@ -2507,6 +2753,35 @@ bool audio_transport_declick_b_shutdown_only( uint8_t declick_mask )
 #if NORA_TDM_USE_SPI2 && (RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE)
     wm8904_set_pending_declick( declick_mask );
     wm8904_set_analog_output_mute( I2C_INST_B, true );   // mute B (ramp-down if mask bit4/E)
+
+    // PARK leg B's transport BEFORE the codec stops driving BCLK/FS.
+    //
+    // wm8904_shutdown() takes B's SYSCLK down, and B is the clock MASTER of its domain: without
+    // this stop, frame sync disappears from under a live SPI2 slave whose RX/TX DMA is armed. The
+    // slave is left stranded mid-frame -- FRMERR latches and the word boundary stays wherever the
+    // clock died -- and re-initialising the codec afterwards does not re-align it, so the leg comes
+    // back misframed and only a full mute+stop+start of the WHOLE transport re-locks it. That is
+    // exactly what was measured on 2026-09-04/05: every *ap ran a real recovery episode
+    // (STREAM epoch+1, transition=frmerr-recovery) whose trigger attributed the errors to leg B
+    // alone and still climbing (`B:frm=67 run=67`). Clearing counters cannot fix that -- the errors
+    // were still arriving -- so the stop side is where it has to be fixed.
+    //
+    // start_domain() in the paired startup_only re-arms it after B's clock is back, and its arm
+    // path runs diag_reset(), so the counters restart clean by construction rather than by a
+    // separate "forget the transient" call.
+    {
+        const int domain = audio_transport_leg_b_own_domain();
+        if( domain < 0 )
+        {
+            printf(" [declick-B] leg B shares its sync domain -- codec clock stops under a live leg\n" );
+        }
+        else if( !nora_spi_i2s_tdm_stop_domain( (uint8_t)domain ) )
+        {
+            printf(" [declick-B] leg-B domain %d stop refused (err=%d) -- clock stops under a live leg\n",
+                   domain, (int)nora_spi_i2s_tdm_get_last_error() );
+        }
+    }
+
     wm8904_shutdown( I2C_INST_B );                        // strategy-aware discharge (quench/ordered/WSEQ)
     // pending mask intentionally left armed; the paired startup_only consumes and clears it.
     return true;
@@ -2527,12 +2802,47 @@ bool audio_transport_declick_b_startup_only( uint8_t declick_mask )
      * ADC+DAC here made a rate change on leg B unrepresentable -- which is why
      * "*ar 1 8" (B -> 48 kHz) reported success while B kept running at 96 kHz.
      */
-    const bool ok = wm8904_init_role( I2C_INST_B, true, AUDIO_TRANSPORT_LEG_B_ROLE );
+    bool ok = wm8904_init_role( I2C_INST_B, true, AUDIO_TRANSPORT_LEG_B_ROLE );
     if( ok )
     {
-        // Only unmute a codec that actually re-initialised. Unmuting a failed/unreachable B
-        // would drive a broken analog block (audible pop) and yield a meaningless measurement --
-        // match the shipping start_route_impl contract (unmute gated on apply success).
+        // B drives BCLK/FS again, so re-arm the domain the shutdown side parked. start_domain() is
+        // an idempotent success on an already-running domain, which is what makes the
+        // no-shutdown-first variant (*ap<mask>01) and a bare startup_only call still work.
+        const int domain = audio_transport_leg_b_own_domain();
+        if( domain >= 0 )
+        {
+            if( !nora_spi_i2s_tdm_start_domain( (uint8_t)domain ) )
+            {
+                printf(" [declick-B] leg-B domain %d start FAILED (err=%d) -- staying muted\n",
+                       domain, (int)nora_spi_i2s_tdm_get_last_error() );
+                ok = false;
+            }
+            else
+            {
+                // Leg B's blocks stopped for the whole codec outage while leg A kept producing, and
+                // the re-arm cleared B's DMA buffers, so the client's cross-leg state (ASRC FIFO
+                // centring + ratio servo) has to be re-locked -- the same re-lock the full-transport
+                // restart does at its end. This used to happen only by accident: the frame-slip made
+                // the manage loop restart the whole transport, which re-locked as a side effect. Now
+                // that the park prevents that restart, the re-lock has to be explicit here.
+                //
+                // Callers that already re-lock (the fast leg-B rate change) simply do it twice; the
+                // client contract is idempotent, and doing it in the primitive keeps every caller
+                // correct instead of relying on each one to remember.
+                const audio_transport_client_t* client = audio_transport_client_get();
+                if( ( client != NULL ) && ( client->reset_stream_state != NULL ) )
+                {
+                    client->reset_stream_state( client->user );
+                }
+            }
+        }
+    }
+    if( ok )
+    {
+        // Only unmute a codec that actually re-initialised AND whose leg is armed. Unmuting a
+        // failed/unreachable B would drive a broken analog block (audible pop) and yield a
+        // meaningless measurement -- match the shipping start_route_impl contract (unmute gated on
+        // apply success).
         wm8904_set_analog_output_mute( I2C_INST_B, false );   // unmute B (soft-ramp up if mask bit2/D)
     }
     wm8904_set_pending_declick( (uint8_t)WM8904_DECLICK_NONE );
@@ -2546,9 +2856,10 @@ bool audio_transport_declick_b_startup_only( uint8_t declick_mask )
 #if NORA_TDM_USE_SPI2 && (RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE)
 // Fast LEG-B rate change: re-init ONLY codec-B (at its already-set new rate) while the transport and
 // codec-A keep running. Reuses the *ap codec-B-only primitives: mute B, strategy-none shutdown, re-init
-// B as codec-master (which picks up the new wm8904 rate), unmute B. B briefly drops its BCLK while
-// re-initing, so the dsPIC SPI2 slave sees a transient frame-slip -- cleared here so the manage loop
-// does not escalate to a full-transport recovery. Codec-A never stops and the A-side DSP is untouched
+// B as codec-master (which picks up the new wm8904 rate), unmute B. Those primitives now PARK leg B's
+// sync domain across the outage (stop_domain -> codec -> start_domain), so B's BCLK dropping no longer
+// strands a live SPI2 slave mid-frame; the frmerr clear below is left as cheap insurance for the case
+// where the park was refused. Codec-A never stops and the A-side DSP is untouched
 // (A's rate is unchanged, so prepare_client would be a no-op anyway). Roughly half the switch time of
 // the whole-transport restart.
 //
@@ -2568,7 +2879,7 @@ static bool audio_transport_reconfigure_codec_b_only( void )
     (void)audio_transport_declick_b_shutdown_only( (uint8_t)WM8904_DECLICK_NONE );
     const bool ok = audio_transport_declick_b_startup_only( (uint8_t)WM8904_DECLICK_NONE );
     delay_ms( 50 );
-    audio_transport_frmerr_reset();   // clear the transient B-clock frame-slip (benign; B re-inited clean)
+    audio_transport_frmerr_reset();   // insurance only: the domain park above should leave nothing behind
 
     // Re-lock the application stream state (ASRC servo + CCP acquire) to B's new rate. Mirrors the
     // full-restart re-lock without stopping the transport; see the block comment above.

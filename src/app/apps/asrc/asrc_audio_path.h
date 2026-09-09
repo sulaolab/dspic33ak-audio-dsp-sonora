@@ -66,12 +66,20 @@ uint32_t asrc_audio_path_ba_fixed_rate_den( void );
 // field: ":11k" / ":12k" for the two /4 sets, "" when the divider is unambiguous on its own.
 // The divider cannot identify a /4 by itself -- both output rates use 4 -- and the two sets
 // have different band edges, so without this a mis-selected set is invisible in the log.
-const char* asrc_audio_path_frontend_tag( void );
-
+const char* asrc_audio_path_frontend_tag( void );
+
+
+
 // Apply rate-monotonic RX-ISR priorities for the committed rate pair: the higher-rate leg has
 // the shorter deadline and gets the higher priority. Task level, called while the transport is
 // stopped (see the definition for why it is not dynamic). No-op when the rates are equal or
 // APP_ASRC_RATE_MONOTONIC_ISR is 0.
+/* True once either leg callback has executed at least once; never goes back to false.
+ * Callers that must not touch live engine state -- the push selftests, which use
+ * s_asrc[ASRC_ENGINE_AB] as their scratch -- gate on this instead of on a call count.
+ * See the definition for why a call count is not equivalent. */
+bool asrc_audio_path_isr_has_started( void );
+
 void asrc_audio_path_apply_isr_priorities( void );
 
 // --- Declick pop measurement (see [internal] manual_wm8904_mute_restart_declick.md) ---

@@ -13,6 +13,7 @@
 #include "asrc_audio_path.h"
 #include "audio_app_asrc.h"
 #include "audio_app_meas.h"
+#include "asrc_full_iir_48_to_32.h"
 
 /*
  * The codec rate query and the TDM leg handles below are needed by TWO things: the low-rate
@@ -48,6 +49,26 @@
 /* printf newline, kept out of the format strings so the source carries no escape that a
  * text tool can mangle. */
 #define ASRC_PRIO_EOL   "\n"
+
+/* NOT inside the 48->8 front-end block below: the three users of this flag
+ * (asrc_audio_path_isr_has_started() and the two leg callbacks) are unconditional, so a
+ * configuration without a runtime 48->8 front end -- AK128 bi-codec, for one -- lost the
+ * declaration and failed to compile. Keep it at file scope. */
+/* "The audio ISRs have started" -- set from the leg callbacks themselves, never cleared.
+ *
+ * This exists so a boot-time selftest can be a boot-time selftest structurally, not by
+ * counting calls.  audio_app_asrc_reset_all() is NOT boot-only: the boot sequence calls it
+ * twice, a console `*ar` rate re-commit re-enters it through asrc_transport_reset(), and
+ * `*as 07` calls it directly.  On the `*ar` path leg A keeps streaming -- it carries the AB
+ * push and the whole BA pull -- so any selftest that borrows s_asrc[] as scratch is racing a
+ * live ISR.  "First call to reset_all" would have been the same guard by accident and would
+ * silently stop being one if the boot sequence gained a third reset; this asks the real
+ * question instead.  Latching in the ISR is what makes it unfalsifiable: nothing else can
+ * claim the ISRs have not run once one has.
+ *
+ * Cost is one byte store per leg block (~2 instruction cycles, 0.02 us), below the 0.1 us
+ * telemetry resolution, and it cancels out of any same-image baseline/optimized delta. */
+static volatile uint8_t s_audio_isr_started;
 
 #if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
 #include "asrc_decimator_48_to_8.h"
@@ -272,6 +293,7 @@ _Static_assert( PATH_DECIMATED_STRIDE == ASRC_CH,
 // -- its step is below 1, so R(step) shrinks and never approaches the clamp that motivates all of
 // this.  That keeps the union sound and keeps the "not ready -> asrc_audio_path_reset()" self-heal
 // below single-writer: only the owning leg's ISR can reach it.
+
 static volatile uint8_t s_path_decimator_ready;
 /*
  * SINGLE-CALLER INVARIANT FOR THE FRONT END, ENFORCED RATHER THAN ASSUMED.
@@ -579,6 +601,22 @@ static bool path_decimator_init( uint32_t num, uint32_t den, uint32_t low_rate_h
                 vpre = ASRC_DECIMATOR_96_TO_48_FOR_44100;
                 s_path_frontend_tag = ":44k1";
             }
+#if APP_ASRC_FULL_IIR_48_TO_32
+            else if( low_rate_hz == 32000u )
+            {
+                /* 96 -> 32 kHz with the Full-IIR stage behind this: the pre-stage is the whole
+                 * FRONT END, but it is NOT the whole anti-alias chain -- the 6-SOS elliptic LPF
+                 * at 48 kHz sits between it and the resampler and is what protects the 16000 Hz
+                 * fold edge.  So this row takes the SHARED 41-tap set, the identical filter the
+                 * N97 composed route uses for this pair, and adds no coefficients: that is what
+                 * makes *aj00 vs *aj01 a comparison of the 48 -> 32 stage alone.  A wide variant
+                 * would change the pre-stage as well and measure two things at once.
+                 *
+                 * Reachable only when the plan published this pair, i.e. only in Full-IIR mode. */
+                vpre = ASRC_DECIMATOR_96_TO_48_SHARED;
+                s_path_frontend_tag = ":32k-fi";
+            }
+#endif
             else
             {
                 s_path_frontend_tag = "";
@@ -742,6 +780,175 @@ typedef struct
     volatile uint32_t meter_b_ticks;
 } asrc_path_profile_t;
 
+#if APP_ASRC_LEG_PROFILE
+/*
+ * Leg A decomposed so that the rows ADD UP, which the peak-held counters above cannot do.
+ * Each of cbA / pushAB / ledA is an independent maximum, so their peaks come from different
+ * blocks and their sum is not any block that ever ran -- the first version of this line
+ * printed a NEGATIVE remainder for exactly that reason, which is honest but useless as a
+ * budget.
+ *
+ * So the block accumulates its own parts in `cur` (zeroed at callback entry, += per call so a
+ * part entered twice still counts once per entry), and when the callback turns out to be the
+ * longest one of the telemetry window its parts are copied to `witness`.  Everything printed
+ * from `witness` therefore describes ONE block -- the worst one -- and `rest` is a real
+ * remainder rather than an artefact of mixing blocks.
+ *
+ * The parts are the calls leg A actually makes at a mixed rate pair, in order: the declick pop
+ * metric, the front end (whose two arithmetic halves come from the front end itself), the A->B
+ * push into the ring, the WHOLE B->A resampler pull -- leg A owns it because ISR priority is
+ * rate-monotonic and leg A is the faster leg -- and the LED meter submit.
+ */
+typedef struct
+{
+    uint32_t pop;
+    uint32_t fe;
+    uint32_t fe_pre;
+    uint32_t fe_r23;
+    uint32_t push;
+    uint32_t pull;
+    uint32_t led;
+    uint32_t cb;
+} asrc_leg_a_parts_t;
+
+static asrc_leg_a_parts_t s_leg_a_cur;
+static asrc_leg_a_parts_t s_leg_a_witness;
+
+/*
+ * LEG B AS A PARTITION, built the same way cpuB itself is built.
+ *
+ * cpuB answered "how much of leg B is leg B" but not "what inside leg B costs what", and leg B
+ * is the term the closing condition weights ONCE (leg A is weighted three times at 96/32), so a
+ * microsecond found here is worth three found in leg A.  The existing pushBA / ledB rows cannot
+ * answer it: they are WALL peaks, and leg A lands inside them repeatedly at a mixed rate pair --
+ * ledB reads ~150 us against a whole-callback CPU of ~91 us, which is preemption, not work.
+ *
+ * So every part is bracketed with the SAME accumulator pairing as cpuB (leg_b_mark) and leg A's
+ * time inside the bracket is subtracted.  The three parts are the three calls leg B actually
+ * makes on the bidirectional route, in order: the B->A ring push, the WHOLE A->B resampler pull
+ * (leg B owns it -- the A->B output frame is leg B's own frame), and the LED meter submit.
+ * `rest` is cpuB minus the three, i.e. the callback prologue/epilogue, the TDM glue, and
+ * everything else the bracket construction charges to leg B.
+ *
+ * ONLY THE BIDIRECTIONAL ROUTE IS PARTITIONED.  On the other routes the three parts stay 0 and
+ * `rest` absorbs the whole callback, which is honest rather than convenient: those routes call a
+ * different set of functions and a row labelled `pull` there would name work that never ran.
+ *
+ * NOT a deadline figure, exactly as with leg A: every row carries this instrument.  Absolute
+ * numbers come from an APP_ASRC_LEG_PROFILE=0 image; this one gives the SPLIT.
+ */
+typedef struct
+{
+    uint32_t push;
+    uint32_t pull;
+    uint32_t led;
+    uint32_t cpu;
+} asrc_leg_b_parts_t;
+
+static asrc_leg_b_parts_t s_leg_b_cur;      /* private to leg B's ISR between entry and exit */
+static asrc_leg_b_parts_t s_leg_b_witness;  /* the parts of the block that set the cpu peak  */
+
+/*
+ * LEG B EXCLUSIVE CPU, and why the wall clock cannot be used instead.
+ *
+ * cbB above is leg B WALL time, and at a mixed rate pair it is not a CPU figure at all:
+ * leg A is the higher-priority leg, so it preempts leg B repeatedly inside one leg-B
+ * callback.  At 96/32 kHz that reads 994.6 us against a 500 us window -- obviously not
+ * 994.6 us of work, but there is no way to tell from that number how much of it WAS.
+ *
+ * The whole-CPU question needs an exclusive figure for both legs, because the closing
+ * condition is a sum: 3 x legA_CPU + legB_CPU <= 500 us at 96/32.  Until now the leg-B
+ * term in that sum was an ESTIMATE (the 62 us in 3R + 62), never a measurement.
+ *
+ * So leg A accumulates its own measured spans into s_leg_a_busy_acc, and leg B subtracts
+ * what accumulated BETWEEN its entry and its exit.  Nothing is timestamped per preemption
+ * and no interrupt is disabled: the accumulator is a plain uint32_t written only by leg A
+ * and read only by leg B, and it wraps harmlessly because only the DIFFERENCE is used.
+ *
+ * WHAT IT OVER-REPORTS, deliberately in the conservative direction.  Leg A brackets itself
+ * from inside its callback, so its prologue, its epilogue and the dispatch around it are
+ * NOT in the accumulator -- nor is any third interrupt (UART, timers).  Every one of those
+ * stays charged to leg B, so cpuB is an UPPER bound on leg B exclusive CPU.  A budget that
+ * closes with this number closes with the real one; a budget that fails by less than the
+ * bracket error has not been decided.
+ *
+ * The subtraction is guarded rather than trusted.  If leg A somehow accumulated more than
+ * leg B measured in wall time, the result would underflow to a huge unsigned value; that
+ * case is COUNTED and printed rather than clamped silently to 0, because a fabricated 0
+ * would look like the best possible result.
+ */
+static volatile uint32_t s_leg_a_busy_acc;      /* ticks, leg A self-measured, wraps */
+static uint32_t          s_leg_b_cpu_peak;      /* ticks, peak-held exclusive CPU    */
+static uint32_t          s_leg_b_cpu_under;     /* subtraction underflows seen       */
+
+/*
+ * ONE CONSISTENT PAIR of (timer, leg-A accumulator), which is the whole difficulty.
+ *
+ * Reading them as two separate loads is wrong by a WHOLE leg-A block, not by a little:
+ * leg A can preempt between the two loads, and then the timestamp is from before that
+ * block and the accumulator from after it (or the reverse, depending on the order).  At
+ * 96/32 kHz a leg-B callback spans not quite four leg-A blocks, so mispairing one of them
+ * moves the answer by ~144 us out of ~650 us -- and since the result is PEAK-held, the one
+ * block where the race happened is exactly the one that gets reported.  That was measured,
+ * not predicted: the first version of this witness read them in sequence and printed a
+ * 230 us peak where DSPload's own share put leg B near 74 us.
+ *
+ * So sample the accumulator on BOTH sides of the timer read and retry while they disagree.
+ * A retry means leg A completed a block in between, which is precisely the case that would
+ * have been mispaired.  The loop terminates because leg A cannot preempt indefinitely (it
+ * is one block per 166.67 us and the body here is a handful of instructions), and it needs
+ * no interrupt masking -- leg A only ever ADDS to the accumulator and this only ever reads
+ * it.
+ *
+ * Both sample points are outside any leg-A block by construction: leg B is running, and it
+ * only runs when the higher-priority leg is not.  So `steal` between two such points is an
+ * exact sum of whole leg-A blocks, with no partial block at either end.
+ */
+static uint32_t leg_b_sample_pair( uint32_t *leg_a_busy )
+{
+    uint32_t before;
+    uint32_t now;
+    do
+    {
+        before = s_leg_a_busy_acc;
+        now    = nora_high_res_timer_get_count();
+    } while( s_leg_a_busy_acc != before );
+    *leg_a_busy = before;
+    return now;
+}
+
+/*
+ * One bracket boundary: the timer and the leg-A accumulator as a CONSISTENT PAIR, which is the
+ * only way a span inside leg B can be turned into a CPU figure (see leg_b_sample_pair).  Cost is
+ * a handful of instructions plus a retry only when leg A completed a block in between, and leg B
+ * runs once per 500 us at 96/32, so the instrument does not move what it measures.
+ */
+typedef struct
+{
+    uint32_t t;
+    uint32_t acc;
+} asrc_leg_b_mark_t;
+
+static uint32_t s_leg_b_part_under;         /* per-part subtraction underflows seen */
+
+static inline asrc_leg_b_mark_t leg_b_mark( void )
+{
+    asrc_leg_b_mark_t m;
+    m.t = leg_b_sample_pair( &m.acc );
+    return m;
+}
+
+/* Underflow is COUNTED, never clamped into the part: a part silently short by a leg-A block
+ * would read as the cheapest one and get taken off the list of things to fix. */
+static inline void leg_b_part_add( uint32_t* part, asrc_leg_b_mark_t start, asrc_leg_b_mark_t end )
+{
+    const uint32_t wall  = end.t - start.t;
+    const uint32_t steal = end.acc - start.acc;
+    if( wall >= steal ) { *part += ( wall - steal ); }
+    else                { ++s_leg_b_part_under; }
+}
+#endif
+
 #if APP_ASRC_HEADROOM_INSTRUMENT
 static asrc_path_profile_t s_path_profile;
 #endif
@@ -769,6 +976,37 @@ static inline void path_push_ab( const int32_t* src )
     profile_peak_ticks( &s_path_profile.push_ab_ticks, started );
 #endif
 }
+
+#if APP_ASRC_FULL_IIR_48_TO_32
+/* Same profiling seam as path_push_ab(), so the stage's cost is visible where the
+ * producer's cost has always been reported (`pushAB`).  It also lands in leg A's ISR
+ * occupancy, which is what `max_demand` measures -- the integrated figure the brief
+ * asks for, rather than a bench number added to a baseline. */
+static inline void path_push_ab_full_iir( const int32_t* src )
+{
+#if APP_ASRC_HEADROOM_INSTRUMENT
+    const uint32_t started = nora_high_res_timer_get_count();
+#endif
+    asrc_full_iir_48_to_32_process_push_ab( src );
+#if APP_ASRC_HEADROOM_INSTRUMENT
+    profile_peak_ticks( &s_path_profile.push_ab_ticks, started );
+#endif
+}
+
+/* Same seam for the pre-stage-fed entry point, so pushAB keeps meaning "the whole
+ * filter-and-push step" in both routes and the two are comparable. */
+static inline void path_push_ab_full_iir_frames( const int32_t* src, uint32_t frames,
+                                                uint32_t stride )
+{
+#if APP_ASRC_HEADROOM_INSTRUMENT
+    const uint32_t started = nora_high_res_timer_get_count();
+#endif
+    asrc_full_iir_48_to_32_process_push_ab_frames( src, frames, stride );
+#if APP_ASRC_HEADROOM_INSTRUMENT
+    profile_peak_ticks( &s_path_profile.push_ab_ticks, started );
+#endif
+}
+#endif
 
 #if APP_B_ROUTE_USES_BA
 static inline void path_push_ba( const int32_t* src )
@@ -805,6 +1043,54 @@ static inline void path_meter_submit( const int32_t* buf, uint8_t leg )
 #endif
 }
 
+#if APP_ASRC_LEG_PROFILE
+/* Accumulate rather than peak-hold: see asrc_leg_a_parts_t.  All of these run in leg A's ISR
+ * only, and `cur` is private to that ISR between its own entry and exit, so no guard. */
+static inline void leg_a_add( uint32_t* part, uint32_t started )
+{
+    *part += ( nora_high_res_timer_get_count() - started );
+}
+#endif
+
+#if APP_ASRC_LEG_PROFILE
+/* The A->B ring push AS LEG A MAKES IT.  Leg A calls audio_app_asrc_push_ab_frames() directly
+ * with the front end's output, so it never went through path_push_ab() and the existing
+ * push_ab_ticks probe never saw it: `pushAB` read 0.0 us in the first instrumented image while
+ * the work was really sitting in the unexplained remainder. */
+static inline void push_ab_frames_profiled( const int32_t* src, size_t frames, size_t stride )
+{
+    const uint32_t started = nora_high_res_timer_get_count();
+    audio_app_asrc_push_ab_frames( src, frames, stride );
+    leg_a_add( &s_leg_a_cur.push, started );
+}
+#else
+#define push_ab_frames_profiled audio_app_asrc_push_ab_frames
+#endif
+
+#if APP_ASRC_LEG_PROFILE && (APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8)
+/* Leg A's front-end call, timed where it is MADE rather than inside the front end, so that this
+ * row and the push / pull / meter rows beside it are one instrument measured at one level.  The
+ * two arithmetic halves come from the front end itself and are subtracted from this row, so
+ * fe - (pre + r23) is the front end's own checks, dispatch and per-stage loop. */
+static inline bool path_decimator_process_profiled( uint32_t den, uint32_t second_den,
+                                                    const int32_t* src, const int32_t** out,
+                                                    size_t* produced )
+{
+    const uint32_t started = nora_high_res_timer_get_count();
+    const bool     ok      = path_decimator_process( den, second_den, src, out, produced );
+    leg_a_add( &s_leg_a_cur.fe, started );
+    {
+        uint32_t pre = 0u, r23 = 0u;
+        asrc_decimator_q31_profile_take_last( &pre, &r23 );
+        s_leg_a_cur.fe_pre += pre;
+        s_leg_a_cur.fe_r23 += r23;
+    }
+    return ok;
+}
+#else
+#define path_decimator_process_profiled path_decimator_process
+#endif
+
 /*
  * Pure front-end selection: which decimating / resampling front end (num/den per engine)
  * this build would put in front of the resampler for a given rate PAIR.
@@ -818,6 +1104,44 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
                                     asrc_frontend_plan_t* plan )
 {
     if( plan == NULL ) { return; }
+#if APP_ASRC_FULL_IIR_48_TO_32
+    /* TRIAL Full-IIR, and only for the one pair it was qualified for.  The stage does not
+     * resample -- it is a 48 kHz LPF, so the RATIO the plan describes is 1/1 and the generic
+     * ASRC does the whole 48 -> 32 conversion at step 1.5.  Answering "direct" here is what
+     * REMOVES the N97 front end; the stage itself is armed by asrc_audio_path_reset(), which
+     * is the only place allowed to touch streaming state.
+     *
+     * Deliberately narrow: the mode is global, this override is not.  Every other pair --
+     * including (A = 32 k, B = 48 k), which decimates in the B->A direction -- keeps the plan
+     * it has, which is also what keeps "at most one denominator != 1" true. */
+    if( ( a_rate_hz == 48000u ) && ( b_rate_hz == 32000u ) &&
+        ( asrc_full_iir_48_to_32_mode() == ASRC_FULL_IIR_MODE_FULL_IIR ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 1u;
+        plan->low_rate_hz = 0u; plan->in_rate_hz = 0u;
+        return;
+    }
+#if APP_USE_96K_RATE
+    /* CPU LOAD STUDY (2026-09-06), same stage one rate up: A = 96 kHz reaches the 48 kHz
+     * stage through the EXISTING 96 -> 48 kHz pre-stage, so the plan keeps den_ab = /2 and
+     * drops only the 2/3 `:audio' second stage that the N97 route puts behind it.  The
+     * resampler is left at step 1.5 exactly as in the 48 kHz row above -- nothing here
+     * fuses the pre-stage into the stage, and no coefficient set is added.
+     *
+     * low_rate_hz names the FINAL rate (32 kHz) so path_decimator_init() can pick the
+     * pre-stage set by the band actually served; in_rate_hz says the /2 comes from a
+     * 96 kHz leg, which is what tells that resolver this is 96 -> 48 and not 48 -> 24. */
+    if( ( a_rate_hz == 96000u ) && ( b_rate_hz == 32000u ) &&
+        ( asrc_full_iir_48_to_32_mode() == ASRC_FULL_IIR_MODE_FULL_IIR ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = PRESTAGE_DEN; plan->den_ba = 1u;
+        plan->low_rate_hz = 32000u; plan->in_rate_hz = 96000u;
+        return;
+    }
+#endif
+#endif
 #if APP_ASRC_48K_TO_8_INTEGRATION
     /* One-way 48 -> 8 kHz preset: the chain is fixed at build time, so the pair does not
      * select anything.  Answer with the preset rather than falling through the runtime
@@ -1080,6 +1404,13 @@ void asrc_audio_path_reset( void )
     s_path_meter_phase[0] = 0u;
     s_path_meter_phase[1] = 0u;
 #endif
+#if APP_ASRC_FULL_IIR_48_TO_32
+    /* Retire the trial stage FIRST, unconditionally, and re-arm at the bottom only if this pair
+     * and mode want it.  Placed ahead of the front-end block because that block can `return`
+     * early (the dual-denominator refusal), and a stage left armed across an early return would
+     * keep filtering with the state of a pair that is no longer configured. */
+    asrc_full_iir_48_to_32_arm( false );
+#endif
 #if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
     // One-shot bit-exactness check of the front end THIS BUILD SHIPS, against an independent
     // reference -- bit-exact or bust.  Once, not per restart: it costs a few ms and the answer
@@ -1231,6 +1562,51 @@ void asrc_audio_path_reset( void )
         ( ( active_den != 1u ) &&
           path_decimator_init( active_num, active_den, low_rate_hz, in_rate_hz ) ) ? 1u : 0u;
 #endif
+
+#if APP_ASRC_FULL_IIR_48_TO_32
+    /* The ONE place the trial stage's streaming state is touched.  This hook runs with the
+     * transport stopped and the codec rates already committed, between mute and unmute -- so
+     * clearing sixteen channels of IIR state here is the "start / switch while muted" point the
+     * brief requires, and there is deliberately no other path to it.  Never per block: a
+     * per-block reset would zero the filter's memory every 16 frames and turn a 6-SOS elliptic
+     * LPF into a transient generator.
+     *
+     * Retire before arming, in that order and for the frontend's reason: the block ISR gates on
+     * `ready`, so between the two writes it takes the plain direct push rather than filtering
+     * against half-initialised state. */
+    {
+        const uint32_t fi_a_hz = wm8904_get_rate_hz( I2C_INST_A );
+        const uint32_t fi_b_hz = wm8904_get_rate_hz( I2C_INST_B );
+        /* 96 kHz is accepted for the CPU load study: the stage still runs at 48 kHz in, fed by
+         * the existing /2 pre-stage (see asrc_audio_path_frontend_plan()).  Both pairs share
+         * one stage, one coefficient table and one reset. */
+        const bool fi_want =
+            ( ( fi_a_hz == 48000u )
+#if APP_USE_96K_RATE
+              || ( fi_a_hz == 96000u )
+#endif
+            ) && ( fi_b_hz == 32000u ) &&
+            ( asrc_full_iir_48_to_32_mode() == ASRC_FULL_IIR_MODE_FULL_IIR );
+
+        if( fi_want )
+        {
+            asrc_full_iir_48_to_32_reset();
+            asrc_full_iir_48_to_32_arm( true );
+            printf( " ASRC %lu->32 anti-alias stage: Full-IIR (6 SOS @48k, ASRC step 1.5)%s"
+                    ASRC_PRIO_EOL,
+                    (unsigned long)( fi_a_hz / 1000u ),
+                    ( fi_a_hz == 96000u ) ? " behind the 96->48 pre-stage" : "" );
+        }
+        else if( asrc_full_iir_48_to_32_mode() == ASRC_FULL_IIR_MODE_FULL_IIR )
+        {
+            /* Selected but not applicable: say so rather than let the pair look like it took the
+             * trial path.  The mode is global; the stage is qualified for one pair only. */
+            printf( " ASRC 48->32 anti-alias stage: Full-IIR selected but pair is A=%luHz B=%luHz"
+                    " -- not applied" ASRC_PRIO_EOL,
+                    (unsigned long)fi_a_hz, (unsigned long)fi_b_hz );
+        }
+    }
+#endif
 }
 
 uint32_t asrc_audio_path_ab_fixed_rate_num( void )
@@ -1322,6 +1698,11 @@ const char* asrc_audio_path_frontend_tag( void )
  * APP_ASRC_RATE_MONOTONIC_ISR=0 restores the symmetric priorities for an A/B on the bench
  * without touching this logic.
  */
+bool asrc_audio_path_isr_has_started( void )
+{
+    return ( s_audio_isr_started != 0u );
+}
+
 void asrc_audio_path_apply_isr_priorities( void )
 {
 #if APP_ASRC_RATE_MONOTONIC_ISR
@@ -1394,6 +1775,102 @@ void asrc_audio_path_dbg_print( void )
            (unsigned long)(ps_b / 10u), (unsigned long)(ps_b % 10u),
            (unsigned long)(lm_b / 10u), (unsigned long)(lm_b % 10u),
            (unsigned)APP_ASRC_LED_FRAME_STRIDE );
+#if APP_ASRC_LEG_PROFILE
+    /*
+     * Leg A as a PARTITION of ONE block -- the longest callback of the window that was just
+     * reported (see asrc_leg_a_parts_t).  The rows therefore ADD UP: cbA is that block's own
+     * duration and `rest` is what is left after the five measured parts, which is the callback
+     * prologue/epilogue, the TDM glue around it, and any preemption that block suffered.
+     *
+     * `pullBA` is on THIS line, not on leg B's, because at a mixed rate pair leg A is the one
+     * that pulls the B->A direction: ISR priority is rate-monotonic, so the 96 kHz leg carries
+     * the 96 kHz-side work of BOTH directions.  A leg-A budget built from the A->B filter chain
+     * alone therefore books the entire B->A resampler as "fixed overhead", which is what the
+     * earlier 45.34 us MAC accounting did.
+     *
+     * NOT a deadline figure: every row carries this instrument.  Take absolute numbers from an
+     * APP_ASRC_LEG_PROFILE=0 image and only the SPLIT from this one.
+     */
+    {
+        const asrc_leg_a_parts_t w = s_leg_a_witness;
+        s_leg_a_witness = (asrc_leg_a_parts_t){ 0 };
+        const uint32_t cb   = nora_high_res_timer_count_to_us_x10( w.cb );
+        const uint32_t pop  = nora_high_res_timer_count_to_us_x10( w.pop );
+        const uint32_t fe   = nora_high_res_timer_count_to_us_x10( w.fe );
+        const uint32_t pre  = nora_high_res_timer_count_to_us_x10( w.fe_pre );
+        const uint32_t r23  = nora_high_res_timer_count_to_us_x10( w.fe_r23 );
+        const uint32_t push = nora_high_res_timer_count_to_us_x10( w.push );
+        const uint32_t pull = nora_high_res_timer_count_to_us_x10( w.pull );
+        const uint32_t led  = nora_high_res_timer_count_to_us_x10( w.led );
+        const int32_t  rest = (int32_t)cb - (int32_t)( pop + fe + push + pull + led );
+        const int32_t  chk  = (int32_t)fe - (int32_t)( pre + r23 );
+        printf("[legA x%uch] cb=%lu.%luus pop=%lu.%luus fe=%lu.%luus (pre=%lu.%luus "
+               "r23=%lu.%luus chk=%s%ld.%ldus) push=%lu.%luus pullBA=%lu.%luus "
+               "led=%lu.%luus rest=%s%ld.%ldus\n",
+               (unsigned)ASRC_CH,
+               (unsigned long)(cb / 10u),   (unsigned long)(cb % 10u),
+               (unsigned long)(pop / 10u),  (unsigned long)(pop % 10u),
+               (unsigned long)(fe / 10u),   (unsigned long)(fe % 10u),
+               (unsigned long)(pre / 10u),  (unsigned long)(pre % 10u),
+               (unsigned long)(r23 / 10u),  (unsigned long)(r23 % 10u),
+               ( chk < 0 ) ? "-" : "",
+               (long)( ( ( chk < 0 ) ? -chk : chk ) / 10 ),
+               (long)( ( ( chk < 0 ) ? -chk : chk ) % 10 ),
+               (unsigned long)(push / 10u), (unsigned long)(push % 10u),
+               (unsigned long)(pull / 10u), (unsigned long)(pull % 10u),
+               (unsigned long)(led / 10u),  (unsigned long)(led % 10u),
+               ( rest < 0 ) ? "-" : "",
+               (long)( ( ( rest < 0 ) ? -rest : rest ) / 10 ),
+               (long)( ( ( rest < 0 ) ? -rest : rest ) % 10 ));
+    }
+
+    /*
+     * Leg B, the other half of the whole-CPU sum.  `wall` is what cbB above already reports
+     * (leg B start to finish, leg A included); `cpu` is that minus the leg-A time measured
+     * inside it, i.e. an UPPER bound on leg B exclusive CPU -- see s_leg_a_busy_acc.  `und`
+     * counts blocks where the subtraction would have underflowed and were therefore NOT
+     * folded into the peak; a non-zero count means cpu is missing blocks and cannot be read
+     * as a bound at all.
+     *
+     * Both are peak-held over the same telemetry window as the line above, so the closing
+     * arithmetic uses figures from one window: 3 x legA + cpuB against the 500 us that the
+     * 32 kHz block gives the whole TDM chain.
+     *
+     * The bracketed part rows are the PARTITION OF THAT SAME BLOCK -- the one that set the
+     * cpu peak -- so they add up the way leg A's do: cpu is the block's exclusive CPU and
+     * `rest` is what the three measured calls do not account for.  See asrc_leg_b_parts_t
+     * for why the pushBA / ledB wall rows on the ASRCpath line above cannot be used for
+     * this, and why only the bidirectional route is partitioned.  `und=a/b` counts the
+     * whole-callback subtraction underflows and the per-part ones separately; either being
+     * non-zero means the corresponding figures are missing blocks and are not bounds.
+     */
+    {
+        const asrc_leg_b_parts_t w = s_leg_b_witness;
+        const uint32_t b_und       = s_leg_b_cpu_under;
+        const uint32_t p_und       = s_leg_b_part_under;
+        s_leg_b_cpu_peak   = 0u;
+        s_leg_b_cpu_under  = 0u;
+        s_leg_b_part_under = 0u;
+        s_leg_b_witness    = (asrc_leg_b_parts_t){ 0 };
+        const uint32_t b_cpu = nora_high_res_timer_count_to_us_x10( w.cpu );
+        const uint32_t push  = nora_high_res_timer_count_to_us_x10( w.push );
+        const uint32_t pull  = nora_high_res_timer_count_to_us_x10( w.pull );
+        const uint32_t led   = nora_high_res_timer_count_to_us_x10( w.led );
+        const int32_t  rest  = (int32_t)b_cpu - (int32_t)( push + pull + led );
+        printf("[legB x%uch] wall=%lu.%luus cpu=%lu.%luus (pushBA=%lu.%luus pullAB=%lu.%luus "
+               "led=%lu.%luus rest=%s%ld.%ldus) und=%lu/%lu\n",
+               (unsigned)ASRC_CH,
+               (unsigned long)(cb_b / 10u),  (unsigned long)(cb_b % 10u),
+               (unsigned long)(b_cpu / 10u), (unsigned long)(b_cpu % 10u),
+               (unsigned long)(push / 10u),  (unsigned long)(push % 10u),
+               (unsigned long)(pull / 10u),  (unsigned long)(pull % 10u),
+               (unsigned long)(led / 10u),   (unsigned long)(led % 10u),
+               ( rest < 0 ) ? "-" : "",
+               (long)( ( ( rest < 0 ) ? -rest : rest ) / 10 ),
+               (long)( ( ( rest < 0 ) ? -rest : rest ) % 10 ),
+               (unsigned long)b_und, (unsigned long)p_und );
+    }
+#endif
 #endif
     // The front-end state used to be printed here as a pair of "ASRCpath <dir> front-end: ..."
     // lines. Since 2026-07-29 it is the trailing `fe=` field of the AB/BA lines in
@@ -1447,21 +1924,29 @@ static void pop_meas_observe( const int32_t* adc_block )
 
 void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* user )
 {
+    s_audio_isr_started = 1u;   /* see the declaration: makes boot-time selftests provable */
 #if APP_ASRC_HEADROOM_INSTRUMENT
     const uint32_t callback_started = nora_high_res_timer_get_count();
 #endif
     (void)user;
+#if APP_ASRC_LEG_PROFILE
+    s_leg_a_cur = (asrc_leg_a_parts_t){ 0 };
+    const uint32_t prof_pop = nora_high_res_timer_get_count();
+#endif
     pop_meas_observe( src );   // A's ADC (B HPOUT looped into A LINE-IN) -- declick pop metric
+#if APP_ASRC_LEG_PROFILE
+    leg_a_add( &s_leg_a_cur.pop, prof_pop );
+#endif
     // ASRC ROUTE select (A side). All routes here are pure ASRC -- no Classic/DRC kernel.
 #if APP_ASRC_48K_TO_8_INTEGRATION
     size_t produced = 0u;
     const int32_t* pushed = NULL;
     if( !s_path_decimator_ready && !s_path_frontend_dual_den_unsupported ) { asrc_audio_path_reset(); }
     if( s_path_decimator_ready &&
-        path_decimator_process( s_path_frontend_den_ab, s_path_frontend_second_den,
+        path_decimator_process_profiled( s_path_frontend_den_ab, s_path_frontend_second_den,
                                 src, &pushed, &produced ) )
     {
-        audio_app_asrc_push_ab_frames( pushed, produced, PATH_DECIMATED_STRIDE );
+        push_ab_frames_profiled( pushed, produced, PATH_DECIMATED_STRIDE );
     }
     for( uint32_t i = 0u; i < (uint32_t)APP_SLOTS_PER_FS * (uint32_t)APP_BLOCK_FRAMES; i++ ) { dst[i] = 0; }
 #elif APP_ASRC_RUNTIME_48K_TO_8
@@ -1489,18 +1974,50 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
         const int32_t* pushed = NULL;
         if( !s_path_decimator_ready && !s_path_frontend_dual_den_unsupported ) { asrc_audio_path_reset(); }
         if( s_path_decimator_ready &&
-            path_decimator_process( s_path_frontend_den_ab, s_path_frontend_second_den,
+            path_decimator_process_profiled( s_path_frontend_den_ab, s_path_frontend_second_den,
                                     a_src, &pushed, &produced ) )
         {
-            audio_app_asrc_push_ab_frames( pushed, produced, PATH_DECIMATED_STRIDE );
+#if APP_ASRC_FULL_IIR_48_TO_32
+            /* 96 -> 32 kHz in Full-IIR mode: the front end here is the /2 pre-stage ALONE, so
+             * its output is a 48 kHz stream and the stage belongs between it and the ring --
+             * the same position it occupies for the 48 kHz pair, just one stage downstream of
+             * where the block arrives.  Frame count is produced (half a block), not
+             * APP_BLOCK_FRAMES, which is the only reason the stage needed a second entry
+             * point at all. */
+            if( asrc_full_iir_48_to_32_armed() )
+            {
+                path_push_ab_full_iir_frames( pushed, (uint32_t)produced,
+                                              (uint32_t)PATH_DECIMATED_STRIDE );
+            }
+            else
+#endif
+            {
+                push_ab_frames_profiled( pushed, produced, PATH_DECIMATED_STRIDE );
+            }
         }
     }
+#if APP_ASRC_FULL_IIR_48_TO_32
+    /* TRIAL Full-IIR: den_ab is 1 for this pair (the stage does not resample), so it lands in
+     * the direct arm and replaces the plain push with filter-then-push.  Every input frame goes
+     * through the IIR exactly once, in order, because this is the same one-block-per-callback
+     * seam the plain push occupies. */
+    else if( asrc_full_iir_48_to_32_armed() )
+    {
+        path_push_ab_full_iir( a_src );
+    }
+#endif
     else
     {
         path_push_ab( a_src );
     }
 #if APP_B_ROUTE_USES_BA
+#if APP_ASRC_LEG_PROFILE
+    const uint32_t prof_pull = nora_high_res_timer_get_count();
+#endif
     audio_app_asrc_pull_ba( dst );
+#if APP_ASRC_LEG_PROFILE
+    leg_a_add( &s_leg_a_cur.pull, prof_pull );
+#endif
 #if APP_ASRC_MEAS && (APP_MEAS_DIR == MEAS_DIR_BA)
     /* MEASUREMENT B->A: capture the UPsampled output here.  Same shadowing problem as the
      * injection above -- this branch precedes the dedicated MEAS_DIR_BA arm further down the
@@ -1508,7 +2025,13 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
      * script times out waiting for *MEAS_END. */
     audio_app_meas_capture( dst );
 #endif
+#if APP_ASRC_LEG_PROFILE
+    const uint32_t prof_led = nora_high_res_timer_get_count();
+#endif
     path_meter_submit( dst, 0u );
+#if APP_ASRC_LEG_PROFILE
+    leg_a_add( &s_leg_a_cur.led, prof_led );
+#endif
 #else
     // One-way A->B (the 96 kHz preset): there is no B->A engine to pull from, so leg A's output is
     // silence -- same as the fixed integration preset above.  Before the 96 kHz rows existed, every
@@ -1553,13 +2076,32 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
 #else
     #error "asrc_audio_path_leg_a_callback: unsupported ASRC route (APP_B_ROUTE)."
 #endif
+#if APP_ASRC_LEG_PROFILE
+    /* Read the running peak BEFORE it is updated below.  Comparing against the updated one would
+     * always succeed -- this block's own duration is measured a few ticks later than the value
+     * that went in -- and the witness would then be the LAST block rather than the longest. */
+    const uint32_t prof_peak_before = s_path_profile.callback_a_ticks;
+#endif
 #if APP_ASRC_HEADROOM_INSTRUMENT
     profile_peak_ticks( &s_path_profile.callback_a_ticks, callback_started );
+#endif
+#if APP_ASRC_LEG_PROFILE
+    /* Keep the parts of the LONGEST callback of this telemetry window, so the printed rows are
+     * one block rather than a mixture.  `cb` is taken here, after the peak update, so it runs a
+     * few ticks longer than the cbA the ASRCpath line prints -- the same block, measured to a
+     * slightly later point.  The two lines therefore agree to within that, not exactly. */
+    s_leg_a_cur.cb = nora_high_res_timer_get_count() - callback_started;
+    if( s_leg_a_cur.cb >= prof_peak_before ) { s_leg_a_witness = s_leg_a_cur; }
+    /* The same span, accumulated for leg B to subtract.  It reuses the value just measured
+     * rather than reading the timer again, so the leg-B witness costs leg A nothing at all
+     * -- which matters because leg A is the leg with the deadline. */
+    s_leg_a_busy_acc += s_leg_a_cur.cb;
 #endif
 }
 
 void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* user )
 {
+    s_audio_isr_started = 1u;   /* see the declaration: makes boot-time selftests provable */
     (void)user;
     if( ( src == NULL ) || ( dst == NULL ) )
     {
@@ -1567,6 +2109,14 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
     }
 #if APP_ASRC_HEADROOM_INSTRUMENT
     const uint32_t callback_started = nora_high_res_timer_get_count();
+#endif
+#if APP_ASRC_LEG_PROFILE
+    /* A second start timestamp, paired with the leg-A accumulator (see leg_b_sample_pair).
+     * It is not callback_started above: that one is read alone, so it cannot be paired with
+     * anything, and it stays exactly as it was so that cbB keeps meaning what it meant. */
+    uint32_t leg_a_busy_at_entry = 0u;
+    const uint32_t leg_b_started = leg_b_sample_pair( &leg_a_busy_at_entry );
+    s_leg_b_cur = (asrc_leg_b_parts_t){ 0 };
 #endif
     // ASRC ROUTE select (B side).
 #if APP_ASRC_48K_TO_8_INTEGRATION
@@ -1620,6 +2170,9 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
     path_push_ba( src );
     for( uint32_t i = 0u; i < (uint32_t)APP_SLOTS_PER_FS * (uint32_t)APP_BLOCK_FRAMES; i++ ) { dst[i] = 0; }
 #elif APP_B_ROUTE == B_ROUTE_ASRC_BIDIR
+#if APP_ASRC_LEG_PROFILE
+    const asrc_leg_b_mark_t m_push0 = leg_b_mark();
+#endif
 #if APP_ASRC_RUNTIME_48K_TO_8
     // Mirror of the leg-A branch above: when leg B is the 48 kHz side and leg A runs low, the
     // B->A direction is the down-sampling one and needs the same anti-alias front end.  Only
@@ -1641,8 +2194,24 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
     {
         path_push_ba( src );
     }
+#if APP_ASRC_LEG_PROFILE
+    /* Boundaries, not durations: each mark pairs the timer with leg A's accumulator so the span
+     * between two marks can have leg A's share taken out of it (see leg_b_part_add).  m_push0 is
+     * taken at the top of the arm so the front-end branch above, whichever way it went, is inside
+     * the `push` part rather than in `rest`. */
+    const asrc_leg_b_mark_t m_pull0 = leg_b_mark();
+    leg_b_part_add( &s_leg_b_cur.push, m_push0, m_pull0 );
+#endif
     audio_app_asrc_pull_ab( dst );
+#if APP_ASRC_LEG_PROFILE
+    const asrc_leg_b_mark_t m_led0 = leg_b_mark();
+    leg_b_part_add( &s_leg_b_cur.pull, m_pull0, m_led0 );
+#endif
     path_meter_submit( dst, 1u );
+#if APP_ASRC_LEG_PROFILE
+    const asrc_leg_b_mark_t m_led1 = leg_b_mark();
+    leg_b_part_add( &s_leg_b_cur.led, m_led0, m_led1 );
+#endif
 #elif APP_B_ROUTE == B_ROUTE_ASRC_LIGHT
     path_push_ba( src );
     audio_app_asrc_pull_ab( dst );
@@ -1652,5 +2221,26 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
 #endif
 #if APP_ASRC_HEADROOM_INSTRUMENT
     profile_peak_ticks( &s_path_profile.callback_b_ticks, callback_started );
+#endif
+#if APP_ASRC_LEG_PROFILE
+    {
+        uint32_t leg_a_busy_at_exit = 0u;
+        const uint32_t wall  = leg_b_sample_pair( &leg_a_busy_at_exit ) - leg_b_started;
+        const uint32_t steal = leg_a_busy_at_exit - leg_a_busy_at_entry;
+        if( wall >= steal )
+        {
+            const uint32_t cpu = wall - steal;
+            if( cpu > s_leg_b_cpu_peak )
+            {
+                s_leg_b_cpu_peak  = cpu;
+                s_leg_b_cur.cpu   = cpu;
+                s_leg_b_witness   = s_leg_b_cur;   /* the parts OF THIS block, so the rows add up */
+            }
+        }
+        else
+        {
+            ++s_leg_b_cpu_under;
+        }
+    }
 #endif
 }

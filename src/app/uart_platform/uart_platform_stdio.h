@@ -54,6 +54,30 @@ bool uart_platform_stdio_tx_muted(void);
  */
 void uart_platform_stdio_tx_drain(void);
 
+/*
+ * Blocking-write yield hook: let ONE subsystem with a foreground deadline keep running
+ * while a long console print blocks.
+ *
+ * write() blocks byte by byte on UART1 (43.4 us each at 230400) and additionally blocks on
+ * the UART2 mirror, so a printf is one uninterruptible foreground operation. Under heavy ISR
+ * load the foreground only runs in the gaps between ISRs, which stretches the wall time far
+ * past the baud-rate figure: a ~590-character telemetry report measured 105 ms on target at
+ * 94 % ISR load, against 31 ms for the same report at 84 %. Anything the foreground was
+ * supposed to service at a fixed rate is stopped for that whole span.
+ *
+ * The measured casualty is the ASRC CCP period queue -- a 256-slot single-producer ring fed
+ * at fs/16 = 3 kHz, i.e. 85.3 ms of storage, overrun by that 105 ms report. See the note over
+ * asrc_clock_control_drain_yield().
+ *
+ * The hook is called once per output chunk (at most UART_PLATFORM_STDIO_YIELD_CHUNK bytes),
+ * which bounds the stall to a fraction of a line instead of a whole report, whatever the
+ * caller prints. Contract for the registered function: short, no printf (it would re-enter
+ * write()), and safe to call from an ISR-context printf. Pass 0 to unregister.
+ */
+typedef void (*uart_platform_stdio_yield_fn)(void);
+
+void uart_platform_stdio_set_yield_hook(uart_platform_stdio_yield_fn fn);
+
 #ifdef __cplusplus
 }
 #endif
