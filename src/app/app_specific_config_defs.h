@@ -50,6 +50,14 @@
  * large to manage -- the split was removed because the include-order / dependency /
  * partial-state reasoning cost outweighed its benefit at this size. The three logical
  * layers are preserved here as clearly-marked sections instead of separate files.
+ *
+ * WHERE DOES A NEW GUARD LINE GO? One table answers that for every file in the
+ * configuration chain, and a checked-in gate enforces the two mechanically decidable
+ * halves of it -- see [internal] config_gate_convention.md. Three defects came from
+ * getting the placement wrong: a guard placed before the value it tests had settled
+ * (so it never fired), a default placed at global scope when it was preset-scoped,
+ * and a declaration guarded narrower than its users (so exactly one configuration
+ * failed to compile). None of the three announced itself.
  * ============================================================ */
 
 

@@ -338,8 +338,8 @@
    * this build no longer has.
    *
    * The value is not load-bearing on this ring, which is why one rate pair's worth of evidence
-   * is enough to write it down: tools_local/predict_gate_ak128.py sweeps the gate over 6, 7 and
-   * 8 and all three accept the same 67 of 81 pairs.  The clamp at ASRC_FILL_TARGET_MAX = 44
+   * is enough to write it down: an offline gate-prediction sweep (maintainer-side, not part of
+   * this repository) sweeps the gate over 6, 7 and 8 and all three accept the same 67 of 81 pairs.  The clamp at ASRC_FILL_TARGET_MAX = 44
    * leaves no pair with a slack between 3 and 8, so the only pairs the constant newly refuses
    * are 44.1 <-> 12 kHz (R=41, set=44, slack=3) at any of the three values.  Whether those two
    * run clean today is the one thing an AK128 hardware sweep still has to answer.

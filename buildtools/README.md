@@ -21,8 +21,9 @@ follows that selection. **No environment variables are involved.**
 
 > **Note.** The flash/reset executables drive an installed MPLAB X (its bundled
 > `mdb` / `ipecmdboost` and Java). MPLAB X must be present; a separate .NET
-> runtime is not needed. If you would rather not use them, program via MPLAB X
-> or MPLAB IPE and the on-board PKOB4 instead.
+> runtime is not needed. If you would rather not use them, program the two
+> projects from MPLAB X over the on-board PKOB4 instead — see the README's
+> ["IDE-only path"](../README.md#ide-only-path-first-boot--learning).
 
 ## Support scope: command line vs MPLAB X
 

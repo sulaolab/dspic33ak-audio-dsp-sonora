@@ -34,7 +34,16 @@ CLAUDE.md export-ignore
 buildtools/check_separation.ps1 export-ignore
 buildtools/check_publication.ps1 export-ignore
 buildtools/check_publication_archive.ps1 export-ignore
+buildtools/check_publication_all.ps1 export-ignore
+buildtools/check_publication_selftest.ps1 export-ignore
+buildtools/publication_gate_common.ps1 export-ignore
+buildtools/publication_gate_exceptions.psd1 export-ignore
 buildtools/make_single_app_tree.ps1 export-ignore
+# The configuration guard gate and its self-test. Dev-tree material for the same
+# reason as the gates above: it cites internal reports, and nothing the published
+# build runs depends on it.
+buildtools/check_config_gate.py export-ignore
+buildtools/check_config_gate_selftest.py export-ignore
 tools/nora_hal_sync/ export-ignore
 # Runs that tool and describes the private publish pipeline, so it goes with it.
 .github/ export-ignore

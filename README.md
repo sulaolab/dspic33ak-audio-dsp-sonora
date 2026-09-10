@@ -89,11 +89,38 @@ Three facts worth knowing before you debug silence:
     mikroBUS I2C buses on the same wire. With them removed, MikroBUS-A and
     MikroBUS-B are independent I2C buses, which is what every dual-codec
     profile assumes.
+
+    This is board rework, and the platform's own documentation covers both
+    states: *Using the I2C bus*, section 2.2 and Figure 2-1 "I2C Bus Connect",
+    in the Curiosity Platform Development Board User's Guide (DS70005562).
+    R38 and R39 are 0 Ohm 0603 links; R38 ties `P6_mkB_B_XPRO1_SCL` to
+    `P67_mkB_A_USB_SCL` and R39 ties `P4_mkB_B_XPRO1_SDA` to
+    `P65_mkB_A_USB_SDA`, which is how to confirm you have the right two parts
+    before touching them. Removing them also separates P6 from P67 and P4 from
+    P65 as DIM pins, and regroups the platform's I2C features into two buses:
+    MikroBUS-A with the I2C-to-USB bridge on one, MikroBUS-B with XPRO1 on the
+    other. This project uses neither XPRO1 nor the I2C-to-USB bridge, so that
+    regrouping costs it nothing.
+
+    With a single WM8904 there is no codec-address collision, so R38/R39 do
+    not need to be removed for address separation.
+
+    <img src="images/curiosity_platform_r38_r39.png" alt="Curiosity Platform layout, zoomed between the MikroBUS-A and MikroBUS-B headers: the 0 Ohm links R38 and R39 sit in the right-hand column, the 2 kOhm parts R34 and R35 in the left-hand column" width="520">
+
+    **The two to remove are R38 and R39 — the right-hand column above**, next to
+    the MikroBUS-B header, opposite the A header's `P67/SCL` and `P65/SDA` pins.
+    The pair immediately to their left, **R34 and R35, are 2 kOhm and are not
+    part of the bridge — leave them fitted.** The board's silkscreen names all
+    four.
   - Or run with a single WM8904 board — `Classic` profiles only (ASRC needs
     both codecs and cannot run single-codec) — by overriding
     `APP_REQ_MIKROB_WM8904` to `0` in `src/app/app_specific_config_defs.h`
     (or via an MPLAB preprocessor define) before building. This is a source
-    override, not a `switch_config.ps1` choice.
+    override, not a `switch_config.ps1` choice. **Put that one board in
+    MikroBUS-A** — the override is what drops the second codec on MikroBUS-B /
+    SPI2, so MikroBUS-A is the leg that remains — and set its jumper to the
+    *Jumper A* column of [the profile table](#the-profiles-you-are-likely-to-want)
+    (XTAL for `Classic 1`).
 
 ## Prerequisites
 
@@ -106,7 +133,7 @@ Three facts worth knowing before you debug silence:
 | Python | 3.11+ — required by `build.ps1` to produce the delivery artifacts (`SERIAL_UPDATE_PACKAGE` / `FACTORY_IMAGE`), and used by the host-side analysis tools under `tools/` |
 
 Flashing and resetting the board uses the on-board PKOB4. You can do it by
-hand from MPLAB X / MPLAB IPE, or from the command line with the flash/reset
+hand from MPLAB X, or from the command line with the flash/reset
 helper shipped in `buildtools/_flash_reset_tools/` — three self-contained
 executables that need no .NET runtime, but do drive an installed MPLAB X. See
 [`buildtools/README.md`](buildtools/README.md).
@@ -137,9 +164,13 @@ Two notes on the toolchain that save time later:
 ```
 
 **3. Program the board.** Program `resident_bootloader.X`, then
-`dspic33ak_audio_dsp.X`, via MPLAB X or MPLAB IPE and the on-board PKOB4 — in
-that order (their linker scripts place them in disjoint flash regions on
-purpose). See ["IDE-only path"](#ide-only-path-first-boot--learning) below for
+`dspic33ak_audio_dsp.X`, from MPLAB X over the on-board PKOB4 — in that order.
+**Both halves are required.** They occupy disjoint flash regions on purpose,
+and that separation is what lets a resident bootloader and an application
+coexist; this order is the one verified on hardware. Program only the
+application and the board still boots and plays audio, but there is no serial
+downloader in Flash.
+See ["IDE-only path"](#ide-only-path-first-boot--learning) below for
 the click-through version, or run `.\buildtools\flashauto.ps1` to do the same
 two-image program-and-reset from the command line.
 
@@ -159,13 +190,31 @@ For a first hands-on boot without touching a script, MPLAB X alone can build
 and flash both halves of a serial-update image:
 
 1. Open `resident_bootloader.X` and `dspic33ak_audio_dsp.X` in MPLAB X.
-2. Select the `dsPIC33AK512_CLASSIC_SERIAL_UPDATE` (or `..._ASRC_...`)
-   configuration on the application project, Clean and Build both projects.
+2. Select a configuration **on both projects, and make the two agree on the
+   device**: `dsPIC33AK512_RESIDENT_BOOT` on `resident_bootloader.X`, and
+   `dsPIC33AK512_CLASSIC_SERIAL_UPDATE` (or `..._ASRC_...`) on the application
+   project — or, on the AK128, `dsPIC33AK128_RESIDENT_BOOT` with
+   `dsPIC33AK128_SERIAL_UPDATE`. Nothing cross-checks
+   the two projects, so an AK512 application paired with an AK128 boot image is
+   a silent mistake. Clean and Build both projects.
 3. Program `resident_bootloader.X`, then `dspic33ak_audio_dsp.X`, via
    PKOB4 — in that order. Their linker scripts place them in disjoint flash
    regions on purpose (that separation is what makes the resident-bootloader
    design work at all); verified working end to end on AK512/Classic.
 4. Reset the board.
+
+**If you skip the boot image** and program only the application, what you get
+depends on the configuration:
+
+- **A Classic configuration** boots and plays audio, but there is no serial
+  downloader in Flash: the banner reports
+  `Delivery: application ONLY -- resident bootloader ABSENT` and `*fu5A`
+  refuses rather than waiting for a download (observed 2026-09-02). That is the
+  symptom of a skipped step, not a fault.
+- **`dsPIC33AK512_ASRC_SERIAL_UPDATE` does not come up at all.** It places the
+  reset vector inside the first 32 KiB that belongs to the boot image, so its
+  application HEX on its own leaves nothing at the reset target — and the
+  programming operation still reports success.
 
 This is enough to see the board boot and talk on the console. It is **not**
 how to produce anything you would ship, though: `resident_bootloader.X` is a
