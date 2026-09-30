@@ -266,7 +266,7 @@ belongs to, and unrelated to per-device availability (below).
 
 | App | Variation | Contents |
 | --- | --- | --- |
-| Classic | `APP_BUILD_STD_DEMO_1` | co-clocked dual codec; WM8904-A drives BCLK/FS, B is slave (the Classic default) |
+| Classic | `APP_BUILD_STD_DEMO_1` | single codec on MikroBUS-A; WM8904-A drives BCLK/FS (the Classic default) |
 | Classic | `APP_BUILD_STD_DEMO_2` | co-clocked dual codec; the dsPIC drives BCLK/FS |
 | Classic | `APP_BUILD_DRC_DEMO` | co-clocked dual codec; DF2T DRC cascade |
 | Classic | `APP_BUILD_DEMO_96K` | non-USB 96 kHz; co-clocked dual codec |
@@ -348,7 +348,7 @@ dsPIC33AK512MPS512 has a configuration for.
 Application profile:
 
    1) Classic 1
-      co-clocked dual codec; WM8904-A drives BCLK/FS
+      single codec on MikroBUS-A; WM8904-A drives BCLK/FS
    ...
    5) ASRC Codec BI
       ASRC production M30 ...; bidirectional A<->B

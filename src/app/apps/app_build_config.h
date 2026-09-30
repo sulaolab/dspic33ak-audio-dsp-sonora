@@ -163,7 +163,7 @@
 /* Exact preset identity for self-identifying boot logs. */
 #if (APP_BUILD == APP_BUILD_STD_DEMO_1)
   #define APP_BUILD_NAME    "APP_BUILD_STD_DEMO_1"
-  #define APP_BUILD_DETAIL  "co-clocked dual codec; WM8904-A drives BCLK/FS, B slave"
+  #define APP_BUILD_DETAIL  "single codec; WM8904-A drives BCLK/FS (Classic default)"
 #elif (APP_BUILD == APP_BUILD_STD_DEMO_2)
   #define APP_BUILD_NAME    "APP_BUILD_STD_DEMO_2"
   #define APP_BUILD_DETAIL  "co-clocked dual codec; dsPIC drives BCLK/FS"

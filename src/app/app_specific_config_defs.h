@@ -303,13 +303,26 @@
 #define APP_USE_FS_50PCT          (1)   // 1 = 50%-duty FS ; 0 = short pulse
 
 
-// --- TOPOLOGY: dual-codec on MikroBUS-B / SPI2 ---
-//   AK512, plus the explicitly selected AK128 Curiosity J3 U-jumper ASRC build
-//   (feeds APP_USE_SPI2_AUDIO; resolved_transport_config.h translates it).
+// --- TOPOLOGY: optional second codec on MikroBUS-B / SPI2 ---
+//   Classic 1 is the one-codec default: keep its WM8904 on MikroBUS-A.  Every
+//   other preset remains a two-codec build, including all ASRC presets and the
+//   Classic 2/DRC/USB/96 kHz variants.  The latter must not silently degrade to
+//   one codec: their compile-time guard below rejects that request.
+//   AK512, plus the explicitly selected AK128 Curiosity J3 U-jumper ASRC build,
+//   can expose the second codec path (feeds APP_USE_SPI2_AUDIO; the resolved
+//   transport configuration translates it).
 //   NOTE: remove bridge resistors between MikroA/B for independent I2C buses.
 //   NOTE: 96kHz requires both codecs (WM8904-A=ADC, WM8904-B=DAC; HW limit). See validation below.
 #ifndef APP_REQ_MIKROB_WM8904
-#define APP_REQ_MIKROB_WM8904     (1)   // 1 = second WM8904 on MikroBUS-B / SPI2
+  #if (APP_BUILD == APP_BUILD_STD_DEMO_1)
+    #define APP_REQ_MIKROB_WM8904 (0)   // Classic 1 default: WM8904-A only
+  #else
+    #define APP_REQ_MIKROB_WM8904 (1)   // all other presets: second WM8904 on MikroBUS-B / SPI2
+  #endif
+#endif
+
+#if (APP_BUILD != APP_BUILD_STD_DEMO_1) && !APP_REQ_MIKROB_WM8904
+  #error "This APP_BUILD requires WM8904-B on MikroBUS-B / SPI2. APP_BUILD_STD_DEMO_1 is the only single-codec preset."
 #endif
 // Physical SPI bank used by the existing logical codec-A/B TDM pair.
 // SPI34_TEST reroutes the SAME MikroBUS A/B WM8904 pins from SPI1/2 to SPI3/4,

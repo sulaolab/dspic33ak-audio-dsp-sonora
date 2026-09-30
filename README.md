@@ -21,9 +21,9 @@ cannot drift — the source it builds is hand-written like everything else.)
 > and describes how it attaches to the Curiosity Platform.
 
 **New here? Read [Quick start](#quick-start) and build `Classic 1`.** That is
-the profile the project treats as its reference: two codecs, one clock domain,
-a DSP chain you can hear and switch on and off from the console. Everything
-else in this README is optional depth.
+the project reference and the one-codec Classic default: one WM8904 on
+MikroBUS-A, one clock domain, and a DSP chain you can hear and switch on and off
+from the console. Everything else in this README is optional depth.
 
 ## What is in the box
 
@@ -77,8 +77,9 @@ Three facts worth knowing before you debug silence:
 - The first run after a fresh flash starts from a cold codec. Codec register
   state is only fully known after the initialization sequence completes; judge
   audio quality from the second run onwards.
-- **Every dual-codec build (`Classic *`, `ASRC *`) expects both WM8904 boards
-  physically present, on independent I2C buses.** There is no runtime
+- **Every dual-codec profile (`Classic 2`, `Classic DRC`, `Classic USB`,
+  `Classic 96k`, and `ASRC *`) expects both WM8904 boards physically present,
+  on independent I2C buses.** There is no runtime
   detection of a missing or bridged second codec — a build that declares two
   codecs and gets an unanswering WM8904-B fails its codec-apply step, prints
   what to check, and stops (it does not retry forever). Two supported hardware
@@ -112,15 +113,12 @@ Three facts worth knowing before you debug silence:
     The pair immediately to their left, **R34 and R35, are 2 kOhm and are not
     part of the bridge — leave them fitted.** The board's silkscreen names all
     four.
-  - Or run with a single WM8904 board — `Classic` profiles only (ASRC needs
-    both codecs and cannot run single-codec) — by overriding
-    `APP_REQ_MIKROB_WM8904` to `0` in `src/app/app_specific_config_defs.h`
-    (or via an MPLAB preprocessor define) before building. This is a source
-    override, not a `switch_config.ps1` choice. **Put that one board in
-    MikroBUS-A** — the override is what drops the second codec on MikroBUS-B /
-    SPI2, so MikroBUS-A is the leg that remains — and set its jumper to the
-    *Jumper A* column of [the profile table](#the-profiles-you-are-likely-to-want)
-    (XTAL for `Classic 1`).
+  - `Classic 1` is the single-WM8904 default. **Put that board in
+    MikroBUS-A** and set its jumper to the *Jumper A* column of
+    [the profile table](#the-profiles-you-are-likely-to-want) (XTAL for
+    `Classic 1`). Its default `APP_REQ_MIKROB_WM8904=0` drops MikroBUS-B / SPI2.
+    All other Classic presets and every ASRC preset require two boards; a
+    `APP_REQ_MIKROB_WM8904=0` override for one of them is a compile-time error.
 
 ## Prerequisites
 
@@ -260,7 +258,7 @@ mismatched jumper is a silent-audio fault, not a build or console error.
 
 | Profile | Jumper A | Jumper B | What it is |
 | --- | --- | --- | --- |
-| `Classic 1` | XTAL | BCLK | **Start here.** Co-clocked dual codec; WM8904-A drives BCLK/FS, B follows. |
+| `Classic 1` | XTAL | — (not fitted) | **Start here.** Single codec on MikroBUS-A; WM8904-A drives BCLK/FS. |
 | `Classic 2` | BCLK | BCLK | The same chain with the dsPIC driving BCLK/FS instead — neither codec is its own master. |
 | `Classic DRC` | XTAL | BCLK | Co-clocked dual codec with a DF2T DRC cascade. |
 | `Classic 96k` | XTAL | BCLK | Non-USB 96 kHz, co-clocked dual codec. |
