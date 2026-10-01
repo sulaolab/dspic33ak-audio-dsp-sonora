@@ -149,15 +149,16 @@ Two notes on the toolchain that save time later:
 ## Quick start
 
 ```powershell
-# 1. Choose what to build. Run with no arguments for an interactive menu.
+# 1. A fresh clone builds AK512 / Classic 1 by default.
+.\buildtools\build.ps1              # -Full for a clean rebuild
+
+# To choose a different profile, run the interactive menu with no arguments...
 .\buildtools\switch_config.ps1
 
-# ...or script the same three choices directly:
+# ...or script the same three choices directly, then build it:
 .\buildtools\switch_config.ps1 -SerialUpdateSupport Yes `
                                -Device dsPIC33AK512MPS512 `
                                -Profile 'Classic 1'
-
-# 2. Build the active selection.
 .\buildtools\build.ps1              # -Full for a clean rebuild
 ```
 

@@ -1210,7 +1210,16 @@ $selection = Get-SonoraSelection -RepoRoot $repoRoot -Configurations $configurat
 $serialUpdateSupport = $selection.SerialUpdateSupport
 
 if ([string]::IsNullOrWhiteSpace($Configuration)) {
-    $Configuration = Get-SonoraActiveConfiguration -RepoRoot $repoRoot -ProjectDir $projectDir -Configurations $configurations
+    # Match flashauto.ps1: the three selection values are authoritative and the
+    # MPLAB configuration is derived from the selected device and profile.
+    # In particular, a fresh clone must not fall back to configurations.xml's
+    # first entry when that entry belongs to a different application.
+    $selectionProfile = Get-SonoraPreset -Catalog $presetCatalog -Name $selection.Profile
+    $Configuration = (Resolve-SonoraConfiguration `
+        -Configurations $configurations `
+        -Device $selection.Device `
+        -App $selectionProfile.App `
+        -SerialUpdate $selection.SerialUpdateSupport).Name
 } else {
     # An explicit configuration IS a delivery mode: each configuration either
     # carries the serial-update layout or does not. So the named one decides, not

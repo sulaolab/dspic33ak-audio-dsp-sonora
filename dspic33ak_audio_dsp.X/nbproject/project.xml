@@ -13,11 +13,11 @@
             </sourceRootList>
             <confList>
                 <confElem>
-                    <name>dsPIC33AK512_ASRC_SERIAL_UPDATE</name>
+                    <name>dsPIC33AK512_CLASSIC_SERIAL_UPDATE</name>
                     <type>2</type>
                 </confElem>
                 <confElem>
-                    <name>dsPIC33AK512_CLASSIC_SERIAL_UPDATE</name>
+                    <name>dsPIC33AK512_ASRC_SERIAL_UPDATE</name>
                     <type>2</type>
                 </confElem>
                 <confElem>

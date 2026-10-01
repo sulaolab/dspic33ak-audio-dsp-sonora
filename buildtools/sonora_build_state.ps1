@@ -828,8 +828,8 @@ function Get-SonoraSelection {
 
       Missing or unusable values fall back to a working default rather than
       failing, so a fresh clone can build without running switch_config first:
-      serial update off (an existing user's board keeps behaving as before), the
-      project's first device, and that application's compile-time default profile.
+      AK512 with the Classic 1 profile. Delivery mode is then derived from the
+      configurations available for that device.
 
       Also migrates the older shape, which stored an MPLAB configuration plus a
       per-configuration preset map. The configuration only contributes its device
@@ -843,6 +843,11 @@ function Get-SonoraSelection {
 
     $state = Get-SonoraLocalState -RepoRoot $RepoRoot
     $devices = Get-SonoraDevices -Configurations $Configurations
+    # The fresh-clone default is intentionally explicit instead of depending on
+    # configurations.xml ordering: its first AK512 application is ASRC, while
+    # the supported first-build path is the single-codec Classic 1 profile.
+    $freshCloneDevice = 'dsPIC33AK512MPS512'
+    $freshCloneProfile = 'APP_BUILD_STD_DEMO_1'
 
     # --- device ---
     $device = $null
@@ -853,7 +858,15 @@ function Get-SonoraSelection {
         $old = @($Configurations | Where-Object { $_.Name -eq $state.Configuration })
         if ($old.Count -eq 1) { $device = $old[0].Device }
     }
-    if ($null -eq $device) { $device = $devices[0] }
+    if ($null -eq $device) {
+        $device = if ($devices -contains $freshCloneDevice) {
+            $freshCloneDevice
+        } else {
+            # Keep an edited or reduced catalog buildable rather than making
+            # the fresh-clone default a hard dependency.
+            $devices[0]
+        }
+    }
 
     # --- profile ---
     $profileName = $null
@@ -872,10 +885,16 @@ function Get-SonoraSelection {
         }
     }
     if ($null -eq $profileName) {
-        # This device's first application, at its compile-time default profile.
-        $app = @($Configurations |
-            Where-Object { $_.Device -eq $device })[0].App
-        $profileName = Get-SonoraDefaultPreset -Catalog $Catalog -App $app
+        $freshCloneEntry = Get-SonoraPreset -Catalog $Catalog -Name $freshCloneProfile
+        if ($device -eq $freshCloneDevice -and $null -ne $freshCloneEntry -and
+            (Test-SonoraProfileAvailable -Configurations $Configurations -Device $device -ProfileEntry $freshCloneEntry)) {
+            $profileName = $freshCloneEntry.Name
+        } else {
+            # This device's first application, at its compile-time default profile.
+            $app = @($Configurations |
+                Where-Object { $_.Device -eq $device })[0].App
+            $profileName = Get-SonoraDefaultPreset -Catalog $Catalog -App $app
+        }
     }
 
     # --- serial update support ---

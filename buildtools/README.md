@@ -124,8 +124,8 @@ to make. **The MPLAB configuration is not one of them.**
 
 | # | Choice | Values | Default |
 | --- | --- | --- | --- |
-| 1 | **Target device** | `dsPIC33AK512MPS512` / `dsPIC33AK128MC106` | the project's first device |
-| 2 | **Application profile** | `Classic 1`, `ASRC Codec BI`, … (display names) | that application's compile-time default |
+| 1 | **Target device** | `dsPIC33AK512MPS512` / `dsPIC33AK128MC106` | `dsPIC33AK512MPS512` (fresh clone) |
+| 2 | **Application profile** | `Classic 1`, `ASRC Codec BI`, … (display names) | `Classic 1` on a fresh clone; otherwise the selected application's compile-time default |
 | — | ( **Delivery mode** ) | `No` (standalone, flashed directly over PKOB4) / `Yes` (RESIDENT_BOOTLOADER + serial update) | **asked only if the selected device has configurations for both** |
 
 **Delivery mode used to be question 1.** It stopped being a question on

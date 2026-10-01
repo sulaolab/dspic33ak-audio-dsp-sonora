@@ -373,7 +373,7 @@
   </sourceRootList>
   <projectmakefile>Makefile</projectmakefile>
   <confs>
-    <conf name="dsPIC33AK512_ASRC_SERIAL_UPDATE" type="2">
+    <conf name="dsPIC33AK512_CLASSIC_SERIAL_UPDATE" type="2">
       <toolsSet>
         <developmentServer>localhost</developmentServer>
         <targetDevice>dsPIC33AK512MPS512</targetDevice>
@@ -414,8 +414,192 @@
         <makeCustomizationEnableLongLines>false</makeCustomizationEnableLongLines>
         <makeCustomizationNormalizeHexFile>false</makeCustomizationNormalizeHexFile>
       </makeCustomizationType>
+      <item path="../src/app/apps/asrc/asrc_app.c" ex="true" overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_audio_path.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_clock_control.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_console.c" ex="true" overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_decimator_48_to_8.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_fir_kernel_bench.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/asrc_full_iir_48_to_32.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/audio_app_asrc.c" ex="true" overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/audio_app_asrc_poly_l128_flash.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
       <item path="../src/app/apps/asrc/audio_app_asrc_poly_l128m30_flash.c"
-            ex="false"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/audio_app_asrc_poly_l64m30_flash.c"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/audio_app_meas.c" ex="true" overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/apps/asrc/audio_app_meas_tones.c"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -431,7 +615,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_audio_path.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -447,7 +631,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_audio_pwm.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -463,7 +647,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_console.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -479,7 +663,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_controls.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -495,7 +679,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_demo_app.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -527,7 +711,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/snd_effect_play.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -543,6 +727,86 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/tone_data_int16.c"
+            ex="false"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/dspic33-cmsis-dsp/Source/BasicMathFunctions/mchp_asrc_push_block16_f32.s"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_q31_dspic33ak.s"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_q31_ymod_dspic33ak.s"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_q31_ymod_yonly_dspic33ak.s"
+            ex="true"
+            overriding="false">
+        <C30>
+        </C30>
+        <C30-AR>
+        </C30-AR>
+        <C30-AS>
+        </C30-AS>
+        <C30-CO>
+        </C30-CO>
+        <C30-LD>
+        </C30-LD>
+        <C30Global>
+        </C30Global>
+      </item>
+      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_wide8_f32_dspic33ak.s"
             ex="true"
             overriding="false">
         <C30>
@@ -612,7 +876,7 @@
         <property key="post-instruction-scheduling" value="default"/>
         <property key="pre-instruction-scheduling" value="default"/>
         <property key="preprocessor-macros"
-                  value="SONORA_MPLAB_APP_ASRC=1;SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
+                  value="SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
         <property key="scalar-model" value="default"/>
         <property key="use-cci" value="false"/>
         <property key="use-iar" value="false"/>
@@ -638,7 +902,7 @@
         <property key="omit-debug-dirs" value="false"/>
         <property key="omit-forms" value="false"/>
         <property key="preprocessor-macros"
-                  value="SONORA_MPLAB_APP_ASRC=1;SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
+                  value="SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
         <property key="relax" value="false"/>
         <property key="warning-level" value="emit-warnings"/>
       </C30-AS>
@@ -685,7 +949,7 @@
         <property key="oXC16ld-nostdlib" value="false"/>
         <property key="oXC16ld-stackguard" value="64"/>
         <property key="preprocessor-macros"
-                  value="SONORA_MPLAB_APP_ASRC=1;SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
+                  value="SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
         <property key="psv-override" value="false"/>
         <property key="remove-unused-sections" value="true"/>
         <property key="report-memory-usage" value="true"/>
@@ -693,7 +957,7 @@
         <property key="secure-flash" value="no_flash"/>
         <property key="secure-ram" value="no_ram"/>
         <property key="secure-write-protect" value="no_write_protect"/>
-        <property key="stack-size" value="2560"/>
+        <property key="stack-size" value="2048"/>
         <property key="symbol-stripping" value=""/>
         <property key="trace-symbols" value=""/>
         <property key="vtable-address-1" value="0x808000"/>
@@ -1953,7 +2217,7 @@
                   value="Press to select which tool pack to use"/>
       </pkob4hybrid>
     </conf>
-    <conf name="dsPIC33AK512_CLASSIC_SERIAL_UPDATE" type="2">
+    <conf name="dsPIC33AK512_ASRC_SERIAL_UPDATE" type="2">
       <toolsSet>
         <developmentServer>localhost</developmentServer>
         <targetDevice>dsPIC33AK512MPS512</targetDevice>
@@ -1994,192 +2258,8 @@
         <makeCustomizationEnableLongLines>false</makeCustomizationEnableLongLines>
         <makeCustomizationNormalizeHexFile>false</makeCustomizationNormalizeHexFile>
       </makeCustomizationType>
-      <item path="../src/app/apps/asrc/asrc_app.c" ex="true" overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/asrc_audio_path.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/asrc_clock_control.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/asrc_console.c" ex="true" overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/asrc_decimator_48_to_8.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/asrc_fir_kernel_bench.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/asrc_full_iir_48_to_32.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/audio_app_asrc.c" ex="true" overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/audio_app_asrc_poly_l128_flash.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
       <item path="../src/app/apps/asrc/audio_app_asrc_poly_l128m30_flash.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/audio_app_asrc_poly_l64m30_flash.c"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/audio_app_meas.c" ex="true" overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/apps/asrc/audio_app_meas_tones.c"
-            ex="true"
+            ex="false"
             overriding="false">
         <C30>
         </C30>
@@ -2195,7 +2275,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_audio_path.c"
-            ex="false"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -2211,7 +2291,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_audio_pwm.c"
-            ex="false"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -2227,7 +2307,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_console.c"
-            ex="false"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -2243,7 +2323,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_controls.c"
-            ex="false"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -2259,7 +2339,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/classic_demo_app.c"
-            ex="false"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -2291,7 +2371,7 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/snd_effect_play.c"
-            ex="false"
+            ex="true"
             overriding="false">
         <C30>
         </C30>
@@ -2307,86 +2387,6 @@
         </C30Global>
       </item>
       <item path="../src/app/apps/classic/tone_data_int16.c"
-            ex="false"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/dspic33-cmsis-dsp/Source/BasicMathFunctions/mchp_asrc_push_block16_f32.s"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_q31_dspic33ak.s"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_q31_ymod_dspic33ak.s"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_q31_ymod_yonly_dspic33ak.s"
-            ex="true"
-            overriding="false">
-        <C30>
-        </C30>
-        <C30-AR>
-        </C30-AR>
-        <C30-AS>
-        </C30-AS>
-        <C30-CO>
-        </C30-CO>
-        <C30-LD>
-        </C30-LD>
-        <C30Global>
-        </C30Global>
-      </item>
-      <item path="../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/fir_ring_wide8_f32_dspic33ak.s"
             ex="true"
             overriding="false">
         <C30>
@@ -2456,7 +2456,7 @@
         <property key="post-instruction-scheduling" value="default"/>
         <property key="pre-instruction-scheduling" value="default"/>
         <property key="preprocessor-macros"
-                  value="SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
+                  value="SONORA_MPLAB_APP_ASRC=1;SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
         <property key="scalar-model" value="default"/>
         <property key="use-cci" value="false"/>
         <property key="use-iar" value="false"/>
@@ -2482,7 +2482,7 @@
         <property key="omit-debug-dirs" value="false"/>
         <property key="omit-forms" value="false"/>
         <property key="preprocessor-macros"
-                  value="SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
+                  value="SONORA_MPLAB_APP_ASRC=1;SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
         <property key="relax" value="false"/>
         <property key="warning-level" value="emit-warnings"/>
       </C30-AS>
@@ -2529,7 +2529,7 @@
         <property key="oXC16ld-nostdlib" value="false"/>
         <property key="oXC16ld-stackguard" value="64"/>
         <property key="preprocessor-macros"
-                  value="SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
+                  value="SONORA_MPLAB_APP_ASRC=1;SONORA_MPLAB_SERIAL_UPDATE=1;SONORA_DELIVERY_SERIAL_UPDATE_APP=1"/>
         <property key="psv-override" value="false"/>
         <property key="remove-unused-sections" value="true"/>
         <property key="report-memory-usage" value="true"/>
@@ -2537,7 +2537,7 @@
         <property key="secure-flash" value="no_flash"/>
         <property key="secure-ram" value="no_ram"/>
         <property key="secure-write-protect" value="no_write_protect"/>
-        <property key="stack-size" value="2048"/>
+        <property key="stack-size" value="2560"/>
         <property key="symbol-stripping" value=""/>
         <property key="trace-symbols" value=""/>
         <property key="vtable-address-1" value="0x808000"/>
