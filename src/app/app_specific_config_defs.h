@@ -160,10 +160,10 @@
 // --- HARDWARE / PCB REVISION ---
 //   Match these to the physical WM8904 codec board in use.
 #define WM8904_PCB_REV4      // REV4 support XTALout(RP16) and MIC Bias
-//// workaround ////
-#define WM8904_SWAP_ADC_LR   // only Rev.4 PCB(White) needs this -- PCB issue
-#define WM8904_SWAP_DAC_LR   // only Rev.4 PCB(White) needs this -- PCB issue
-//// workaround ////
+// Normal L/R routing is the default. Enable these only for a Rev.4 white PCB
+// whose physical ADC/DAC channels are reversed.
+// #define WM8904_SWAP_ADC_LR
+// #define WM8904_SWAP_DAC_LR
 
 
 // --- RED INPUT JACK (MCHP X32 CODEC PCB) ---
