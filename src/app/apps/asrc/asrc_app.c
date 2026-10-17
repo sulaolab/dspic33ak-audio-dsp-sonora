@@ -477,6 +477,10 @@ bool sonora_app_service( void )
     audio_transport_frmerr_recover_tick();
 #endif
 
+#if APP_ASRC_MEAS
+    audio_app_meas_service();
+#endif
+
 #if APP_ASRC_MEAS_UART2_STREAM
     return audio_app_meas_stream_service() != 0;
 #else

@@ -22,13 +22,17 @@
 #include "board/devices/pot_drv.h"
 #include <xc.h>
 #include "nora_adc.h"
+#include "nora_gpio.h"
+#include <stdio.h>
 
 static nora_adc_handle_t pot_adc;
 static bool pot_adc_ready;
 static uint16_t pot_last_data;
 
 #define POT_ADC_CHANNEL        (0U)
-#if RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK512_VALUE
+#if (RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK506_VALUE) && ENA_NANO_POT
+#define POT_ADC_POSITIVE_INPUT (2U) // AD2AN2, not PPS RP18
+#elif RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK512_VALUE
 #define POT_ADC_POSITIVE_INPUT (0U)
 #else
 #define POT_ADC_POSITIVE_INPUT (6U)
@@ -39,7 +43,9 @@ static uint16_t pot_last_data;
 void POT_Initialize(void)
 {
     const nora_adc_config_t config = {
-#if RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK512_VALUE
+#if (RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK506_VALUE) && ENA_NANO_POT
+        .instance = NORA_ADC_INSTANCE_2,
+#elif RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK512_VALUE
         .instance = NORA_ADC_INSTANCE_5,
 #else
         .instance = NORA_ADC_INSTANCE_1,
@@ -52,6 +58,14 @@ void POT_Initialize(void)
         .calibration_timeout_count = POT_ADC_TIMEOUT_COUNT,
     };
 
+#if (RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK506_VALUE) && ENA_NANO_POT
+    const nora_gpio_config_t pin_cfg = {
+        .dir = NORA_GPIO_DIR_INPUT, .pull = NORA_GPIO_PULL_NONE,
+        .analog = true, .open_drain = false, .initial_high = false,
+    };
+    pot_adc_ready = false;
+    if (!nora_gpio_rp_config(18u, &pin_cfg)) return;
+#endif
     pot_last_data = 0U;
     pot_adc_ready = nora_adc_init(&pot_adc, &config);
 }
@@ -73,6 +87,17 @@ static uint16_t pot_read_adc(void)
     return pot_last_data;
 }
 
+
+bool POT_IsReady(void) { return pot_adc_ready; }
+void POT_PrintStatus(void)
+{
+    uint16_t raw = POT_Read();
+    printf(" POT ready=%u raw=%u", (unsigned)pot_adc_ready, (unsigned)raw);
+#if (RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK506_VALUE) && ENA_NANO_POT
+    printf(" slot=2 rp=18 adc=2 input=2 span=%u invert=%u", (unsigned)NANO_POT_SPAN_COUNTS, (unsigned)NANO_POT_INVERT);
+#endif
+    printf("\n");
+}
 
 #if RESOLVED_BOARD_USE_REGULAR_ADC_API
 

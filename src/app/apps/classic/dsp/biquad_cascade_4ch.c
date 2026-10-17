@@ -264,6 +264,7 @@ static float32_t g_biquad_cascade_4ch_cmsis_state[BIQUAD_CASCADE_NUM_CH][2u * BI
 
 volatile float g_biquad_cascade_4ch_cmsis_test_max_abs_diff = 0.0f;
 
+/* DSP timing telemetry for the active kernel call. */
 uint32_t t0, dt;
 
 
@@ -467,6 +468,25 @@ void biquad_cascade_4ch_cmsis_init(void)
     }
 }
 
+const char *biquad_cascade_4ch_cmsis_kernel_name(void)
+{
+#if ENA_BIQUAD_CASCADE_4CH_X1S3P
+#if BIQUAD_DRC_READY_VARIANT == 1
+    return "x1s3p_readyN";
+#elif BIQUAD_DRC_READY_VARIANT == 2
+    return "x1s3p_ready32";
+#else
+    return "x1s3p";
+#endif
+#elif ENA_BIQUAD_CASCADE_4CH_X4T
+    return "x4t";
+#elif ENA_BIQUAD_CASCADE_4CH_X2
+    return "x2";
+#else
+    return "opt_v1";
+#endif
+}
+
 
 /**
  * @brief Apply dspic33-cmsis-dsp / MCHP DF2T biquad cascade to 4ch audio.
@@ -496,6 +516,157 @@ void biquad_cascade_4ch_process_cmsis( const float* in,
         return;
     }
 
+#if ENA_BIQUAD_CASCADE_4CH_X1S3P
+    /*
+     * LIVE DRC CANDIDATE -- one x1s3p call per existing channel-major block.
+     *
+     * This is intentionally not a foreground Tier-1 invocation: it is the
+     * actual four-channel DRC ISR path, with the same four instance objects,
+     * per-channel coefficient/state arrays, frame count, and dt convention as
+     * the scalar fallback.  The 141-stage default is 47 exact x1s3p triples; the
+     * kernel's scalar tail preserves the general nonzero-stage contract.
+     *
+     * `dt` is the last one-channel call. The console normalizes that duration to
+     * ns/sample/SOS; ISR response/margin remains the authoritative four-channel
+     * end-to-end measure.
+     */
+#if BIQUAD_DRC_READY_VARIANT == 1
+# define DRC_DF2T_PROCESS biquad_cascade_df2T_f32_dspic33ak_x1s3p_readyN
+#elif BIQUAD_DRC_READY_VARIANT == 2
+# define DRC_DF2T_PROCESS biquad_cascade_df2T_f32_dspic33ak_x1s3p_ready32
+#else
+# define DRC_DF2T_PROCESS biquad_cascade_df2T_f32_dspic33ak_x1s3p
+#endif
+    extern void DRC_DF2T_PROCESS(
+        const mchp_biquad_cascade_df2T_instance_f32 * S,
+        const float32_t * pSrc,
+        float32_t * pDst,
+        uint32_t blockSize );
+
+    for (int ch = 0; ch < BIQUAD_CASCADE_NUM_CH; ch++)
+    {
+        const float32_t* p_src = &in [ch * samples];
+              float32_t* p_dst = &out[ch * samples];
+
+        t0 = nora_high_res_timer_get_count();
+        DRC_DF2T_PROCESS(
+            &g_biquad_cascade_4ch_cmsis_inst[ch], p_src, p_dst,
+            (uint32_t)samples );
+        dt = nora_high_res_timer_elapsed_count(t0);
+    }
+#undef DRC_DF2T_PROCESS
+#elif ENA_BIQUAD_CASCADE_4CH_X4T
+    /*
+     * ALL FOUR CHANNELS IN ONE CALL, measured 23.3 % faster than x2.
+     *
+     * biquad_cascade_df2T_f32_dspic33ak_x4t interleaves four independent
+     * channels with a three-register rotation and dtb loop control. Measured on
+     * AK506 Nano at ap84: 7.605 cyc/sample/section, CPI 1.006, ev8 = 0.000,
+     * against x2's 9.921. Bit-identical to opt_v1 on all four channels.
+      * Full result: [internal] iir_df2t_phase_e_x3_2026-09-23.md §12
+     *
+     * Same correctness argument as x2 below, four channels wide: every channel
+     * has its own instance, coefficients and state, and no instruction of one
+     * channel names a register of another. The kernel drives all four cascades
+     * from channel 0's stage count, which init() makes uniform.
+     *
+     * blockSize 1..512 including odd - the tail handles the remainder mod 3.
+     *
+     * WHAT `dt` MEASURES NOW: one call = FOUR channels. The console divides by
+     * that channel coverage when normalizing the result to ns/sample/SOS.
+     */
+    _Static_assert( BIQUAD_CASCADE_NUM_CH == 4,
+                    "x4t filters exactly four channels per call" );
+
+    extern void biquad_cascade_df2T_f32_dspic33ak_x4t(
+        const mchp_biquad_cascade_df2T_instance_f32 * const * S,
+        const float32_t * const * pSrc,
+              float32_t * const * pDst,
+        uint32_t blockSize );
+
+    /* Argument arrays, because xc-dsc passes only seven 32-bit arguments in
+     * registers. Built per call: `in`/`out` are parameters, and twelve stores
+     * are nothing against 84 stages x 128 channel-samples. */
+    const mchp_biquad_cascade_df2T_instance_f32 * const x4_inst[4] =
+    {
+        &g_biquad_cascade_4ch_cmsis_inst[0], &g_biquad_cascade_4ch_cmsis_inst[1],
+        &g_biquad_cascade_4ch_cmsis_inst[2], &g_biquad_cascade_4ch_cmsis_inst[3],
+    };
+    const float32_t * const x4_src[4] =
+    {
+        &in[0 * samples], &in[1 * samples], &in[2 * samples], &in[3 * samples],
+    };
+    float32_t * const x4_dst[4] =
+    {
+        &out[0 * samples], &out[1 * samples], &out[2 * samples], &out[3 * samples],
+    };
+
+    t0 = nora_high_res_timer_get_count();
+
+    biquad_cascade_df2T_f32_dspic33ak_x4t( x4_inst, x4_src, x4_dst,
+                                           (uint32_t)samples );
+
+    dt = nora_high_res_timer_elapsed_count(t0);
+#elif ENA_BIQUAD_CASCADE_4CH_X2
+    /*
+     * TWO CHANNELS PER CALL, measured 13.6 % faster than one at a time.
+     *
+     * biquad_cascade_df2T_f32_dspic33ak_x2 filters two independent channels in
+     * one interleaved loop so that each channel's MAC latency is covered by the
+     * other channel's work instead of by a stall. Measured on AK506 Nano at
+     * ap84: 9.922 cyc/sample/section against opt_v1's 11.484, with the PMU
+     * showing ev8 = ev9 = 0 and CPI 1.004 - every attributable stall gone.
+      * Full result: [internal] iir_df2t_phase_d_summary_2026-09-23.md
+     *
+     * WHY THIS LOOP IS CORRECT WITH TWO CHANNELS AT A TIME
+     *   Each channel has its own instance, its own coefficient array and its own
+     *   state array (see g_biquad_cascade_4ch_cmsis_{inst,coeff,state} above), and
+     *   the kernel touches no register of one channel while working on the other.
+     *   So pairing changes only the schedule, never a value: the output is
+     *   BIT-IDENTICAL to four separate opt_v1 calls, which the Tier 1 bench proves
+     *   on both channels before any cycle figure is reported.
+     *
+     *   The kernel drives BOTH cascades from channel A's stage count, which is
+     *   safe here because every channel is initialised with the same
+     *   BIQUAD_CASCADE_4CH_NUM_STAGE in biquad_cascade_4ch_cmsis_init(). If that
+     *   ever becomes per-channel, this pairing must go back to single calls -
+     *   hence the static assert below rather than a comment alone.
+     *
+     *   blockSize is unconstrained (1..512, exactly opt_v1's contract): x2 is not
+     *   unrolled. The faster x2r variant (9.672, -15.8 %) IS unrolled and even-only,
+     *   and is deliberately NOT used here - 2.5 % is not worth narrowing the
+     *   kernel's contract in the audio path.
+     *
+     * WHAT `dt` MEASURES NOW: one call = TWO channels. The console divides by
+     * that channel coverage when normalizing the result to ns/sample/SOS.
+     */
+    _Static_assert( ( BIQUAD_CASCADE_NUM_CH % 2 ) == 0,
+                    "x2 pairing needs an even channel count" );
+
+    extern void biquad_cascade_df2T_f32_dspic33ak_x2(
+        const mchp_biquad_cascade_df2T_instance_f32 * SA,
+        const float32_t * pSrcA, float32_t * pDstA,
+        const mchp_biquad_cascade_df2T_instance_f32 * SB,
+        const float32_t * pSrcB, float32_t * pDstB,
+        uint32_t blockSize );
+
+    for (int ch = 0; ch < BIQUAD_CASCADE_NUM_CH; ch += 2)
+    {
+        const float32_t* p_src_a = &in [ (ch    ) * samples];
+              float32_t* p_dst_a = &out[ (ch    ) * samples];
+        const float32_t* p_src_b = &in [ (ch + 1) * samples];
+              float32_t* p_dst_b = &out[ (ch + 1) * samples];
+
+        t0 = nora_high_res_timer_get_count();
+
+        biquad_cascade_df2T_f32_dspic33ak_x2(
+            &g_biquad_cascade_4ch_cmsis_inst[ch    ], p_src_a, p_dst_a,
+            &g_biquad_cascade_4ch_cmsis_inst[ch + 1], p_src_b, p_dst_b,
+            (uint32_t)samples );
+
+        dt = nora_high_res_timer_elapsed_count(t0);
+    }
+#else
     for (int ch = 0; ch < BIQUAD_CASCADE_NUM_CH; ch++)
     {
         const float32_t* p_src = &in [ch * samples];
@@ -526,6 +697,8 @@ void biquad_cascade_4ch_process_cmsis( const float* in,
         dt = nora_high_res_timer_elapsed_count(t0);
 #endif //APP_TARGET == APP_TARGET_AK512
     }
+#endif /* ENA_BIQUAD_CASCADE_4CH_X4T / _X2 */
+
 }
 
 
@@ -1269,11 +1442,29 @@ bool app_biquad_cascade_4ch_load_coeff_from_uart_csv( const float* coeff,
     app_biquad_cascade_4ch_clear_state();
 #endif //defined(USE_CMSIS_IIR_DSP_PROCESS)
 
-    printf("BIQUAD UART CSV: loaded stage=%u/%u ch=%u coeff=%u\n",
-           (unsigned)stage_num,
-           (unsigned)BIQUAD_CASCADE_4CH_NUM_STAGE,
-           (unsigned)ch_num,
-           (unsigned)coeff_num);
+    /*
+     * A stable active-table checksum makes successful CSV application
+     * independently verifiable, including the bypass fill of stages not
+     * covered by a shorter CSV.
+     */
+    {
+        const uint8_t* p = (const uint8_t*)&g_biquad_cascade_4ch_coeff[0][0];
+        uint32_t hash = 2166136261u;    /* FNV-1a */
+        size_t i;
+
+        for( i = 0u; i < sizeof(g_biquad_cascade_4ch_coeff); i++ )
+        {
+            hash ^= (uint32_t)p[i];
+            hash *= 16777619u;
+        }
+
+        printf("BIQUAD UART CSV: loaded stage=%u/%u ch=%u coeff=%u tblsum=%08lX\n",
+               (unsigned)stage_num,
+               (unsigned)BIQUAD_CASCADE_4CH_NUM_STAGE,
+               (unsigned)ch_num,
+               (unsigned)coeff_num,
+               (unsigned long)hash);
+    }
 
     return true;
 }
@@ -1312,6 +1503,21 @@ void app_biquad_cascade_4ch_request_bypass(void)
 bool app_biquad_cascade_4ch_is_bypass_active(void)
 {
     return (s_biquad_proc_state == APP_BIQUAD_CASCADE_4CH_PROC_BYPASS_ACTIVE);
+}
+
+/*
+ * A stopped audio transport cannot run the ISR that normally acknowledges a
+ * bypass request.  The CSV apply path first proves the transport stopped with
+ * its authoritative predicate, then uses this narrowly-scoped promotion so
+ * the coefficient table can be copied without leaving the state machine
+ * parked in BYPASS_REQUESTED.
+ */
+void app_biquad_cascade_4ch_confirm_bypass_stopped(void)
+{
+    if( s_biquad_proc_state == APP_BIQUAD_CASCADE_4CH_PROC_BYPASS_REQUESTED )
+    {
+        s_biquad_proc_state = APP_BIQUAD_CASCADE_4CH_PROC_BYPASS_ACTIVE;
+    }
 }
 
 

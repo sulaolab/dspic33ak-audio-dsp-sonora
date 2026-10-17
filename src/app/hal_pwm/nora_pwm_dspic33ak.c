@@ -41,6 +41,13 @@
 #define NORA_PWM_IOCONBITS(n)  PG##n##IOCONbits
 #endif
 
+/* Output override bits: PGxIOCON2 where the device splits IOCON, else PGxIOCON. */
+#if defined(PG1IOCON2)
+#define NORA_PWM_OVRBITS(n)    PG##n##IOCON2bits
+#else
+#define NORA_PWM_OVRBITS(n)    PG##n##IOCONbits
+#endif
+
 /* Single output (H only). PENL may still be set (matches shipped pwm.c: the
  * LED generators enable PENL without ever routing PWMxL to a pin). */
 #define NORA_PWM_DEFINE_GEN_H(n)                                             \
@@ -69,7 +76,7 @@ static bool nora_pwm_pg##n##_init(const nora_pwm_generator_cfg_t *cfg,       \
     NORA_PWM_IOCONBITS(n).PENH = cfg->pen_h ? 1u : 0u;                      \
     NORA_PWM_IOCONBITS(n).PENL = cfg->pen_l ? 1u : 0u;                      \
     PG##n##CONbits.MSTEN = cfg->is_module_master ? 1u : 0u;                 \
-    PG##n##CONbits.ON = 1;                                                  \
+    PG##n##CONbits.ON = cfg->start_disabled ? 0u : 1u;                                                  \
     return true;                                                            \
 }                                                                            \
 static void nora_pwm_pg##n##_set_duty(uint32_t duty)                        \
@@ -77,7 +84,8 @@ static void nora_pwm_pg##n##_set_duty(uint32_t duty)                        \
     PG##n##DCbits.DC = duty;                                                \
 }
 
-/* Complementary H+L pair (audio-DAC use). AK512-only in practice (AK128 has
+/* Complementary H+L pair (audio-DAC use). UPDTRG=01 requests a buffer
+ * update on each DMA duty write (00 requires software UPDREQ). AK512-only in practice (AK128 has
  * no PG5-8), but guarded on PGxCON presence like every other instance here,
  * not on APP_TARGET. */
 #define NORA_PWM_DEFINE_GEN_HL(n)                                            \
@@ -110,8 +118,13 @@ static bool nora_pwm_pg##n##_init(const nora_pwm_generator_cfg_t *cfg,       \
     NORA_PWM_IOCONBITS(n).PMOD = pmod;                                      \
     NORA_PWM_IOCONBITS(n).PENH = cfg->pen_h ? 1u : 0u;                      \
     NORA_PWM_IOCONBITS(n).PENL = cfg->pen_l ? 1u : 0u;                      \
+    if (cfg->start_overridden) {                                            \
+        NORA_PWM_OVRBITS(n).OVRDAT = 0u;                                     \
+        NORA_PWM_OVRBITS(n).OVRENH = 1u;                                     \
+        NORA_PWM_OVRBITS(n).OVRENL = 1u;                                     \
+    }                                                                       \
     PG##n##CONbits.MSTEN = cfg->is_module_master ? 1u : 0u;                 \
-    PG##n##CONbits.ON = 1;                                                  \
+    PG##n##CONbits.ON = cfg->start_disabled ? 0u : 1u;                                                  \
     return true;                                                            \
 }                                                                            \
 static void nora_pwm_pg##n##_set_duty(uint32_t duty)                        \
@@ -336,4 +349,101 @@ bool nora_pwm_generator_is_present(nora_pwm_generator_id_t id)
         return false;
     }
     return nora_pwm_device_is_present(id);
+}
+
+/* Output override and run control for the complementary H/L generators
+ * (PG5-8). Policy -- when to override, what level, how long to wait -- stays
+ * with the consumer. */
+#define NORA_PWM_DEFINE_OVERRIDE(n)                                           \
+static void nora_pwm_pg##n##_override(bool enable, bool high, bool synchronous)\
+{                                                                             \
+    uint32_t value = PG##n##IOCON2;                                           \
+    value &= ~(_PG##n##IOCON2_OSYNC_MASK | _PG##n##IOCON2_OVRDAT_MASK |       \
+               _PG##n##IOCON2_OVRENH_MASK | _PG##n##IOCON2_OVRENL_MASK);      \
+    /* DS70005591D: OSYNC 00 = next SOC, 01 = immediate. */                   \
+    if (!synchronous) value |= (1u << _PG##n##IOCON2_OSYNC_POSITION);         \
+    if (high) value |= _PG##n##IOCON2_OVRDAT_MASK;                            \
+    if (enable) value |= _PG##n##IOCON2_OVRENH_MASK | _PG##n##IOCON2_OVRENL_MASK;\
+    PG##n##IOCON2 = value;                                                    \
+}                                                                             \
+static void nora_pwm_pg##n##_run(bool on)                                     \
+{                                                                             \
+    PG##n##CONbits.ON = on ? 1u : 0u;                                         \
+}
+
+#if defined(PG5IOCON2)
+NORA_PWM_DEFINE_OVERRIDE(5)
+#endif
+#if defined(PG6IOCON2)
+NORA_PWM_DEFINE_OVERRIDE(6)
+#endif
+#if defined(PG7IOCON2)
+NORA_PWM_DEFINE_OVERRIDE(7)
+#endif
+#if defined(PG8IOCON2)
+NORA_PWM_DEFINE_OVERRIDE(8)
+#endif
+
+bool nora_pwm_generator_override(nora_pwm_generator_id_t id, bool enable,
+                                 bool high, bool synchronous)
+{
+    if (((unsigned)id >= (unsigned)NORA_PWM_GEN_COUNT) || !s_generator_ready[id]) {
+        return false;
+    }
+    switch (id) {
+#if defined(PG5IOCON2)
+    case NORA_PWM_GEN_5: nora_pwm_pg5_override(enable, high, synchronous); return true;
+#endif
+#if defined(PG6IOCON2)
+    case NORA_PWM_GEN_6: nora_pwm_pg6_override(enable, high, synchronous); return true;
+#endif
+#if defined(PG7IOCON2)
+    case NORA_PWM_GEN_7: nora_pwm_pg7_override(enable, high, synchronous); return true;
+#endif
+#if defined(PG8IOCON2)
+    case NORA_PWM_GEN_8: nora_pwm_pg8_override(enable, high, synchronous); return true;
+#endif
+    default: return false;
+    }
+}
+
+bool nora_pwm_generator_run(nora_pwm_generator_id_t id, bool on)
+{
+    if (((unsigned)id >= (unsigned)NORA_PWM_GEN_COUNT) || !s_generator_ready[id]) {
+        return false;
+    }
+    switch (id) {
+#if defined(PG5IOCON2)
+    case NORA_PWM_GEN_5: nora_pwm_pg5_run(on); return true;
+#endif
+#if defined(PG6IOCON2)
+    case NORA_PWM_GEN_6: nora_pwm_pg6_run(on); return true;
+#endif
+#if defined(PG7IOCON2)
+    case NORA_PWM_GEN_7: nora_pwm_pg7_run(on); return true;
+#endif
+#if defined(PG8IOCON2)
+    case NORA_PWM_GEN_8: nora_pwm_pg8_run(on); return true;
+#endif
+    default: return false;
+    }
+}
+
+/* Compatibility with the tested direct stereo consumer. */
+bool nora_pwm_generator_pair_override(nora_pwm_generator_id_t id,
+                                     bool enable, bool high, bool synchronous)
+{
+    return nora_pwm_generator_override(id, enable, high, synchronous);
+}
+bool nora_pwm_generator_enable(nora_pwm_generator_id_t id, bool enable)
+{
+    return nora_pwm_generator_run(id, enable);
+}
+bool nora_pwm_audio_pair_override(bool enable, bool high, bool synchronous)
+{
+    return nora_pwm_generator_override(NORA_PWM_GEN_5, enable, high, synchronous);
+}
+bool nora_pwm_audio_pair_enable(bool enable)
+{
+    return nora_pwm_generator_run(NORA_PWM_GEN_5, enable);
 }

@@ -91,6 +91,19 @@
 #define CCPDET_FF_STABLE_PPM   (100.0f)
 #define CCPDET_FF_STABLE_COUNT (8u)
 #define CCPDET_FF_NOMINAL_PPM  (1000.0f)
+/* Average raw integer capture periods before publishing the one-shot
+ * feed-forward centre.  At the slowest 8 kHz clock, 256 periods span
+ * 0.512 s and therefore still fit inside the 3 s readiness target. */
+#define CCPDET_FF_PRECISE_PERIODS (256u)
+/* P0: close both precise windows after a common ELAPSED time instead of a common period
+ * count.  256 periods are 85 ms on a 48 kHz leg but 512 ms on an 8 kHz leg, so the FRC
+ * time-base wander both legs share does not cancel in the ratio (design section 3).  Selected at
+ * run time by "*ax 04 VV" in MEAS (T = VV x 500 ms, 0 = the count window above); boot value
+ * APP_P0_FF_COTIMED_DEFAULT, applied once in asrc_clock_control_init_reset().  Compiled with
+ * QUIET_TRACK too, which only enters after the two-stage handover built on it. */
+#define CCPDET_FF_COTIMED           (APP_ASRC_MEAS || APP_ASRC_QUIET_TRACK)
+#define CCPDET_FF_COTIMED_STEP_MS   (500u)
+#define CCPDET_FF_COTIMED_MAX_CODE  (8u)
 #endif
 
 typedef struct {
@@ -117,6 +130,12 @@ typedef struct {
 #endif
     bool                  inited;
     float                 ema_period;
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+    uint32_t              ff_period_sum;
+    uint16_t              ff_period_count;
+    float                 ff_period_reference;
+    bool                  ff_period_collecting;
+#endif
 } ccpdet_t;
 
 static ccpdet_t s_det_a = {
@@ -130,10 +149,37 @@ static ccpdet_t s_det_b = {
     .rp     = BOARD_ASRC_CLOCK_B_RP,
 };
 
+#if APP_ASRC_MEAS
+/* P0 step 5 (*af08): pull deferral after a leg's own CCP edge grid, see ccpdet_defer_ticks().
+ * One per leg: leg B for the A->B engine's pull, leg A for the B->A engine's pull. */
+typedef struct
+{
+    uint32_t u0;                    /* lowest (now - edge) mod period seen this epoch, CCP ticks */
+    bool     u0_valid;
+    int32_t  last, max;
+    uint32_t calls;
+} ccpdet_defer_t;
+static ccpdet_defer_t s_defer_b, s_defer_a;
+#endif
+
 #if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
 static float   s_ff_candidate;
 static uint8_t s_ff_stable_count;
 static bool    s_ff_acquired;
+static float   s_ff_precise_ab;
+static uint32_t s_ff_precise_seq;
+#if CCPDET_FF_COTIMED
+static volatile uint32_t s_ff_cotimed_ticks;   /* co-timed window length; 0 = none */
+static uint16_t s_ff_cotimed_ms;
+/* Which rule closes the windows now.  Single stage: co-timed for the whole epoch.  Two stage:
+ * count windows until the first publish, co-timed after it (s_ff_refine_stage 1 -> 2). */
+static volatile bool s_ff_window_cotimed;
+static uint8_t  s_ff_two_stage;
+static bool     s_ff_two_stage_epoch;   /* two stage selected AND allowed for this rate epoch */
+static uint8_t  s_ff_refine_stage;
+static long double s_ff_precise_ab64;   /* xc-dsc: double is binary32 */
+static uint16_t s_ff_last_n_a, s_ff_last_n_b;
+#endif
 #endif
 
 static inline __attribute__((always_inline)) void
@@ -178,6 +224,22 @@ ccpdet_capture_isr( ccpdet_t* detector, uint32_t timestamp )
     detector->have = true;
 }
 
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+static inline bool ccpdet_ff_window_full( const ccpdet_t* detector )
+{
+#if CCPDET_FF_COTIMED
+    const uint32_t window_ticks = s_ff_cotimed_ticks;
+    if( s_ff_window_cotimed && ( window_ticks != 0u ) )
+    {
+        /* Summed period ticks ARE the elapsed time on this leg's capture timebase, and both
+         * legs share that timebase, so both windows close at T to within one period. */
+        return detector->ff_period_sum >= window_ticks;
+    }
+#endif
+    return detector->ff_period_count >= CCPDET_FF_PRECISE_PERIODS;
+}
+#endif
+
 static void ccpdet_process_periods( ccpdet_t* detector )
 {
     if( !detector->period_queue_enabled )
@@ -212,8 +274,9 @@ static void ccpdet_process_periods( ccpdet_t* detector )
 
     while( read != write )
     {
-        const float period =
-            (float)detector->period_queue[read & CCPDET_PERIOD_QUEUE_MASK];
+        const uint32_t period_ticks =
+            detector->period_queue[read & CCPDET_PERIOD_QUEUE_MASK];
+        const float period = (float)period_ticks;
         read = (uint16_t)( read + 1u );
         detector->period_read = read;
 
@@ -227,8 +290,155 @@ static void ccpdet_process_periods( ccpdet_t* detector )
             detector->ema_period +=
                 ( period - detector->ema_period ) * CCPDET_EMA_ALPHA;
         }
+
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+        if( detector->ff_period_collecting )
+        {
+            /* A restart may land after the foreground armed this window.  Drop
+             * that transition rather than letting one long/short interval bias
+             * the one-shot rate centre. */
+            const float reference = detector->ff_period_reference;
+            if( ( reference > 0.0f ) &&
+                ( period < reference * 0.75f || period > reference * 1.25f ) )
+            {
+                detector->ff_period_sum = 0u;
+                detector->ff_period_count = 0u;
+                detector->ff_period_reference = period;
+            }
+            else if( !ccpdet_ff_window_full( detector ) )
+            {
+                detector->ff_period_sum += period_ticks;
+                detector->ff_period_count++;
+                if( ccpdet_ff_window_full( detector ) )
+                {
+                    detector->ff_period_collecting = false;
+                }
+            }
+        }
+#endif
     }
 }
+
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+static void ccpdet_ff_precision_clear( ccpdet_t* detector )
+{
+    detector->ff_period_sum = 0u;
+    detector->ff_period_count = 0u;
+    detector->ff_period_reference = 0.0f;
+    detector->ff_period_collecting = false;
+}
+
+static void ccpdet_ff_precision_start( ccpdet_t* detector )
+{
+    detector->ff_period_sum = 0u;
+    detector->ff_period_count = 0u;
+    detector->ff_period_reference = detector->ema_period;
+    detector->ff_period_collecting = true;
+}
+
+static bool ccpdet_ff_precision_ready( const ccpdet_t* detector )
+{
+    return ( detector->ff_period_count != 0u ) && ccpdet_ff_window_full( detector );
+}
+
+static float ccpdet_ff_precision_period( const ccpdet_t* detector )
+{
+    return (float)detector->ff_period_sum / (float)detector->ff_period_count;
+}
+
+/* Planned step from two finished windows: (sum_num/n_num)/(sum_den/n_den) through the plan.
+ * The count window keeps the original binary32 arithmetic bit for bit.  The co-timed window
+ * evaluates in binary64 (long double -- plain double is binary32 on xc-dsc): near 6.0 a binary32
+ * ratio is already 0.08 ppm per ULP, above what that window exists to resolve.  The one rounding
+ * to binary32 is the published step itself (half an ULP at 2.0 = 0.06 ppm). */
+static float ccpdet_ff_precise_plan( const ccpdet_t* num, const ccpdet_t* den,
+                                     const asrc_rate_plan_t* plan )
+{
+#if CCPDET_FF_COTIMED
+    if( s_ff_window_cotimed && ( s_ff_cotimed_ticks != 0u ) && ( plan->fixed_input_den != 0u ) )
+    {
+        const long double ratio =
+            ( (long double)num->ff_period_sum * (long double)den->ff_period_count ) /
+            ( (long double)den->ff_period_sum * (long double)num->ff_period_count );
+        return (float)( ( ratio * (long double)plan->fixed_output_num ) /
+                        (long double)plan->fixed_input_den );
+    }
+#endif
+    return asrc_rate_plan_step( ccpdet_ff_precision_period( num ) /
+                                ccpdet_ff_precision_period( den ), plan );
+}
+
+#if CCPDET_FF_COTIMED
+/* Latch the finished windows' B/A ratio in binary64 and their lengths, for the CCPff64 line. */
+static void ccpdet_ff_latch_diag( void )
+{
+    s_ff_precise_ab64 =
+        ( (long double)s_det_b.ff_period_sum * (long double)s_det_a.ff_period_count ) /
+        ( (long double)s_det_a.ff_period_sum * (long double)s_det_b.ff_period_count );
+    s_ff_last_n_a = s_det_a.ff_period_count;
+    s_ff_last_n_b = s_det_b.ff_period_count;
+}
+#endif
+
+#if CCPDET_FF_COTIMED
+/* Whether this rate epoch may use the P0 co-timed / two-stage FF.  MEAS: always (the console
+ * selects).  Product: only at the operating point QUIET_TRACK was verified at; anywhere else the
+ * epoch keeps the pre-P0 256-period FF, so an unverified pair is not changed. */
+static bool ccpdet_p0_point_ok( void )
+{
+#if APP_ASRC_MEAS
+    return true;
+#else
+    return ( wm8904_get_rate_hz( I2C_INST_A ) == APP_P0_POINT_A_HZ ) &&
+           ( wm8904_get_rate_hz( I2C_INST_B ) == APP_P0_POINT_B_HZ );
+#endif
+}
+
+/* Whether this rate epoch goes through the FF acquire path (the same rule as ff_guard_active in
+ * asrc_clock_control_publish()).  Stage 2 of the two-stage FF is entered from that path only, so on
+ * an epoch that bypasses it (no guard, front-end den == 1) arming two-stage would leave the P0
+ * refine armed with no stage 2 ever coming, and QUALITY_READY would wait on it forever.  The dens
+ * are valid here: asrc_audio_path_reset() sets them before asrc_clock_control_init_reset(). */
+static bool ccpdet_ff_epoch_acquires( void )
+{
+    return APP_ASRC_FF_ACQUIRE_GUARD ||
+           ( asrc_audio_path_ab_fixed_rate_den() != 1u )
+#if APP_B_ROUTE_USES_BA
+           || ( asrc_audio_path_ba_fixed_rate_den() != 1u )
+#endif
+           ;
+}
+
+/* Two-stage and single-stage co-timed choice for this epoch.  An epoch that cannot reach stage 2
+ * falls back to the single-stage co-timed window. */
+static void ccpdet_ff_mode_select( void )
+{
+    const bool cotimed = ( s_ff_cotimed_ticks != 0u ) && ccpdet_p0_point_ok();
+    s_ff_two_stage_epoch = s_ff_two_stage && cotimed && ccpdet_ff_epoch_acquires();
+    s_ff_window_cotimed = cotimed && !s_ff_two_stage_epoch;
+    audio_app_asrc_p0_refine_arm( s_ff_two_stage_epoch ? 1u : 0u );
+}
+
+/* Window rule at the start of a rate epoch. */
+static void ccpdet_ff_mode_epoch( void )
+{
+    s_ff_refine_stage = 0u;
+    ccpdet_ff_mode_select();
+}
+#endif
+
+static void ccpdet_ff_precision_restart( void )
+{
+    ccpdet_ff_precision_start( &s_det_a );
+    ccpdet_ff_precision_start( &s_det_b );
+}
+
+static void ccpdet_ff_precision_cancel( void )
+{
+    ccpdet_ff_precision_clear( &s_det_a );
+    ccpdet_ff_precision_clear( &s_det_b );
+}
+#endif
 
 #if APP_ASRC_CCP_QUEUE_OBSERVE
 /*
@@ -421,6 +631,9 @@ static void ccpdet_reset( ccpdet_t* detector )
     detector->inited = false;
     detector->ema_period = 0.0f;
     detector->capture_count = 0u;
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+    ccpdet_ff_precision_clear( detector );
+#endif
 }
 
 static bool ccpdet_arm( ccpdet_t* detector )
@@ -469,6 +682,17 @@ void asrc_clock_control_init_reset( void )
     static bool initialized = false;
     if( !initialized )
     {
+#if ( APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8 ) && CCPDET_FF_COTIMED
+        /* P0 MEAS boot defaults (asrc_app_config.h).  Before the detectors arm, so the first
+         * rate epoch already uses them; the console setters still override afterwards. */
+        s_ff_two_stage = ( APP_P0_FF_TWO_STAGE_DEFAULT != 0u ) ? 1u : 0u;
+        {
+            const uint8_t code = ( APP_P0_FF_COTIMED_DEFAULT > CCPDET_FF_COTIMED_MAX_CODE )
+                               ? CCPDET_FF_COTIMED_MAX_CODE : (uint8_t)APP_P0_FF_COTIMED_DEFAULT;
+            s_ff_cotimed_ms    = (uint16_t)( code * CCPDET_FF_COTIMED_STEP_MS );
+            s_ff_cotimed_ticks = (uint32_t)( ( (uint64_t)CCPDET_TIMEBASE_HZ * s_ff_cotimed_ms ) / 1000u );
+        }
+#endif
         const bool ok_a = ccpdet_arm( &s_det_a );
         const bool ok_b = ccpdet_arm( &s_det_b );
         if( !ok_a || !ok_b )
@@ -485,6 +709,10 @@ void asrc_clock_control_init_reset( void )
 
     ccpdet_reset( &s_det_a );
     ccpdet_reset( &s_det_b );
+#if APP_ASRC_MEAS
+    s_defer_b = (ccpdet_defer_t){ 0u, false, 0, 0, 0u };
+    s_defer_a = (ccpdet_defer_t){ 0u, false, 0, 0, 0u };
+#endif
 #if APP_ASRC_CCP_QUEUE_OBSERVE
     /* ccpdet_reset() already zeroes period_overrun_count here, so every audio restart is a
      * fresh window for the overrun counter too; keep the observation tallies in step with it
@@ -495,6 +723,61 @@ void asrc_clock_control_init_reset( void )
     s_ff_candidate = 0.0f;
     s_ff_stable_count = 0u;
     s_ff_acquired = false;
+    s_ff_precise_ab = 0.0f;
+    s_ff_precise_seq = 0u;
+#if CCPDET_FF_COTIMED
+    ccpdet_ff_mode_epoch();
+#endif
+#endif
+}
+
+void asrc_clock_control_servo_rearm( void )
+{
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+    /* audio_app_asrc_reset_all() clears the engines' published ratios.  Keep the
+     * already-running CCP detectors and their queues intact, but permit the
+     * stable feed-forward ratio to be acquired and published again. */
+    s_ff_candidate = 0.0f;
+    s_ff_stable_count = 0u;
+    s_ff_acquired = false;
+    s_ff_precise_ab = 0.0f;
+    s_ff_precise_seq = 0u;
+    ccpdet_ff_precision_cancel();
+#if CCPDET_FF_COTIMED
+    ccpdet_ff_mode_epoch();
+#endif
+#endif
+}
+
+void asrc_clock_control_ff_cotimed_set( uint8_t code )
+{
+#if ( APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8 ) && CCPDET_FF_COTIMED
+    if( code > CCPDET_FF_COTIMED_MAX_CODE ) { code = CCPDET_FF_COTIMED_MAX_CODE; }
+    uint32_t timebase_hz = nora_ccp_icap_timebase_hz( s_det_a.inst );
+    if( timebase_hz == 0u ) { timebase_hz = (uint32_t)CCPDET_TIMEBASE_HZ; }
+    s_ff_cotimed_ms = (uint16_t)( code * CCPDET_FF_COTIMED_STEP_MS );
+    s_ff_cotimed_ticks = (uint32_t)( ( (uint64_t)timebase_hz * s_ff_cotimed_ms ) / 1000u );
+    s_ff_window_cotimed = ( s_ff_cotimed_ticks != 0u ) && !( s_ff_two_stage && ccpdet_ff_epoch_acquires() );
+    printf(" *MEAS ff co-timed window = %u ms (%lu ticks; 0 = 256-period windows;"
+           " applies from the next rate epoch)\n",
+           (unsigned)s_ff_cotimed_ms, (unsigned long)s_ff_cotimed_ticks );
+#else
+    (void)code;
+    printf(" *MEAS ff co-timed window not compiled in this image\n");
+#endif
+}
+
+void asrc_clock_control_ff_two_stage_set( uint8_t on )
+{
+#if ( APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8 ) && CCPDET_FF_COTIMED
+    s_ff_two_stage = on ? 1u : 0u;
+    ccpdet_ff_mode_select();
+    printf(" *MEAS ff two-stage = %s (stage 1 = 256-period FF, stage 2 = %u ms co-timed;"
+           " applies from the next rate epoch)\n",
+           s_ff_two_stage ? "ON" : "OFF", (unsigned)s_ff_cotimed_ms );
+#else
+    (void)on;
+    printf(" *MEAS ff two-stage not compiled in this image\n");
 #endif
 }
 
@@ -560,6 +843,47 @@ void asrc_clock_control_tick( void )
     const float measured_ab = period_b / period_a;
     const float planned_ab = asrc_rate_plan_step( measured_ab, &ab_rate_plan );
 #if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+    /* The CCP period estimator is an acquisition aid, not a clean steady-state
+     * modulation source.  Republishing its quantised 50 Hz estimate after
+     * acquisition moves the ASRC step by tens of ppm and measurably phase-
+     * modulates audio.  Once one stable estimate has been published for this
+     * rate epoch, leave that feed-forward centre fixed.  The existing fill
+     * servo remains closed and carries real long-term clock drift.  A stream
+     * reset clears s_ff_acquired and therefore takes a fresh estimate for the
+     * next rate epoch. */
+    if( ff_guard_active && s_ff_acquired )
+    {
+        /* Continue measuring matched raw-period windows for diagnosis, but do
+         * not republish them into the audio step.  This separates clock
+         * settling/drift evidence from the control law whose audio quality is
+         * under test. */
+        if( ccpdet_ff_precision_ready( &s_det_a ) &&
+            ccpdet_ff_precision_ready( &s_det_b ) )
+        {
+            s_ff_precise_ab = ccpdet_ff_precision_period( &s_det_b ) /
+                              ccpdet_ff_precision_period( &s_det_a );
+#if CCPDET_FF_COTIMED
+            ccpdet_ff_latch_diag();
+            if( s_ff_refine_stage == 1u )
+            {
+                /* First co-timed window after the stage-1 publish: hand it to the engine. */
+                audio_app_asrc_refine_ratio_ab(
+                    ccpdet_ff_precise_plan( &s_det_b, &s_det_a, &ab_rate_plan ) );
+#if APP_B_ROUTE_USES_BA && APP_ASRC_MEAS
+                /* Product: the B->A engine keeps its stage-1 FF (= the pre-P0 product FF) and so
+                 * never enters QUIET_TRACK, until the BA route is verified (NEXT card 2 step 4). */
+                audio_app_asrc_refine_ratio_ba(
+                    ccpdet_ff_precise_plan( &s_det_a, &s_det_b, &ba_rate_plan ) );
+#endif
+                s_ff_refine_stage = 2u;
+            }
+#endif
+            s_ff_precise_seq++;
+            ccpdet_ff_precision_restart();
+        }
+        return;
+    }
+
     if( ff_guard_active && !s_ff_acquired )
     {
 #if APP_B_CODEC_MASTER
@@ -579,6 +903,7 @@ void asrc_clock_control_tick( void )
         {
             s_ff_candidate = 0.0f;
             s_ff_stable_count = 0u;
+            ccpdet_ff_precision_cancel();
             return;
         }
 #endif
@@ -586,6 +911,7 @@ void asrc_clock_control_tick( void )
         {
             s_ff_candidate = planned_ab;
             s_ff_stable_count = 1u;
+            ccpdet_ff_precision_restart();
             return;
         }
         float delta_ppm = ( planned_ab / s_ff_candidate - 1.0f ) * 1.0e6f;
@@ -594,10 +920,54 @@ void asrc_clock_control_tick( void )
         {
             s_ff_candidate = planned_ab;
             s_ff_stable_count = 1u;
+            ccpdet_ff_precision_restart();
             return;
         }
-        if( ++s_ff_stable_count < CCPDET_FF_STABLE_COUNT ) { return; }
+        if( s_ff_stable_count < CCPDET_FF_STABLE_COUNT ) { s_ff_stable_count++; }
+        if( ( s_ff_stable_count < CCPDET_FF_STABLE_COUNT ) ||
+            !ccpdet_ff_precision_ready( &s_det_a ) ||
+            !ccpdet_ff_precision_ready( &s_det_b ) )
+        {
+            return;
+        }
+
+        const float precise_period_a = ccpdet_ff_precision_period( &s_det_a );
+        const float precise_period_b = ccpdet_ff_precision_period( &s_det_b );
+        const float precise_ab = precise_period_b / precise_period_a;
+        const float precise_planned_ab =
+            ccpdet_ff_precise_plan( &s_det_b, &s_det_a, &ab_rate_plan );
+        float precise_delta_ppm = ( precise_planned_ab / s_ff_candidate - 1.0f ) * 1.0e6f;
+        if( precise_delta_ppm < 0.0f ) { precise_delta_ppm = -precise_delta_ppm; }
+        if( precise_delta_ppm > CCPDET_FF_STABLE_PPM )
+        {
+            s_ff_candidate = planned_ab;
+            s_ff_stable_count = 1u;
+            ccpdet_ff_precision_restart();
+            return;
+        }
         s_ff_acquired = true;
+        s_ff_precise_ab = precise_ab;
+        s_ff_precise_seq = 1u;
+#if APP_B_ROUTE_USES_BA
+        const float precise_planned_ba =
+            ccpdet_ff_precise_plan( &s_det_a, &s_det_b, &ba_rate_plan );
+#endif
+#if CCPDET_FF_COTIMED
+        ccpdet_ff_latch_diag();
+        if( s_ff_two_stage_epoch )
+        {
+            /* Stage 1 published below; the windows restarted here are the co-timed refinement. */
+            s_ff_window_cotimed = true;
+            s_ff_refine_stage = 1u;
+        }
+#endif
+        ccpdet_ff_precision_restart();
+
+        audio_app_asrc_set_ratio_ab( precise_planned_ab );
+#if APP_B_ROUTE_USES_BA
+        audio_app_asrc_set_ratio_ba( precise_planned_ba );
+#endif
+        return;
     }
 #endif
 
@@ -616,6 +986,81 @@ uint32_t asrc_clock_control_capture_count_b( void )
 {
     return s_det_b.capture_count;
 }
+
+#if APP_ASRC_MEAS
+/*
+ * P0 step 5: how long the running leg-B pull started after its own hardware instant, in
+ * high-res-timer ticks.  Measured 2026-09-28 (kick-log `age`): the leg-B vector cannot run
+ * while leg A's callback does, so whenever leg B's block boundary slides into that ~111 us
+ * window the pull and its timestamp move to the end of the callback.  The continuous fill
+ * then extrapolates the producer to a later instant than rd/frac stand for, a +2.4 frame
+ * step that decays over ~4 min and recurs every time A/B slide one leg-A period.
+ *
+ * CCP2 captures every 16th leg-B LRCLK edge = one per 16-frame pull, so (CCP2TMR - last edge)
+ * mod period is the pull's latency after a fixed point of leg B's frame grid.  Its lowest value
+ * this epoch is the undeferred latency; the excess is the deferral.  The minimum ratchets down
+ * continuously at the end of a deferred zone (the deferral shrinks to 0 there), so a wrong
+ * first reference never produces a step.  Both counters are read on CCP2's own time base.
+ */
+static int32_t ccpdet_defer_ticks( const ccpdet_t* det, nora_ccp_inst_t inst, ccpdet_defer_t* s )
+{
+    const uint32_t period = det->latest_period;
+    if( !det->have || ( period == 0u ) )
+    {
+        s->u0_valid = false;
+        return 0;
+    }
+    const uint32_t edge = det->prev;
+    const uint32_t now  = nora_ccp_dspic33ak_timer_now( inst );
+    const uint32_t u    = ( now - edge ) % period;   /* a not-yet-drained capture is one period */
+    if( !s->u0_valid )
+    {
+        s->u0       = u;
+        s->u0_valid = true;
+    }
+    int32_t d = (int32_t)u - (int32_t)s->u0;
+    const int32_t half = (int32_t)( period / 2u );
+    if( d >= half )       { d -= (int32_t)period; }
+    else if( d < -half )  { d += (int32_t)period; }
+    if( d < 0 )
+    {
+        s->u0 = u;
+        d = 0;
+    }
+#if CCPDET_TIMEBASE_FROM_PLL2
+    d = (int32_t)( (float)d * ( (float)FCY / (float)CCPDET_TIMEBASE_HZ ) );
+#endif
+    s->last = d;
+    if( d > s->max ) { s->max = d; }
+    s->calls++;
+    return d;
+}
+
+int32_t asrc_clock_control_legb_defer_ticks( void )
+{
+    return ccpdet_defer_ticks( &s_det_b, NORA_CCP2, &s_defer_b );
+}
+
+/* The same for the B->A engine, whose pull runs on leg A's block: CCP1 captures every 16th leg-A
+ * LRCLK edge = one per 16-frame leg-A pull, so leg A's grid gives that pull's hardware instant. */
+int32_t asrc_clock_control_lega_defer_ticks( void )
+{
+    return ccpdet_defer_ticks( &s_det_a, NORA_CCP1, &s_defer_a );
+}
+
+void asrc_clock_control_legb_defer_print( void )
+{
+    printf(" *MEAS legb_defer: calls=%lu last=%ld max=%ld u0=%lu period=%lu (high-res ticks; u0/period CCP ticks)\n",
+           (unsigned long)s_defer_b.calls, (long)s_defer_b.last, (long)s_defer_b.max,
+           (unsigned long)s_defer_b.u0, (unsigned long)s_det_b.latest_period );
+    if( s_defer_a.calls != 0u )
+    {
+        printf(" *MEAS lega_defer: calls=%lu last=%ld max=%ld u0=%lu period=%lu\n",
+               (unsigned long)s_defer_a.calls, (long)s_defer_a.last, (long)s_defer_a.max,
+               (unsigned long)s_defer_a.u0, (unsigned long)s_det_a.latest_period );
+    }
+}
+#endif
 
 #define CCP_DISPLAY_WARMUP_WINDOWS  (2u)
 static float    s_display_scale = 1.0f;
@@ -690,6 +1135,28 @@ void asrc_clock_control_debug_print( uint32_t fs_a_hz,
            (unsigned long)( display_b_x100 % 100u ),
            ratio_x1e6 / 1000000ul, ratio_x1e6 % 1000000ul,
            (unsigned long)recover_count );
+#if APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8
+    printf("CCPff ratioAB=%.9f seq=%lu periods=%u/%u acquired=%u\n",
+           (double)s_ff_precise_ab,
+           (unsigned long)s_ff_precise_seq,
+           (unsigned)CCPDET_FF_PRECISE_PERIODS,
+           (unsigned)CCPDET_FF_PRECISE_PERIODS,
+           (unsigned)s_ff_acquired );
+#if CCPDET_FF_COTIMED
+    if( s_ff_cotimed_ticks != 0u )
+    {
+        /* Integer print: the binary64 value must not pass through a binary32 printf. */
+        const long double r = s_ff_precise_ab64;
+        const uint32_t whole = (uint32_t)r;
+        const uint64_t frac_e12 = (uint64_t)( ( r - (long double)whole ) * 1.0e12L + 0.5L );
+        printf("CCPff64 cot_ms=%u two=%u stage=%u nA=%u nB=%u ratioAB=%lu.%06lu%06lu\n",
+               (unsigned)s_ff_cotimed_ms, (unsigned)s_ff_two_stage, (unsigned)s_ff_refine_stage,
+               (unsigned)s_ff_last_n_a, (unsigned)s_ff_last_n_b,
+               (unsigned long)whole,
+               (unsigned long)( frac_e12 / 1000000u ), (unsigned long)( frac_e12 % 1000000u ) );
+    }
+#endif
+#endif
     if( ( s_det_a.period_overrun_count != 0u ) ||
         ( s_det_b.period_overrun_count != 0u ) )
     {
@@ -734,6 +1201,17 @@ void asrc_clock_control_debug_print( uint32_t fs_a_hz,
 #else
 
 void asrc_clock_control_init_reset( void ) { }
+void asrc_clock_control_servo_rearm( void ) { }
+void asrc_clock_control_ff_cotimed_set( uint8_t code )
+{
+    (void)code;
+    printf(" *MEAS ff co-timed window not compiled in this image\n");
+}
+void asrc_clock_control_ff_two_stage_set( uint8_t on )
+{
+    (void)on;
+    printf(" *MEAS ff two-stage not compiled in this image\n");
+}
 void asrc_clock_control_tick( void ) { }
 void asrc_clock_control_drain_yield( void ) { }
 #if APP_ASRC_CCP_QUEUE_OBSERVE
@@ -741,6 +1219,14 @@ void asrc_clock_control_queue_stats_clear( void ) { }
 #endif
 uint32_t asrc_clock_control_capture_count_a( void ) { return 0u; }
 uint32_t asrc_clock_control_capture_count_b( void ) { return 0u; }
+#if APP_ASRC_MEAS
+int32_t asrc_clock_control_legb_defer_ticks( void ) { return 0; }
+int32_t asrc_clock_control_lega_defer_ticks( void ) { return 0; }
+void asrc_clock_control_legb_defer_print( void )
+{
+    printf(" *MEAS legb_defer: not compiled in this image (no CCP rate detect)\n");
+}
+#endif
 void asrc_clock_control_debug_print( uint32_t fs_a_hz,
                                      uint32_t fs_b_hz,
                                      uint32_t recover_count )

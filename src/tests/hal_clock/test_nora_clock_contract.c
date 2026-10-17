@@ -86,6 +86,7 @@ static void case_contract_numbering(void)
     CHECK(NORA_CLOCK_DSPIC33AK_DIAG_FOSC_OVER_LIMIT == 11);
     CHECK(NORA_CLOCK_DSPIC33AK_DIAG_SYSTEM_DIVIDER_UNKNOWN == 12);
     CHECK(NORA_CLOCK_DSPIC33AK_DIAG_SOURCE_HZ_CONFLICT == 13);
+    CHECK(NORA_CLOCK_DSPIC33AK_DIAG_PLL_STOP_REFUSED == 14);
 
     CHECK(NORA_CLOCK_FRC_HZ == 8000000UL);
 }
@@ -937,6 +938,238 @@ static void case_argument_validation(void)
     CHECK(nora_fake_pll_source_switches(1u) == 0u);
 }
 
+/* --------------------------------------------------------------------------
+ * Both PLLs are programmed by ONE sequence
+ * --------------------------------------------------------------------------
+ * The two used to have separate functions that had drifted: PLL1's cleared ON and
+ * waited for the rev A1 self-started DIVSWEN, PLL2's did neither, and only PLL1
+ * proved anything past OSCCTRL's lock bit.  What is asserted here is the footprint
+ * that sequence leaves, for BOTH instances, so a future edit that special-cases
+ * one of them fails rather than silently reintroducing the drift.
+ */
+static void case_both_plls_take_the_same_sequence(void)
+{
+    nora_clock_pll_config_t cfg;
+    uint32_t pll;
+
+    for (pll = 1u; pll <= 2u; pll++) {
+        nora_fake_clock_reset();
+
+        cfg.source = NORA_CLOCK_SOURCE_FRC;
+        cfg.input_hz = 0u;                  /* FRC is known without declaring it */
+        cfg.target_hz = 200000000u;
+        CHECK(nora_clock_pll_configure((nora_clock_pll_t)pll, &cfg, NULL) ==
+            NORA_CLOCK_OK);
+
+        /* Staged with the generator stopped, then re-enabled: the ON clear is the
+         * observable half of "POSTDIV1/2 were not written while it was running". */
+        CHECK(nora_fake_pllcon(pll)->ON == 1u);
+        CHECK(nora_fake_pllcon(pll)->NOSC == NORA_FAKE_NOSC_FRC);
+
+        /* Proven, not inherited: the source that is CURRENT is the one asked for,
+         * the PLL block says ready, and so does OSCCTRL. */
+        CHECK(nora_fake_pllcon(pll)->COSC == NORA_FAKE_NOSC_FRC);
+        CHECK(nora_fake_pllcon(pll)->CLKRDY == 1u);
+        CHECK(nora_fake_pll_source_switches(pll) == 1u);
+
+        /* Every commit bit was left clear -- none of them was still in flight
+         * when the call returned. */
+        CHECK(nora_fake_pllcon(pll)->OSWEN == 0u);
+        CHECK(nora_fake_pllcon(pll)->PLLSWEN == 0u);
+        CHECK(nora_fake_pllcon(pll)->FOUTSWEN == 0u);
+        CHECK(nora_fake_pllcon(pll)->DIVSWEN == 0u);
+    }
+
+    CHECK(nora_fake_oscctrl()->PLL2RDY == 1u);
+}
+
+/* --------------------------------------------------------------------------
+ * A PLL a consumer still holds: no-op if it already matches, refused if not
+ * --------------------------------------------------------------------------
+ * Clearing ON is a REQUEST, not a guarantee: DS70005591D 12.4.1 ORs it with every
+ * consumer's clock request, so a PLL something is still using does not stop.  And
+ * POSTDIV1/POSTDIV2 must not be changed while a PLL is operating (12.4.6.1 step
+ * 3b), which leaves exactly two honest answers, and this case pins both:
+ *
+ *   - asked for the operating point it is ALREADY locked on -> OK, having written
+ *     nothing.  Taking a clock something is using out of lock and putting it back
+ *     for no change would be a glitch, not a service.
+ *   - asked for a DIFFERENT operating point -> refused with every divider
+ *     untouched.  Writing them would be the 3b violation, on the clock of
+ *     whatever is holding the PLL.
+ *
+ * Neither state can be arranged on the bench, which is why the host model has to
+ * be able to hold a PLL on.
+ */
+static void case_held_pll_is_a_noop_or_refused(void)
+{
+    nora_clock_pll_config_t cfg;
+    uint32_t fbdiv, pre, post1, post2;
+    uint32_t on_clears, switches;
+
+    nora_fake_clock_reset();
+
+    /* Get it genuinely locked on an operating point first, by the normal path --
+     * rather than hand-writing divider values, which would only assert what this
+     * test guessed the solver picks. */
+    cfg.source = NORA_CLOCK_SOURCE_FRC;
+    cfg.input_hz = 0u;
+    cfg.target_hz = 320000000u;
+    CHECK(nora_clock_pll_configure(NORA_CLOCK_PLL_2, &cfg, NULL) ==
+        NORA_CLOCK_OK);
+
+    fbdiv = nora_fake_plldiv(2u)->PLLFBDIV;
+    pre = nora_fake_plldiv(2u)->PLLPRE;
+    post1 = nora_fake_plldiv(2u)->POSTDIV1;
+    post2 = nora_fake_plldiv(2u)->POSTDIV2;
+    on_clears = nora_fake_pll_on_clears(2u);
+    switches = nora_fake_pll_source_switches(2u);
+
+    /* Now a consumer starts using it, so ON = 0 stops being effective. */
+    nora_fake_pll_set_request_held(2u, 1u);
+
+    /* --- asked for what it already has: OK, and nothing was disturbed --- */
+    CHECK(nora_clock_pll_configure(NORA_CLOCK_PLL_2, &cfg, NULL) ==
+        NORA_CLOCK_OK);
+    CHECK(nora_clock_last_diag() == 0u);
+    CHECK(nora_clock_source_hz(NORA_CLOCK_SOURCE_PLL_2) == 320000000u);
+
+    /* Idempotent: not taken out of lock, and no switch commanded. */
+    CHECK(nora_fake_pll_on_clears(2u) == on_clears);
+    CHECK(nora_fake_pll_source_switches(2u) == switches);
+    CHECK(nora_fake_pllcon(2u)->ON == 1u);
+    CHECK(nora_fake_pllcon(2u)->CLKRDY == 1u);
+    CHECK(nora_fake_oscctrl()->PLL2RDY == 1u);
+
+    /* --- asked for something else: refused, dividers untouched --- */
+    cfg.target_hz = 200000000u;
+    CHECK(nora_clock_pll_configure(NORA_CLOCK_PLL_2, &cfg, NULL) ==
+        NORA_CLOCK_ERR_TIMEOUT);
+    CHECK(nora_clock_last_diag() ==
+        (uint16_t)NORA_CLOCK_DSPIC33AK_DIAG_PLL_STOP_REFUSED);
+
+    /* THE point of the case: no divider was written to a running PLL. */
+    CHECK(nora_fake_plldiv(2u)->PLLFBDIV == fbdiv);
+    CHECK(nora_fake_plldiv(2u)->PLLPRE == pre);
+    CHECK(nora_fake_plldiv(2u)->POSTDIV1 == post1);
+    CHECK(nora_fake_plldiv(2u)->POSTDIV2 == post2);
+
+    /* The consumer's clock is untouched, and the refusal left no pending stop
+     * request behind to fire when that consumer lets go. */
+    CHECK(nora_fake_pllcon(2u)->ON == 1u);
+    CHECK(nora_fake_pllcon(2u)->COSC == NORA_FAKE_NOSC_FRC);
+    CHECK(nora_fake_pll_source_switches(2u) == switches);
+    CHECK(nora_clock_source_hz(NORA_CLOCK_SOURCE_PLL_2) == 320000000u);
+
+    nora_fake_pll_set_request_held(2u, 0u);
+}
+
+/* --------------------------------------------------------------------------
+ * A switch that completes without taking is not accepted as a lock
+ * --------------------------------------------------------------------------
+ * OSWEN clearing says the request finished.  It does not say the requested source
+ * is the one now selected, and a PLL that stayed on its old source goes on
+ * reporting lock the whole time -- so "it is ready" is not evidence.  Every
+ * frequency the caller derives from this PLL would be silently wrong.
+ *
+ * This is the case the closing poll's COSC test exists for, and the one a driver
+ * that waited only for OSCCTRL's lock bit would report OK on.
+ */
+static void case_pll_switch_that_does_not_take_is_refused(void)
+{
+    nora_clock_pll_config_t cfg;
+
+    nora_fake_clock_reset();
+    nora_fake_pll_set_switch_refused(2u, 1u);
+
+    cfg.source = NORA_CLOCK_SOURCE_FRC;
+    cfg.input_hz = 0u;
+    cfg.target_hz = 320000000u;
+    CHECK(nora_clock_pll_configure(NORA_CLOCK_PLL_2, &cfg, NULL) ==
+        NORA_CLOCK_ERR_TIMEOUT);
+    CHECK(nora_clock_last_diag() ==
+        (uint16_t)NORA_CLOCK_DSPIC33AK_DIAG_PLL_LOCK_TIMEOUT);
+
+    /* The lock indications were standing the whole time -- which is exactly why
+     * they are not what the sequence trusts. */
+    CHECK(nora_fake_oscctrl()->PLL2RDY == 1u);
+    CHECK(nora_fake_pllcon(2u)->CLKRDY == 1u);
+    CHECK(nora_fake_pllcon(2u)->COSC != NORA_FAKE_NOSC_FRC);
+
+    /* And no frequency was published for a PLL that is not on the asked-for
+     * source. */
+    CHECK(nora_clock_source_hz(NORA_CLOCK_SOURCE_PLL_2) != 320000000u);
+
+    nora_fake_pll_set_switch_refused(2u, 0u);
+}
+
+/* --------------------------------------------------------------------------
+ * A PLL held up ONLY by a consumer is adopted, not reprogrammed
+ * --------------------------------------------------------------------------
+ * The ON bit and the enable are different things: DS70005591D 12.4.1 ORs ON with
+ * every consumer's clock request, so a PLL can be locked on exactly the wanted
+ * settings while ON reads 0, because a peripheral is the only thing keeping it up.
+ *
+ * The right answer is to take a hold of it and stop there.  Reprogramming would
+ * glitch a clock already in use for no change, and doing nothing would leave the
+ * caller owning a clock that disappears the moment that consumer releases it.
+ */
+static void case_consumer_held_pll_is_adopted(void)
+{
+    nora_clock_pll_config_t cfg;
+    uint32_t fbdiv, pre, post1, post2;
+    uint32_t on_clears, switches;
+
+    nora_fake_clock_reset();
+
+    /* Locked on an operating point by the normal path, so the divider values are
+     * the solver's and not this test's guess. */
+    cfg.source = NORA_CLOCK_SOURCE_FRC;
+    cfg.input_hz = 0u;
+    cfg.target_hz = 320000000u;
+    CHECK(nora_clock_pll_configure(NORA_CLOCK_PLL_2, &cfg, NULL) ==
+        NORA_CLOCK_OK);
+
+    fbdiv = nora_fake_plldiv(2u)->PLLFBDIV;
+    pre = nora_fake_plldiv(2u)->PLLPRE;
+    post1 = nora_fake_plldiv(2u)->POSTDIV1;
+    post2 = nora_fake_plldiv(2u)->POSTDIV2;
+
+    /* A consumer takes it over and software drops its own ON.  The block keeps
+     * running on the consumer's request alone, which is the state under test. */
+    nora_fake_pll_set_request_held(2u, 1u);
+    nora_fake_pllcon(2u)->ON = 0u;
+
+    CHECK(nora_fake_pllcon(2u)->ON == 0u);          /* the bit holds what was written */
+    CHECK(nora_fake_oscctrl()->PLL2RDY == 1u);      /* and it never stopped */
+    CHECK(nora_fake_pllcon(2u)->CLKRDY == 1u);
+
+    on_clears = nora_fake_pll_on_clears(2u);
+    switches = nora_fake_pll_source_switches(2u);
+
+    /* Asked for the settings it is already locked on. */
+    CHECK(nora_clock_pll_configure(NORA_CLOCK_PLL_2, &cfg, NULL) ==
+        NORA_CLOCK_OK);
+    CHECK(nora_clock_last_diag() == 0u);
+    CHECK(nora_clock_source_hz(NORA_CLOCK_SOURCE_PLL_2) == 320000000u);
+
+    /* ON is now set -- the HAL holds it too -- and nothing else moved. */
+    CHECK(nora_fake_pllcon(2u)->ON == 1u);
+    CHECK(nora_fake_pll_on_clears(2u) == on_clears);
+    CHECK(nora_fake_pll_source_switches(2u) == switches);
+    CHECK(nora_fake_pllcon(2u)->COSC == NORA_FAKE_NOSC_FRC);
+    CHECK(nora_fake_plldiv(2u)->PLLFBDIV == fbdiv);
+    CHECK(nora_fake_plldiv(2u)->PLLPRE == pre);
+    CHECK(nora_fake_plldiv(2u)->POSTDIV1 == post1);
+    CHECK(nora_fake_plldiv(2u)->POSTDIV2 == post2);
+
+    /* The point of adopting it: the consumer letting go no longer stops the PLL. */
+    nora_fake_pll_set_request_held(2u, 0u);
+    CHECK(nora_fake_oscctrl()->PLL2RDY == 1u);
+    CHECK(nora_fake_pllcon(2u)->CLKRDY == 1u);
+    CHECK(nora_clock_source_hz(NORA_CLOCK_SOURCE_PLL_2) == 320000000u);
+}
+
 int main(void)
 {
     case_contract_numbering();
@@ -963,6 +1196,10 @@ int main(void)
     case_system_generator_is_never_stopped();
     case_raw_capture_wiring();
     case_argument_validation();
+    case_both_plls_take_the_same_sequence();
+    case_held_pll_is_a_noop_or_refused();
+    case_consumer_held_pll_is_adopted();
+    case_pll_switch_that_does_not_take_is_refused();
 
     if (s_failures != 0) {
         (void)printf("nora_clock contract tests: %d FAILURE(S)\n", s_failures);

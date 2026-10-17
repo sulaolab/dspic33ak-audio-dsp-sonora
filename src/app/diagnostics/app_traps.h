@@ -102,6 +102,17 @@ extern "C" {
 #define APP_RCOUNT_PROBE  APP_TRAP_TEST_CMDS
 #endif
 
+/*
+ * DIAGNOSTIC ONLY, default 0: record MODCON / YMODSRT / YMODEND and the next three stack words
+ * below the trap frame ([sp-16] = outer stacked PC, [sp-20] = outer stacked SR, [sp-24]) in the
+ * trap latch, and print them on the next boot.  The latch region is full (80 B, fixed), so these
+ * overwrite six fields that read constant on every recorded STACK ERROR (INTCON3/4/5, FEX2,
+ * PCHOLD, VFA) -- no RAM moves, which is the point: the layout is what is under test.
+ */
+#ifndef APP_TRAP_DIAG_FRAME
+#define APP_TRAP_DIAG_FRAME  0
+#endif
+
 #ifndef APP_STACK_WATERMARK
 #define APP_STACK_WATERMARK  APP_TRAP_TEST_CMDS
 #endif
@@ -148,7 +159,13 @@ typedef struct
     uint32_t         pctrap;
     uint32_t         fex;
     uint32_t         fex2;
-    uint32_t         pchold;
+    /*
+     * BMXCPUERR (AK512) or BMXICDERR (AK128) is the raw bus-matrix error
+     * status. It replaces PCHOLD in schema 4: PCHOLD is emulation-only state,
+     * whereas this register distinguishes target/transaction failures that
+     * otherwise leave a BUS ERROR with no actionable source.
+     */
+    uint32_t         bmx_cpu_err;
     uint32_t         vfa;
     uint32_t         splim;
     uint32_t         rcon;

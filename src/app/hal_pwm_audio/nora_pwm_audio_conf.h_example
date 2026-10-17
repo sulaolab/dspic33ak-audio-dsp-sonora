@@ -1,0 +1,40 @@
+#ifndef NORA_PWM_AUDIO_CONF_H
+#define NORA_PWM_AUDIO_CONF_H
+
+/*
+ * nora_pwm_audio_conf.h_example -- PROJECT CONFIG template for hal_pwm_audio.
+ *
+ * Copy to the project as nora_pwm_audio_conf.h, keep it outside this folder,
+ * put it on the include path. The HAL reads only the macros below; it never
+ * reads application configuration. A project conf.h may derive them from its
+ * own build config.
+ */
+
+/* 0 compiles nora_pwm_audio.c to nothing, so the core adds no ROM or RAM.
+ * nora_pwm_audio_modulator.c is not gated: it has no state, and a linker
+ * that removes unreferenced functions drops it when nothing calls it. */
+#ifndef NORA_PWM_AUDIO_ENABLE
+#define NORA_PWM_AUDIO_ENABLE 1
+#endif
+
+/* The one rate and block length the built board accepts (v1: 48 kHz / 32). */
+#define NORA_PWM_AUDIO_SAMPLE_RATE_HZ   48000u
+#define NORA_PWM_AUDIO_FRAMES_PER_BLOCK 32u
+
+/* Channels the built board can drive: 1 (L) or 2 (L/R). */
+#define NORA_PWM_AUDIO_MAX_CHANNELS 1u
+
+/* Whole audio blocks the FIFO holds between write() and the DMA refill. One
+ * slot always stays empty, so N slots buffer N-1 blocks. */
+#define NORA_PWM_AUDIO_FIFO_BLOCKS 4u
+
+/* Blocks that must be queued before the first refill after start() or an
+ * underrun takes data; until then the output stays neutral. Absorbs the
+ * phase between the producer and the PWM refill. */
+#define NORA_PWM_AUDIO_PRIME_BLOCKS 2u
+
+/* Storage type of one duty value in the backend's unit; wide enough for the
+ * backend's period. */
+#define NORA_PWM_AUDIO_DUTY_T uint16_t
+
+#endif /* NORA_PWM_AUDIO_CONF_H */

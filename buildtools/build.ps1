@@ -41,7 +41,12 @@ param(
     #   -AsDefine APP_ASRC_REPEAT_IRQ_INHIBIT_AB=1
     # A bare NAME is given the value 1, because `--defsym NAME` alone is a
     # syntax error, unlike -D. Same one-shot semantics as -Define: nothing stored.
-    [string[]]$AsDefine
+    [string[]]$AsDefine,
+    # Extra compiler options for this build only, appended to MP_EXTRA_CC_PRE after the
+    # -D list. Restricted to -merrata=<names> (silicon-errata A/B, e.g. A1 item 22
+    # -merrata=base_offset) so it cannot be used to change the layout-defining flags.
+    #   -CcFlag -merrata=base_offset
+    [string[]]$CcFlag
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1399,9 +1404,23 @@ $explicitFull = $Full
 $needsRegenerate = $false
 
 $builtAppBuild = Get-SonoraBuiltPreset -ProjectDir $projectDir -Configuration $Configuration
+# One-shot C/assembler defines change object contents even when APP_BUILD is
+# unchanged. Record them separately so delivery metadata keeps the profile name.
+$overrideStamp = Join-Path $projectDir "build/$Configuration/production/.sonora_build_overrides"
+$overrideIdentity = ConvertTo-Json -Compress -InputObject ([ordered]@{
+    c = @($Define | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    assembly = @($AsDefine | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+})
+$builtOverrides = if (Test-Path -LiteralPath $overrideStamp) {
+    (Get-Content -LiteralPath $overrideStamp -Raw).Trim()
+} else { $null }
 if (-not ($Full -or $Clean -or $Generate) -and
     (Test-SonoraConfigurationHasObjects -ProjectDir $projectDir -Configuration $Configuration)) {
     $promoteReasons = @()
+
+    if ($builtOverrides -ne $overrideIdentity) {
+        $promoteReasons += 'C/assembler build overrides changed or are unknown'
+    }
 
     # configurations.xml owns the per-configuration macros and source manifest, and
     # the generated makefile is only a snapshot of it. If the project has moved on
@@ -1529,7 +1548,9 @@ try {
 
     # Git revision of this build, injected the same way as APP_SRC_DIRNAME: a BARE TOKEN
     # stringified in C for the boot banner ("Commit:"). No option needed -- every build stamps
-    # it automatically. A dirty working tree becomes "<hash>_dirty"; when Git is unavailable the
+    # it automatically. Any working-tree change becomes "<hash>_dirty", untracked files included,
+    # EXCEPT untracked files under _ai_out/ (run output and logs, never a build input), so a log
+    # written there cannot mislabel an image built from an unmodified commit. When Git is unavailable the
     # token is "unknown". Sanitized to [A-Za-z0-9_] so it is always a valid single C token
     # (main.c has an #ifndef fallback of "(unknown)" for IDE-direct builds that skip this script).
     $gitRevision = 'unknown'
@@ -1546,10 +1567,26 @@ try {
         } else { '' }
         if ($commitOk -and -not [string]::IsNullOrWhiteSpace($commit)) {
             $gitRevision = $commit
+            $generatedTrackedFiles = @(
+                'dspic33ak_audio_dsp.X/nbproject/Makefile-variables.mk',
+                'dspic33ak_audio_dsp.X/nbproject/project.xml'
+            )
             $statusRaw = & $gitCmd.Source -C $repoRoot status --porcelain --untracked-files=normal 2>$null
             $statusOk  = ($LASTEXITCODE -eq 0)
             if ($statusOk) {
-                $dirty = @($statusRaw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                $dirty = @($statusRaw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notlike '?? _ai_out/*' })
+                # The makefile generator step above rewrites these two tracked files on every
+                # -Full build, changing only whitespace/EOL.  That is this script's own output,
+                # not a source change, so a whitespace-only diff there does not mark the build
+                # dirty.  Any real edit to them still does (git diff -w exits 1).
+                $dirty = @($dirty | Where-Object {
+                    $rel = $_.Substring(3).Trim()
+                    if ($_.StartsWith(' M') -and ($rel -in $generatedTrackedFiles)) {
+                        & $gitCmd.Source -C $repoRoot diff -w --quiet HEAD -- $rel 2>$null
+                        return ($LASTEXITCODE -ne 0)
+                    }
+                    return $true
+                })
                 if ($dirty.Count -gt 0) {
                     $gitRevision += '_dirty'
                 }
@@ -1601,6 +1638,16 @@ try {
             $extraDefines += "-D$token"
             Write-Host "Extra define: -D$token"
         }
+    }
+
+    foreach ($c in @($CcFlag)) {
+        if ([string]::IsNullOrWhiteSpace($c)) { continue }
+        $token = $c.Trim()
+        if ($token -notmatch '^(-merrata=[a-z_]+(,[a-z_]+)*|-fstack-usage)$') {
+            throw "-CcFlag '$c' is not accepted (only -merrata=<name>[,<name>...] or -fstack-usage)."
+        }
+        $extraDefines += $token
+        Write-Host "Extra compiler option: $token"
     }
 
     $extraCcPre = "MP_EXTRA_CC_PRE=$($extraDefines -join ' ')"
@@ -1796,6 +1843,7 @@ try {
     # it can be incremental (see the promotion block above) and flashauto.ps1 can
     # report which variation the HEX came from.
     Set-SonoraBuiltPreset -ProjectDir $projectDir -Configuration $Configuration -Value $appBuildIdentity
+    $overrideIdentity | Set-Content -LiteralPath $overrideStamp -Encoding utf8
 }
 finally {
     Pop-Location

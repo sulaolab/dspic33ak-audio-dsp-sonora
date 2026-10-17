@@ -269,6 +269,21 @@ static void dec_q31_st_note(const char *what, uint32_t den, uint8_t kase,
     s_q31_st_fail.want    = want;
 }
 
+/* ALWAYS INLINE, and that is a ROM decision rather than a speed one.
+ *
+ * This body used to be the tail of dec_q31_st_run() and was split out on 2026-09-14 so the
+ * composed chain's check could reuse it instead of copying the oracle.  Splitting it left the
+ * source identical and cost 3,644 B of program in the PRODUCTION (gate OFF) image: with a second
+ * function between the loop and asrc_decimator_q31_process_s24_left(), the compiler stopped
+ * inlining dec_q31_stage_run() into process() and emitted a constprop clone of process() as well
+ * (measured against dc40f09 -- +4,136 clone, +2,208 stage_run, -2,588 process).  Forcing the
+ * inline restores the single-function shape the size was measured on, so the reuse is a SOURCE
+ * property and not a code-layout change.  Cost in the prototype build: the body appears twice,
+ * once per caller, which is selftest code behind a gate. */
+static inline __attribute__((always_inline))
+bool dec_q31_st_run_armed(uint32_t note_den, uint8_t kase, uint8_t live_ch,
+                          uint32_t *ties);
+
 /* One chain x one case x one channel polarity.
  *
  * `live_ch` says which of the two source channels carries the signal; the other
@@ -307,7 +322,20 @@ static bool dec_q31_st_run(uint32_t den,
         dec_q31_st_note("init", note_den, kase, live_ch, 0u, 0u, 0u, 0, 0);
         return false;
     }
+    return dec_q31_st_run_armed(note_den, kase, live_ch, ties);
+}
 
+/* The same body against a chain that is ALREADY ARMED, so that a front end armed by some other
+ * entry point is checked by this oracle and not by a copy of it.
+ *
+ * Split out of dec_q31_st_run() on 2026-09-14 for the composed 44.1 -> 16 kHz chain, whose arm
+ * is asrc_decimator_q31_init_dec_then_lpf1to1() and not the divider dispatch.  Nothing about the
+ * check itself is chain-specific: dec_q31_st_ref_chain() already walks s_q31.stages, so the
+ * oracle follows whatever was armed.  `note_den` is only the label in the failure record. */
+static inline __attribute__((always_inline))
+bool dec_q31_st_run_armed(uint32_t note_den, uint8_t kase, uint8_t live_ch,
+                          uint32_t *ties)
+{
     dec_q31_st_ref_t ref;
     memset(&ref, 0, sizeof(ref));
 

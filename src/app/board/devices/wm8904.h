@@ -108,6 +108,13 @@ typedef enum
  */
 extern bool wm8904_init( uint8_t inst, bool master_cfg );
 extern bool wm8904_init_role( uint8_t inst, bool master_cfg, wm8904_role_t role );
+/*
+ * True when the most recent wm8904_init_role() on `inst` saw the write sequencer never start
+ * (trace code E54): the codec answered I2C but had no SYSCLK, so no MCLK reached it.
+ * init_role still returns true in that case (every register write verified), which is why a
+ * caller that wants to name the missing clock has to ask separately.
+ */
+extern bool wm8904_last_init_had_no_sysclk( uint8_t inst );
 extern void wm8904_shutdown( uint8_t inst );
 extern void wm8904_dump_reg( uint8_t inst );
 extern void wm8904_set_analog_output_mute( uint8_t inst, bool mute );

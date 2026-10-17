@@ -1,0 +1,61 @@
+#ifndef SONORA_MPQ6612A_BOARD_H
+#define SONORA_MPQ6612A_BOARD_H
+#include "app_specific_config_defs.h"
+
+/* PWM PCB: IN1=PWM, IN2=CS, nSLEEP=RST, nFAULT=INT, VISEN=AN.
+ * Board routing only; modulation/lifecycle stays in the common PWM driver. */
+#if defined(APP_TARGET_AK506) && APP_TARGET == APP_TARGET_AK506
+/* DS70005634 Fig. 1-3 / DS50002839B Fig. 3-1, Nano Base. */
+#if MPQ6612A_NANO_SLOT == 2
+#define MPQ6612A_IN1_RP 9u   /* RA8, PWM2 */
+#define MPQ6612A_IN2_RP 19u  /* RB2, CS2 */
+#define MPQ6612A_SLEEP_RP 42u /* RC9, RST2 */
+#define MPQ6612A_FAULT_RP 41u /* RC8, INT2 */
+#define MPQ6612A_VISEN_RP 18u /* RB1, AD2AN2; physical RP only */
+#else /* slot 3 */
+#define MPQ6612A_IN1_RP 23u  /* RB6, PWM3 */
+#define MPQ6612A_IN2_RP 25u  /* RB8, CS3 */
+#define MPQ6612A_SLEEP_RP 52u /* RD3, RST3 */
+#define MPQ6612A_FAULT_RP 51u /* RD2, INT3 */
+#define MPQ6612A_VISEN_RP 2u /* RA1, AD5AN1; physical RP only */
+#endif
+#else
+/* dsPIC33AK512MPS512 GP DIM + Curiosity Platform, MikroBUS B.
+ * DS70005563 DIM connector / DS70005562 platform. */
+#define MPQ6612A_B_IN1_RP 98u   /* RG1, DIM-P27 */
+#define MPQ6612A_B_IN2_RP 29u   /* RB12, DIM-P33 */
+#define MPQ6612A_B_SLEEP_RP 102u /* RG5, DIM-P31 */
+#define MPQ6612A_B_FAULT_RP 82u /* RF1, DIM-P25 */
+#define MPQ6612A_B_VISEN_RP 4u /* RA3, AD1AN2; physical RP only */
+/* Upper XPRO1/J17 + ATMBUSADAPTER_XPRO (DS50002671A Table 4-2).
+ * These five nets are independent of MikroBUS B and WM8904-A. */
+#define MPQ6612A_XPRO1_IN1_RP 21u  /* RB4, EXT7 PWM, DIM-P5 */
+#define MPQ6612A_XPRO1_IN2_RP 18u  /* RB1, EXT15 CS, DIM-P12 */
+#define MPQ6612A_XPRO1_SLEEP_RP 32u /* RB15, EXT5 RST, DIM-P9 */
+#define MPQ6612A_XPRO1_FAULT_RP 24u /* RB7, EXT9 INT, DIM-P1 */
+#define MPQ6612A_XPRO1_VISEN_RP 25u /* RB8, EXT3 AN, AD2AN4; physical RP only */
+
+/* Mono receives processed L on PG5/DMA4, whichever route is selected.
+ * With both enabled, B is primary L and XPRO1 is secondary R. */
+#if MPQ6612A_ENABLE_MIKROB
+#define MPQ6612A_IN1_RP MPQ6612A_B_IN1_RP
+#define MPQ6612A_IN2_RP MPQ6612A_B_IN2_RP
+#define MPQ6612A_SLEEP_RP MPQ6612A_B_SLEEP_RP
+#define MPQ6612A_FAULT_RP MPQ6612A_B_FAULT_RP
+#define MPQ6612A_VISEN_RP MPQ6612A_B_VISEN_RP
+#else
+#define MPQ6612A_IN1_RP MPQ6612A_XPRO1_IN1_RP
+#define MPQ6612A_IN2_RP MPQ6612A_XPRO1_IN2_RP
+#define MPQ6612A_SLEEP_RP MPQ6612A_XPRO1_SLEEP_RP
+#define MPQ6612A_FAULT_RP MPQ6612A_XPRO1_FAULT_RP
+#define MPQ6612A_VISEN_RP MPQ6612A_XPRO1_VISEN_RP
+#endif
+#if MPQ6612A_STEREO
+#define MPQ6612A_RIGHT_IN1_RP MPQ6612A_XPRO1_IN1_RP
+#define MPQ6612A_RIGHT_IN2_RP MPQ6612A_XPRO1_IN2_RP
+#define MPQ6612A_RIGHT_SLEEP_RP MPQ6612A_XPRO1_SLEEP_RP
+#define MPQ6612A_RIGHT_FAULT_RP MPQ6612A_XPRO1_FAULT_RP
+#define MPQ6612A_RIGHT_VISEN_RP MPQ6612A_XPRO1_VISEN_RP
+#endif
+#endif
+#endif

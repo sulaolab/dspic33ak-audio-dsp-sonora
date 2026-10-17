@@ -39,7 +39,15 @@ extern bool  app_biquad_coeff_csv_feed_char( uint8_t c );
 extern void  app_biquad_coeff_csv_task(void);
 extern bool  app_biquad_coeff_csv_is_receiving(void);
 
-extern void  app_biquad_coeff_csv_copy_to_active(
+/*
+ * Copy staged coefficients into the active table.
+ *
+ * Returns false if the underlying loader rejected the data (out-of-range shape,
+ * a non-finite value) -- the active table is then UNCHANGED, because the loader
+ * validates every value before writing any of them. The caller must not print
+ * success or run any "load completed" side effect when this returns false.
+ */
+extern bool  app_biquad_coeff_csv_copy_to_active(
         const float coeff[APPDBG_BIQUAD_CSV_STAGE_NUM][APPDBG_BIQUAD_CSV_COEFF_NUM][APPDBG_BIQUAD_CSV_CH_NUM],
         uint16_t stage_num,
         uint16_t coeff_num,

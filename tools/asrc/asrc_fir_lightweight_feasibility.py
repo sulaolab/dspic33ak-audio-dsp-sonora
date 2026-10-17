@@ -11,13 +11,13 @@ TWO PATH CONVENTIONS, both taken unchanged from the existing studies:
 
   poly23  a dedicated L=2 / M=3 polyphase front end (this is what N97 is), followed by the
           unchanged generic ASRC at step 1.0.  The rear therefore sees a 32 kHz input and
-          its own prototype (M=30, fc = 0.465 of ITS input) lands at 14.88 kHz.  An input
+          its own prototype (M=30, fc = 0.464 of ITS input) lands at 14.848 kHz.  An input
           at f appears at BOTH f and 48000-f on the 96 kHz axis, each image folds into
           fold(., 32000), and the rear shapes the LANDING frequency.
 
   pre48   a prefilter running at 48 kHz on every input sample, followed by the unchanged
           generic ASRC at step ~1.5 (this is what Full-IIR is).  The rear sees a 48 kHz
-          input, so its fc lands at 22.3 kHz and it is flat across the whole wanted band.
+          input, so its fc lands at 22.272 kHz and it is flat across the whole wanted band.
           A source above 16 kHz lands at 32000-f and the rear shapes the SOURCE.
 
 That difference is not cosmetic and it decides this study, so it is measured, not argued.

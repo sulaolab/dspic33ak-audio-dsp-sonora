@@ -192,6 +192,9 @@ static const wm8904_rate_cfg_t s_wm8904_rates[] = {
 #define WM8904_INST_MAX     (4u)
 static uint32_t s_fs_hz[WM8904_INST_MAX] = { 48000u, 48000u, 48000u, 48000u };
 static bool s_io_ok[WM8904_INST_MAX] = { true, true, true, true };
+// Latched when the write sequencer never starts (E54) during the current wm8904_init_role():
+// the codec answers I2C but has no SYSCLK, i.e. no MCLK reached it. Cleared at each init_role.
+static bool s_wseq_never_started[WM8904_INST_MAX];
 
 // --- Declick research state (see [internal] manual_wm8904_mute_restart_declick.md) ---
 // One-shot restart-strategy bitmask consumed by the next (re)configure. 0 == baseline.
@@ -462,6 +465,7 @@ bool wm8904_init_role( uint8_t inst, bool master_cfg, wm8904_role_t role )
     }
 
     s_io_ok[inst] = true;
+    s_wseq_never_started[inst] = false;
 
     if( wm8904_confirm_device_id(inst) )
     {
@@ -508,6 +512,11 @@ bool wm8904_init_role( uint8_t inst, bool master_cfg, wm8904_role_t role )
     WM8904_REPORT_MODE(inst, master_cfg, role);
     TRACE_V("\n");
     return s_io_ok[inst];
+}
+
+bool wm8904_last_init_had_no_sysclk( uint8_t inst )
+{
+    return ( inst < WM8904_INST_MAX ) && s_wseq_never_started[inst];
 }
 
 /* Historical signature: ADC+DAC at the instance's currently selected rate. */
@@ -1587,6 +1596,7 @@ static bool wm8904_wait_write_sequencer_done(uint8_t inst, uint32_t timeout_ms)
             // against instance 2's 294 ms on the same boot). Fail, so the caller falls back.
             if( !busy_seen )
             {
+                if( inst < WM8904_INST_MAX ) { s_wseq_never_started[inst] = true; }
                 WM8904_FAIL(WM8904_E_WSEQ_NEVER_STARTED, inst, data);
                 TRACE(" WM8904 WSEQ never started inst=%d R70=0x%04x %ld(ms)"
                       " -- no SYSCLK on this codec?\n",

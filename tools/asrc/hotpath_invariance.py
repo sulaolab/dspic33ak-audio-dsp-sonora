@@ -66,8 +66,10 @@ def default_git_commit(repo_root):
     rc, commit = run(["rev-parse", "--short=7", "HEAD"])
     if rc != 0 or not commit:
         return "unknown"
+    # Same rule as build.ps1: untracked files count, except run output under _ai_out/.
     rc, status = run(["status", "--porcelain", "--untracked-files=normal"])
-    if rc == 0 and status.strip():
+    changed = [l for l in status.splitlines() if l.strip() and not l.startswith("?? _ai_out/")]
+    if rc == 0 and changed:
         commit += "_dirty"
     return re.sub(r"[^A-Za-z0-9_]", "_", commit)
 

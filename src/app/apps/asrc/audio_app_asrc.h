@@ -73,11 +73,32 @@ uint32_t audio_app_asrc_intermediate_underrun_count_ba( void );
 #endif
 
 #if APP_ASRC_MEAS
+/*
+ * P1 rate/re-arm timing telemetry.
+ *
+ * `audio_app_asrc_p1_begin()` establishes t=0 when an accepted rate/re-arm
+ * command is received, and snapshots the requested A/B rate pair.  The engine
+ * then records the first valid feed-forward ratio, the first control-ready
+ * point, and the first quality-ready point where the internal step trend
+ * reaches its specified floor band.  `audio_app_asrc_p1_status()` prints
+ * machine-readable `*MEAS p1*` lines for `?as`; they identify both the timing
+ * result and the sample-rate conversion it belongs to, without waiting for
+ * periodic TDM telemetry.
+ *
+ * control_ready means the existing Q50 fill-centre/slope/no-clamp detector has
+ * held for its defined window. quality_ready is a later firmware-only event:
+ * |strend| has entered the fixed fine-convergence band. Neither event depends
+ * on host command latency or a fixed host-side dwell.
+ */
+void     audio_app_asrc_p1_begin( uint32_t rate_a_hz, uint32_t rate_b_hz );
+void     audio_app_asrc_p1_reject( void );
+void     audio_app_asrc_p1_status( void );
 // Bench (measurement): freeze the A->B step to a constant (loop open) / restore normal control.
 void audio_app_asrc_freeze( void );
-// Bench: freeze exactly at the live feed-forward ratio and re-centre the FIFO.
+// Bench: freeze at the live feed-forward ratio and re-centre at the next consumer pull.
 // This isolates direct large-ratio kernel behavior without waiting for servo convergence.
-void audio_app_asrc_freeze_ratio_ab( void );
+// True only after the consumer has applied it; false for invalid/stopped transport.
+bool audio_app_asrc_freeze_ratio_ab( void );
 void audio_app_asrc_unfreeze( void );
 // Bench: the frozen A->B resample step (input samples per output sample). 0 if not frozen.
 // The MEAS harness uses it to synthesize an OUTPUT-bin-coherent input tone (Mode K).
@@ -85,6 +106,8 @@ float audio_app_asrc_get_freeze_step_ab( void );
 // R12 Q12: intentional FEED-FORWARD ratio freeze (NOT Mode-K). Latch the live ratio and make the
 // controller use it, while corr_lpf/clamp/slew/applied-step stay live (a->ratio keeps updating).
 void    audio_app_asrc_ff_freeze( void );
+// Hi-Fi axis D: FF held at live ratio x (1 + ppm*1e-6); fill servo live (tracking test).
+void    audio_app_asrc_ff_freeze_offset( int8_t ppm );
 void    audio_app_asrc_ff_unfreeze( void );
 float   audio_app_asrc_get_ff_frozen_ratio_ab( void );
 uint8_t audio_app_asrc_get_ff_freeze_ab( void );
@@ -95,11 +118,26 @@ uint8_t audio_app_asrc_get_corr_hold_ab( void );
 // R14 Q14: select N=64 moving-average fill vs raw fill for the servo observation path.
 void    audio_app_asrc_fill_use_ma( uint8_t on );
 uint8_t audio_app_asrc_get_fill_use_ma_ab( void );
-void    audio_app_asrc_cfill_en( uint8_t on );      // Q40: continuous-fill estimator toggle (MEAS)
+void    audio_app_asrc_cfill_en( uint8_t on );      // continuous-fill estimator toggle (MEAS)
 uint8_t audio_app_asrc_get_cfill_en( void );
-void    audio_app_asrc_pc_auto( uint8_t on );       // Q41: automatic phase-centering toggle (MEAS)
-void    audio_app_asrc_pc_status( void );           // Q41/Q42: print cfill/phase-center/period status
-void    audio_app_asrc_hf_en( uint8_t on );         // Q42: measured-producer-period phase toggle (MEAS)
+// Bench A/B: include the consumer's fractional read position in continuous FIFO occupancy.
+void    audio_app_asrc_cfill_consumer_phase_en( uint8_t on );
+// P0 step 5 (MEAS): observe the continuous fill at leg B's hardware instant (*af08, default OFF).
+void    audio_app_asrc_cfill_hw_instant_en( uint8_t on );
+uint8_t audio_app_asrc_get_cfill_hw_instant_en( void );
+// P0 Step 7 (MEAS): bias the stage-2 FF ratio by N x 0.1 ppm at the handover (0 at boot).
+void    audio_app_asrc_p0_ff_bias_set( int8_t tenths_ppm );
+int8_t  audio_app_asrc_p0_ff_bias_get( void );
+uint8_t audio_app_asrc_get_cfill_consumer_phase_en( void );
+void    audio_app_asrc_cfill_status( void );         // per-engine effective producer estimate
+// P0 kick log (MEAS Q31): per-pull fill observation + applied step across one capture.
+void    audio_app_asrc_p0k_capture_arm( void );
+void    audio_app_asrc_p0k_capture_first( void );
+void    audio_app_asrc_p0k_capture_done( void );
+void    audio_app_asrc_p0k_dump( void );
+#if APP_ASRC_MEAS && ASRC_SAMPLE_Q31
+extern volatile uint32_t s_p0k_legb_isr_tick;   /* P0 kick log: leg-B RX callback entry tick */
+#endif
 float   audio_app_asrc_get_fill_ma_ab( void );
 // R15 Q15: corr_lpf 1 Hz band-split motion selector: 0=FULL,1=SLOW-motion,2=FAST-motion,3=HOLD.
 void    audio_app_asrc_corr_mode( uint8_t mode );
@@ -121,6 +159,11 @@ float    audio_app_asrc_get_freeze_base_step_ab( void );
 int      audio_app_asrc_get_step_delta_mode( void );
 int32_t  audio_app_asrc_get_step_delta_req( void );
 uint32_t audio_app_asrc_get_fill_ab( void );
+// Capture provenance: fill sampled at the start of the most recent consumer pull, and the
+// ratio-aware target used by that same engine.  These are not interchangeable with get_fill_ab(),
+// which reads the live wr-rd value after the pull has advanced rd.
+uint32_t audio_app_asrc_get_fill_pull_start_ab( void );
+uint32_t audio_app_asrc_get_fill_target_ab( void );
 #if APP_B_ROUTE_USES_BA
 // B->A mirrors of the four A->B fields above, so a MEAS_DIR_BA capture reports the state of the
 // engine it actually measured rather than the other leg's (see the definitions). No step-delta
@@ -128,6 +171,8 @@ uint32_t audio_app_asrc_get_fill_ab( void );
 float    audio_app_asrc_get_freeze_base_step_ba( void );
 float    audio_app_asrc_get_freeze_step_ba( void );
 uint32_t audio_app_asrc_get_fill_ba( void );
+uint32_t audio_app_asrc_get_fill_pull_start_ba( void );
+uint32_t audio_app_asrc_get_fill_target_ba( void );
 float    audio_app_asrc_get_ratio_live_ba( void );
 float    audio_app_asrc_get_ff_frozen_ratio_ba( void );
 #endif
@@ -148,8 +193,8 @@ void     audio_app_asrc_inject( uint8_t en, uint8_t freq_hz, uint8_t amp_idx );
 uint8_t  audio_app_asrc_get_inject( void );
 float    audio_app_asrc_get_inject_amp( void );
 // Q30: bench sensitivity screen -- runtime multiplier on the servo gain KP (which=0) or the corr-LPF
-// coefficient ALPHA (which=1). code {0:x1, 1:x0.5, 2:x2.0}. Scales the MEAS servo path only (no
-// shipping/structure change). corr-LPF time constant ~= 1/ALPHA, so tau x0.5 == ALPHA x2 (code 2).
+// coefficient ALPHA (which=1). ALPHA codes 7/8/9 select x1/64, x1/256 and x1/1024 for settled-loop
+// quality diagnostics. Scales the MEAS servo path only (no shipping/structure change).
 void     audio_app_asrc_set_servo_mult( uint8_t which, uint8_t code );
 float    audio_app_asrc_get_kp_mult( void );
 float    audio_app_asrc_get_alpha_mult( void );
@@ -160,7 +205,7 @@ void     audio_app_asrc_q50_enable( uint8_t on );
 uint8_t  audio_app_asrc_q50_get_en( void );
 uint8_t  audio_app_asrc_q50_state( void );       // 0=ACQUIRE 1=HANDOVER 2=TRACK
 uint32_t audio_app_asrc_q50_lock_pulls( void );  // pulls from ratio-lock to TRACK (0 = not yet locked)
-float    audio_app_asrc_q50_pull_hz( void );
+float    audio_app_asrc_q50_pull_hz( void );      // pull rate of the APP_MEAS_DIR-selected consumer
 float    audio_app_asrc_q50_ho_stepdiff( void ); // applied-step seam at handover (want ~0 = bumpless)
 float    audio_app_asrc_q50_strend( void );      // live step-trend (slow-vslow EMA); calibrates STEP_TOL
 // Q51 Feed-Forward Rate Seed (layered on Q50 candidate): estimate the true rate from ACQUIRE-window
@@ -178,7 +223,8 @@ float    audio_app_asrc_q52_est_step( void );    // step_true = ratio0 + delta_f
 float    audio_app_asrc_q52_dfill( void );       // observed fill drift over the window (frames)
 float    audio_app_asrc_q52_ratio0( void );      // frozen FF ratio held over the window (debug)
 float    audio_app_asrc_q52_fill0( void );       // fill at window start (debug)
-// Q55 probe: raw producer/consumer counters + elapsed us_x10 (host computes fs_A(t) = delta_wr/delta_t).
+// Q55 probe: selected-direction producer/consumer counters + elapsed us_x10.
+// The host computes producer_fs(t) = delta_wr/delta_t.
 uint32_t audio_app_asrc_get_wr( void );
 uint32_t audio_app_asrc_get_rd( void );
 uint32_t audio_app_asrc_wrt_elapsed_us10( void );
@@ -191,6 +237,22 @@ void     audio_app_asrc_q58_cfg( uint8_t on, float center );  // Q58: block-phas
 uint8_t  audio_app_asrc_q58_get_en( void );
 float    audio_app_asrc_q58_last_phase( void );
 int16_t  audio_app_asrc_q58_last_off( void );
+#endif
+
+#if APP_ASRC_MEAS || APP_ASRC_QUIET_TRACK
+// P0 two-stage FF (clock control -> engine): arm it for the rate epoch, then hand each engine its
+// co-timed stage-2 ratio; the engine's next pull adopts it (and, in MEAS, gates QUALITY_READY).
+void    audio_app_asrc_p0_refine_arm( uint8_t on );
+void    audio_app_asrc_refine_ratio_ab( float ratio );
+#if APP_B_ROUTE_USES_BA
+void    audio_app_asrc_refine_ratio_ba( float ratio );
+#endif
+#endif
+#if APP_ASRC_QUIET_TRACK
+// P0 QUIET_TRACK: 0 = OFF, 1..4 = preset (boot = APP_P0T_DEFAULT_MODE); every engine enters after
+// its stage-2 handover (MEAS: the measured direction at QUALITY_READY).
+void    audio_app_asrc_quiet_track_set( uint8_t mode );
+uint8_t audio_app_asrc_quiet_track_get( void );
 #endif
 
 #if APP_ASRC_LOAD_TEST
@@ -215,6 +277,11 @@ uint32_t audio_app_asrc_q31_opt_fails( void );   /* boot bit-exactness selftest,
 void audio_app_asrc_set_ratio_ba( float ratio );
 void audio_app_asrc_push_ba( const int32_t* src );
 void audio_app_asrc_pull_ba( int32_t* dst );
+#if APP_ASRC_MEAS
+// BA producer stamp (MEAS): leg B's deferral measured at the top of its callback, high-res
+// ticks; the same callback's B->A push stamps its publication that much earlier (*af08 gates).
+void audio_app_asrc_p0_ba_prod_defer_note( int32_t defer_ticks );
+#endif
 #endif // APP_B_ROUTE_USES_BA
 
 // Can the engines serve this rate PAIR at all?  false = the ring cannot hold the burst

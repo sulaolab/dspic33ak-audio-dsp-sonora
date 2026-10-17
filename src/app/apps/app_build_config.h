@@ -115,10 +115,18 @@
  *
  * It differs from 96K_A_TO_B on every axis that moves the deadline, which is why it is
  * its own catalogue entry instead of a define set someone has to remember: ASRC_CH 12
- * (not 8), two engines, the Q31 sample path, the rear polyphase at M=28, the HB31
+ * (not 8), two engines, the Q31 sample path, the rear polyphase at M=30, the HB31
  * half-band pre-stage and the optimised Q31 row kernels.  asrc_app_build_config.h pins
- * all of them, so selecting this preset is the whole recipe -- no -Define, and no
- * -AsDefine either (asrc_fir_hb_kernel_dspic33ak.s no longer needs one).
+ * all of them EXCEPT M, which resolves to the global default 30 -- its preset pin was
+ * unreachable and has been removed, see that header's preset block and its build guard --
+ * so selecting this preset is the whole recipe: no -Define, and no -AsDefine either
+ * (asrc_fir_hb_kernel_dspic33ak.s no longer needs one).
+ *
+ * The third-band 96 -> 32 kHz front end is NOT part of the preset.  It is opted into with
+ * -Define APP_ASRC_THIRDBAND_96_TO_32=1, which COMPILES it; whether it is the front end
+ * actually filtering is a separate, runtime question (APP_ASRC_THIRDBAND_DEFAULT_ON, then
+ * `*av00`/`*av01`).  The banner below states the first and leaves the second to the runtime
+ * report, because only the runtime knows it.
  *
  * The ANALOG path is still one-way.  At 96 kHz the WM8904 cannot run ADC and DAC at
  * once, so leg A is ADC-only and leg B DAC-only exactly as in 96K_A_TO_B.  Two engines
@@ -132,8 +140,9 @@
  * the 32 kHz this preset boots at is outside what was measured. */
 #define APP_BUILD_ASRC_CODEC_96K_12CH_32K (25) /* tier: internal; artifact: asrc_96k_12ch_32k; display: ASRC Codec 96k 12ch to 32k */
 /* Values 19/20 were used only on the pre-main M28 research branch and are
- * intentionally not public presets.  Flip this internal compile-time switch
- * only while building the standard BIDIR or MEAS preset to reproduce it. */
+ * intentionally not public presets.  The switch remains defined only so
+ * stale -Define APP_ASRC_EXPERIMENTAL_M28=1 usage can fail with a clear
+ * retirement diagnostic. */
 #ifndef APP_ASRC_EXPERIMENTAL_M28
   #define APP_ASRC_EXPERIMENTAL_M28  (0)
 #endif
@@ -181,11 +190,11 @@
   #define APP_BUILD_DETAIL  "non-USB 96 kHz; co-clocked dual codec"
 #elif (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR)
   #define APP_BUILD_NAME    "APP_BUILD_ASRC_CODEC_BIDIR"
-  #if APP_ASRC_EXPERIMENTAL_M28
-    #define APP_BUILD_DETAIL  "ASRC EXPERIMENTAL M28 Kaiser-10.55 fc0.4632; bidirectional A<->B"
-  #else
-    #define APP_BUILD_DETAIL  "ASRC production M30 Kaiser-11 fc0.465; bidirectional A<->B; auto low-rate front-end; sparse LED meter; 10 s telemetry"
-  #endif
+  /* No APP_ASRC_EXPERIMENTAL_M28 branch here any more: the switch is retired for the whole
+   * AK512 M30 family (see asrc/asrc_app_build_config.h) and errors out before this banner
+   * text would matter, so a live #else here was already dead in practice and is now dead
+   * by construction too. */
+  #define APP_BUILD_DETAIL  "ASRC production M30 Kaiser-11 fc0.465; bidirectional A<->B; auto low-rate front-end; sparse LED meter; 10 s telemetry"
 #elif (APP_BUILD == APP_BUILD_ASRC_CODEC_A_B_ONLY)
   #define APP_BUILD_NAME    "APP_BUILD_ASRC_CODEC_A_B_ONLY"
   #define APP_BUILD_DETAIL  "ASRC; codec master; one-way A->B"
@@ -194,11 +203,8 @@
   #define APP_BUILD_DETAIL  "ASRC; codec master; one-way B->A"
 #elif (APP_BUILD == APP_BUILD_ASRC_CODEC_MEAS)
   #define APP_BUILD_NAME    "APP_BUILD_ASRC_CODEC_MEAS"
-  #if APP_ASRC_EXPERIMENTAL_M28
-    #define APP_BUILD_DETAIL  "ASRC EXPERIMENTAL M28 Kaiser-10.55 fc0.4632; one-way digital quality capture"
-  #else
-    #define APP_BUILD_DETAIL  "ASRC production M30 Kaiser-11 fc0.465; one-way digital quality capture"
-  #endif
+  /* Same retirement as APP_BUILD_ASRC_CODEC_BIDIR above -- no M28 branch left. */
+  #define APP_BUILD_DETAIL  "ASRC production M30 Kaiser-11 fc0.465; one-way digital quality capture"
 #elif (APP_BUILD == APP_BUILD_ASRC_DSPIC_BIDIR)
   #define APP_BUILD_NAME    "APP_BUILD_ASRC_DSPIC_BIDIR"
   #define APP_BUILD_DETAIL  "ASRC; dsPIC master; bidirectional A<->B"
@@ -237,7 +243,39 @@
   #define APP_BUILD_DETAIL  "ASRC AK128; TDM8 8ch A<->B; Codec-A/Codec-B master; Curiosity J3 DIM-Pxx U-jumpers"
 #elif (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K)
   #define APP_BUILD_NAME    "APP_BUILD_ASRC_CODEC_96K_12CH_32K"
-  #define APP_BUILD_DETAIL  "ASRC 96 kHz leg A -> 32 kHz leg B; 12 ch each way, two engines; Q31, rear M=28, HB31 pre-stage, opt Q31 kernels; Hard RT PASS with 5 % reserve FAIL (internal)"
+  /* Rear geometry says M=30 because that is what this preset has always BUILT: the
+   * preset-level pin on APP_ASRC_EXPERIMENTAL_M28 was unreachable (this file defaults
+   * the switch to 0 above and only includes the ASRC preset header further down), and
+   * the whole 2026-09-10 validation was taken on M30.  A boot banner is the one line a
+   * human reads to know what is running, so it states the resolved geometry, not an
+   * intent.  See the preset block in asrc/asrc_app_build_config.h and its build guard. */
+  /* THE BANNER IDENTIFIES THE BUILD, NOT THE RUNNING STATE, and the two are not the same
+   * thing here.  APP_ASRC_THIRDBAND_96_TO_32 says the third band is COMPILED IN; which front
+   * end is actually filtering is decided later by APP_ASRC_THIRDBAND_DEFAULT_ON and then by
+   * `*av00`/`*av01` at runtime, so a build with the stage compiled and DEFAULT_ON = 0 boots
+   * on the composed chain.  A banner that named an active front end would be lying in that
+   * perfectly legal configuration.  So it says "compiled" and stops there; the authority on
+   * what is running is the runtime report -- the `ASRC 96->32 front end:` selftest line and
+   * the leg telemetry's `fe=` field -- which reads the armed state itself.
+   *
+   * No measurement verdict either.  Response, margin and reserve depend on the front end
+   * armed, the build layout and the rate pair, so any fixed string is wrong for some image
+   * that carries it: the third band measures 5 % reserve PASS while the composed chain it
+   * replaces measures Hard RT FAIL in the same comparison, and both were once described by
+   * the same literal.  Identity here, numbers from the telemetry.
+   *
+   * `defined()` is the whole test at this point in the chain: apps/asrc/asrc_app_config.h --
+   * the header that defaults the switch to 0 -- is included long after this line, so the only
+   * thing that can be seen here is a command-line opt-in.  Pinning it in a header instead
+   * would make the banner silently wrong again, so asrc_app_validate.h compares the arm taken
+   * here against the resolved value once every fact is settled. */
+  #if defined(APP_ASRC_THIRDBAND_96_TO_32) && (APP_ASRC_THIRDBAND_96_TO_32)
+    #define APP_BUILD_DETAIL_THIRDBAND_COMPILED  (1)
+    #define APP_BUILD_DETAIL  "ASRC 96 kHz leg A -> 32 kHz leg B; 12 ch each way, two engines; Q31, rear M=30, HB31 pre-stage, opt Q31 kernels; third-band 96->32 front end COMPILED -- armed front end is reported at runtime (internal)"
+  #else
+    #define APP_BUILD_DETAIL_THIRDBAND_COMPILED  (0)
+    #define APP_BUILD_DETAIL  "ASRC 96 kHz leg A -> 32 kHz leg B; 12 ch each way, two engines; Q31, rear M=30, HB31 pre-stage, opt Q31 kernels; composed 96->32 front end, third band not compiled (internal)"
+  #endif
 #else
   /* The retired M28 research values 19/20 now fall inside the ASRC APP_BUILD
    * range, so an unnamed preset must fail loudly instead of building without

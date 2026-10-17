@@ -36,7 +36,7 @@ def mag(coeff, fs, f):
 
 
 print("host phase-worst oracle candidate")
-print("front end: %s CRC32 0x%08X (N=97 L=2/M=3)   rear: L=%d phases, fc=0.465" %
+print("front end: %s CRC32 0x%08X (N=97 L=2/M=3)   rear: L=%d phases, fc=0.464" %
       (g.INC.name, crc, L))
 print()
 print("%7s %8s %10s %10s %10s %10s %8s  %s"

@@ -46,41 +46,310 @@ def direct_fifo_burst_fits(step: float) -> bool:
 
 # --- the *ar pair gate, as audio_app_asrc.c implements it (AK512: FIFO 128, BLOCK 16) ----------
 #
-# Mirrors asrc_burst_ratio_fits() and asrc_fill_slack_fits() in integers, so the routing table
-# below is checked against the SAME arithmetic the firmware refuses pairs with, rather than against
-# a comment.  Written when 96 k -> 22.05 kHz was admitted (2026-09-02): that pair is the one the
-# soft bound rejects on the direct path, and the whole point of its composed /4 row is to move it.
+# Mirrors asrc_burst_ratio_fits() and asrc_fill_slack_fits()/asrc_fill_law() in integers, so the
+# routing table below is checked against the SAME arithmetic the firmware refuses pairs with, rather
+# than against a comment.
+#
+# THE SOFT BOUND CHANGED ON 2026-09-12 (A1, the lower-side producer-block reserve).  It used to be
+#   R        = floor(step*(BLOCK-1)) + AHEAD + 1
+#   set      = clamp(R + JITTER, TARGET, TARGET_MAX)
+#   accepted = set > R and (set-R >= 8 or fs_in*(BLOCK-1) % fs_out == 0)   # exact-step exemption
+# and the 8 was measured on 48 <-> 44.1 kHz, whose 147/160 ratio gives 160 block-phase classes, i.e.
+# the DENSE limit BLOCK/2.  A pair on a low-order rational loses a whole producer BLOCK instead, so
+# 32 -> 12 kHz (8/3) starved on it; the exemption made it worse by waving through exactly the q = 1
+# pairs, which are the deepest case.  See asrc_fill_law() and
+# [internal] ak512_32to12_starve_analysis_2026-09-11.md.
 GATE_AHEAD = 15            # ASRC_POLY_AHEAD
-GATE_JITTER = 4            # ASRC_FILL_JITTER
+GATE_JITTER = 4            # ASRC_FILL_JITTER -- UPPER bound only since 2026-09-12
 GATE_TARGET = 64           # ASRC_FILL_TARGET  = ASRC_FIFO_FRAMES / 2
 GATE_TARGET_MAX = 104      # ASRC_FIFO_FRAMES - 4 - APP_BLOCK_FRAMES - ASRC_FILL_JITTER
-GATE_SLACK_REQUIRED = 8    # ASRC_FILL_SLACK_REQUIRED (measured, 100 pairs)
+GATE_RESERVE = BLOCK_FRAMES + 1   # ASRC_FILL_BLOCK_RESERVE: one producer block + 1
 GATE_BURST_NUM = 128 - 4 - GATE_AHEAD   # ASRC_BURST_RATIO_LIMIT_NUM
 GATE_BURST_DEN = BLOCK_FRAMES - 1       # ASRC_BURST_RATIO_LIMIT_DEN
 
 
-def gate_accepts(fs_in_hz: int, num: int, den: int, fs_out_hz: int) -> tuple[bool, str]:
-    """(accepted, why) for one direction, exactly as the two C predicates decide it."""
+def fill_law(fs_in_hz: int, num: int, den: int, fs_out_hz: int) -> tuple[int, int, int, int, bool]:
+    """(look_safe, r_safe, set_required, set, fits) -- asrc_fill_law(), integer for integer.
+
+    floor(nominal)+1 is ceil() where the product is fractional and ceil+1 where it is an integer,
+    which is the frame the servo's upward trim needs.  No step <= 1 shortcut: an up-conversion needs
+    the producer-block reserve too, and the expression already collapses for it.
+    """
+    eff_num = fs_in_hz * num
+    eff_den = den * fs_out_hz
+    look_safe = (eff_num * (BLOCK_FRAMES - 1)) // eff_den + 1
+    r_safe = look_safe + GATE_AHEAD + 1
+    set_required = r_safe + GATE_RESERVE
+    setpoint = max(set_required, GATE_TARGET)
+    return look_safe, r_safe, set_required, setpoint, setpoint <= GATE_TARGET_MAX
+
+
+# The DIRECT-ROUTE ANTI-ALIAS POLICY (audio_app_asrc.c s_asrc_unsafe_direct_routes[]).
+#
+# Not a safety rule and no longer a temporary one.  Two independent facts are asserted about this
+# same table below, and keeping them separate is the point:
+#
+#   HISTORY   it is exactly the set A1 newly admitted -- checked against a re-derivation of the
+#             pre-A1 accepted set (legacy_gate_accepts below), so the table cannot drift.
+#   REASON    the DIRECT route of each of these pairs reads a worst in-band unwanted component of
+#             0.00 dBc on host (tools/asrc/asrc_direct_route_policy_matrix.py, 2026-09-15), so it
+#             is refused for a reason that does not expire when step > 2.07 is qualified.
+#
+# And the object refused is a ROUTE, not a physical pair: check_direct_route_policy() asserts both
+# directions of that for every entry.
+FENCE_UNQUALIFIED_DIRECT = frozenset({
+    (22050, 8000), (32000, 11025), (44100, 12000),
+    (44100, 16000), (48000, 11025), (96000, 22050),
+})
+
+# The FILTERED route each of those physical pairs has in this tree, as (num, den) exactly as
+# asrc_audio_path_frontend_plan() publishes it, or None when the pair has no front-end row at all.
+# A pair with no row is not a hole in the policy -- it is a pair whose only route today is the one
+# the policy refuses, which is what makes "physical pair != route" worth asserting per entry.
+FILTERED_ROUTE = {
+    # UPDATED 2026-09-19/20 as each row landed.  Three entries that read None until then now name a
+    # route, and that is a DELIBERATE WIDENING of the accepted pair set -- stated here as a
+    # specification rather than absorbed silently.  What did NOT change is the direct-route table
+    # above: every one of these pairs is still refused on its DIRECT route, and each row is exempt
+    # because a filtered route is a different (num, den).  check_optin_pair_gates() asserts, per row
+    # and for the union, exactly which ordered cells each one adds.
+    (22050, 8000): (1, 2),               # /2 + 1:1@11.025k, APP_ASRC_ANTIALIAS_22K05_TO_8K (PR #36)
+    (32000, 11025): (1, 2),              # /2 + 1:1@16k,     APP_ASRC_ANTIALIAS_32K_TO_11K025
+    (44100, 12000): (1, 2),              # /2 + 1:1@22.05k,  APP_ASRC_ANTIALIAS_44K1_TO_12K
+    (44100, 16000): (1, 2),              # /2 + 1:1 composed, APP_ASRC_LPF1TO1_PROTOTYPE
+    (48000, 11025): (1, 4),              # 48 kHz divider table
+    (96000, 22050): (1, 4),              # 96 kHz divider table -- accepted before A1 and still
+}
+
+# THE OPT-IN FRONT-END ROWS, as a specification of which cells each one adds.
+#
+# WHY THIS TABLE EXISTS RATHER THAN A WEAKENED ASSERTION.  check_qualification_fence() asserts that
+# the post-A1 accepted set equals the pre-A1 one, and it still does -- it evaluates the DIRECT route
+# only, and no row here touches a direct route.  So the historical property is intact and needed no
+# relaxing.  What DID need stating is the new property: each opt-in row admits exactly two ordered
+# cells, and the union of the rows admits exactly the union of those pairs.
+#
+# `blocker` records WHICH gate refused the pair before its row, because the two are asserted
+# differently.  An "alias" pair must STAY in FENCE_UNQUALIFIED_DIRECT, because its direct route is
+# still refused on spectral grounds.  The "fill" pair was never in that table and must not be added
+# to it: its direct step was refused by asrc_fill_law(), and the row LOWERS THE STEP rather than
+# relaxing the law -- putting it in the anti-alias table would state the wrong reason.
+OPTIN_FRONTEND_ROWS = {
+    "APP_ASRC_ANTIALIAS_22K05_TO_8K":   dict(pair=(22050, 8000),  route=(1, 2), blocker="alias"),
+    "APP_ASRC_ANTIALIAS_32K_TO_11K025": dict(pair=(32000, 11025), route=(1, 2), blocker="alias"),
+    "APP_ASRC_ANTIALIAS_44K1_TO_12K":   dict(pair=(44100, 12000), route=(1, 2), blocker="alias"),
+    "APP_ASRC_ANTIALIAS_44K1_TO_8K":    dict(pair=(44100, 8000),  route=(1, 4), blocker="fill"),
+}
+
+
+def fence_allows(fs_in_hz: int, num: int, den: int, fs_out_hz: int) -> bool:
+    """Direct path only -- a filtered row is a different effective step and was already qualified."""
+    if (num, den) != (1, 1):
+        return True
+    return (fs_in_hz, fs_out_hz) not in FENCE_UNQUALIFIED_DIRECT
+
+
+def legacy_gate_accepts(fs_in_hz: int, num: int, den: int, fs_out_hz: int) -> bool:
+    """The PRE-A1 soft bound, for one purpose only: proving the fence freezes the surface exactly.
+
+    This is the arithmetic A1 deleted -- setpoint pinned at R + JITTER, a measured-slack threshold of
+    8, and the exact-step exemption.  It lives in the TEST because the property under test is
+    historical ("the accepted set did not change"), and it must NOT live in the firmware, where it
+    would resurrect the gate A1 replaced and state it as a safety rule again.
+    """
     eff_num = fs_in_hz * num
     eff_den = den * fs_out_hz
     if eff_num <= eff_den:
-        # Both predicates return true here before any arithmetic: at step <= 1 the look-ahead R only
-        # shrinks, so the slack only grows.  Covers every up-conversion AND every composed chain the
-        # front end lands exactly on 1.0.
-        return True, "step <= 1"
+        return True
     if eff_num * GATE_BURST_DEN >= GATE_BURST_NUM * eff_den:
-        return False, "burst: ring cannot hold the look-ahead"
+        return False
     k = BLOCK_FRAMES - 1
     scale = eff_num * k
     r = (scale // eff_den) + GATE_AHEAD + 1
     setpoint = min(max(r + GATE_JITTER, GATE_TARGET), GATE_TARGET_MAX)
     if setpoint <= r:
-        return False, f"slack: set {setpoint} <= R {r}"
-    if (setpoint - r) >= GATE_SLACK_REQUIRED:
-        return True, f"slack {setpoint - r} (R {r}, set {setpoint})"
-    if scale % eff_den == 0:
-        return True, f"slack {setpoint - r} but exact step (R {r})"
-    return False, f"slack {setpoint - r} < {GATE_SLACK_REQUIRED} and step not exact (R {r})"
+        return False
+    if (setpoint - r) >= 8:            # the retired ASRC_FILL_SLACK_REQUIRED
+        return True
+    return scale % eff_den == 0        # the deleted exact-step exemption
+
+
+def check_qualification_fence() -> None:
+    """A1 fixes starve on the pairs already supported; it must not add or remove any."""
+    rates = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000)
+    before, after, fenced = set(), set(), set()
+    for fs_in in rates:
+        for fs_out in rates:
+            if legacy_gate_accepts(fs_in, 1, 1, fs_out):
+                before.add((fs_in, fs_out))
+            law_ok, _why = gate_accepts(fs_in, 1, 1, fs_out)
+            if law_ok and fence_allows(fs_in, 1, 1, fs_out):
+                after.add((fs_in, fs_out))
+            elif law_ok:
+                fenced.add((fs_in, fs_out))
+    print(f"fence: pre-A1 accepted {len(before)}  post-A1+fence accepted {len(after)}  "
+          f"held out {len(fenced)}")
+    assert after == before, (
+        f"A1 must not change the accepted set: newly admitted {sorted(after - before)}, "
+        f"lost {sorted(before - after)}")
+    assert fenced == FENCE_UNQUALIFIED_DIRECT, (
+        f"the fence table is not the set the law newly admits: table-only "
+        f"{sorted(FENCE_UNQUALIFIED_DIRECT - fenced)}, missing {sorted(fenced - FENCE_UNQUALIFIED_DIRECT)}")
+    print(f"fence: held out exactly {sorted(fenced)}")
+
+
+def check_direct_route_policy() -> None:
+    """The policy refuses a ROUTE.  Assert both axes, for every entry -- not just one pair.
+
+    Axis 1 (route): the direct route of each listed pair is refused, and a filtered route for the
+    SAME physical pair is allowed.  A regression that fenced on the physical rates alone would
+    remove a qualified configuration (96 -> 22.05 kHz /4 is the one that already shipped), and a
+    regression that dropped the num/den test would do it silently.
+
+    Axis 2 (pair): no pair OUTSIDE the table is refused on either route, so the policy cannot
+    quietly grow.
+    """
+    for pair in sorted(FENCE_UNQUALIFIED_DIRECT):
+        fs_in, fs_out = pair
+        assert not fence_allows(fs_in, 1, 1, fs_out), f"{pair}: the DIRECT route must be refused"
+        route = FILTERED_ROUTE[pair]
+        if route is None:
+            # Kept for a FUTURE table entry with no row yet.  As of 2026-09-20 every entry names a
+            # route, so this branch is unreached -- deleting it would mean the next pair added to
+            # the table silently loses its shape assertion.
+            # No row today.  Still assert the shape: were a route added, it must not be refused
+            # by this table, because the table is about routes and not about rates.
+            assert fence_allows(fs_in, 1, 2, fs_out), (
+                f"{pair}: a hypothetical filtered route must not be refused by the direct policy")
+            print(f"policy: {fs_in:6d} -> {fs_out:6d}  direct REFUSE, no filtered route in tree")
+            continue
+        num, den = route
+        assert fence_allows(fs_in, num, den, fs_out), (
+            f"{pair}: the filtered route {num}/{den} must be ALLOWED -- refusing it removes a "
+            f"qualified configuration")
+        print(f"policy: {fs_in:6d} -> {fs_out:6d}  direct REFUSE, filtered {num}/{den} ALLOW")
+
+    rates = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000)
+    for fs_in in rates:
+        for fs_out in rates:
+            if (fs_in, fs_out) in FENCE_UNQUALIFIED_DIRECT:
+                continue
+            for num, den in ((1, 1), (1, 2), (1, 4)):
+                assert fence_allows(fs_in, num, den, fs_out), (
+                    f"({fs_in}, {fs_out}) route {num}/{den} is not in the table and must not be "
+                    f"refused by it")
+    print("policy: no pair outside the table is refused on any route")
+
+
+def pair_accepted(fs_in: int, fs_out: int, rows_on: frozenset) -> bool:
+    """Is this ORDERED cell accepted, with a named set of opt-in rows enabled?
+
+    Mirrors what audio_app_asrc_rate_pair_is_supported() composes: the planner picks a route for the
+    pair, and the fill law and the anti-alias policy then judge THAT route.  Only a row in `rows_on`
+    publishes a route; every other pair runs direct.
+
+    BOTH DIRECTIONS of the physical pair are judged, because the firmware instantiates an engine per
+    direction and refuses the pair if either fails.  That is exactly why a row has to be asserted to
+    move two ordered cells rather than one.
+    """
+    def route_for(a, b):
+        for macro, spec in OPTIN_FRONTEND_ROWS.items():
+            if macro not in rows_on:
+                continue
+            if (a, b) == spec["pair"]:
+                return spec["route"]
+        return (1, 1)
+
+    for a, b in ((fs_in, fs_out), (fs_out, fs_in)):
+        num, den = route_for(a, b)
+        law_ok, _why = gate_accepts(a, num, den, b)
+        if not law_ok:
+            return False
+        if not fence_allows(a, num, den, b):
+            return False
+    return True
+
+
+def check_optin_pair_gates() -> None:
+    """Each opt-in row adds EXACTLY its own two ordered cells; the union adds exactly the union.
+
+    Four properties, each able to fail on its own:
+      1  with every row off, the accepted set is the legacy one
+      2  each row alone adds exactly two ordered cells -- its pair, both orientations
+      3  all rows on adds exactly the union, so no row shadows another in either if-chain
+      4  every pair keeps the DIRECT verdict it had, from the gate that was actually refusing it
+    """
+    rates = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000)
+    cells = [(a, b) for a in rates for b in rates]
+
+    def accepted_set(rows_on):
+        return {c for c in cells if pair_accepted(c[0], c[1], rows_on)}
+
+    base = accepted_set(frozenset())
+    print(f"opt-in: baseline (every row off) accepts {len(base)} of {len(cells)} ordered cells")
+
+    for macro, spec in sorted(OPTIN_FRONTEND_ROWS.items()):
+        fi, fo = spec["pair"]
+        got = accepted_set(frozenset({macro}))
+        added, lost = got - base, base - got
+        want = {(fi, fo), (fo, fi)}
+        assert not lost, f"{macro}: must not remove any accepted cell, lost {sorted(lost)}"
+        assert added == want, f"{macro}: must add exactly {sorted(want)}, added {sorted(added)}"
+        print(f"opt-in: {macro:34s} adds exactly {sorted(added)}")
+
+    every = frozenset(OPTIN_FRONTEND_ROWS)
+    got = accepted_set(every)
+    want = base | {c for spec in OPTIN_FRONTEND_ROWS.values()
+                   for c in (spec["pair"], spec["pair"][::-1])}
+    assert got == want, (f"the union is not the union of the rows: unexpected {sorted(got - want)}, "
+                         f"missing {sorted(want - got)}")
+    print(f"opt-in: all {len(OPTIN_FRONTEND_ROWS)} rows on accepts {len(got)} cells, "
+          f"exactly the union")
+
+    for macro, spec in sorted(OPTIN_FRONTEND_ROWS.items()):
+        fi, fo = spec["pair"]
+        policy_refuses = not fence_allows(fi, 1, 1, fo)
+        law_ok, why = gate_accepts(fi, 1, 1, fo)
+        if spec["blocker"] == "alias":
+            assert policy_refuses, (
+                f"{macro}: the pair DIRECT route must still be refused by the anti-alias policy")
+            assert (fi, fo) in FENCE_UNQUALIFIED_DIRECT, (
+                f"{macro}: an alias-blocked pair must stay in FENCE_UNQUALIFIED_DIRECT")
+            print(f"opt-in: {macro:34s} DIRECT still refused by the policy (blocker alias)")
+        else:
+            assert not policy_refuses, (
+                f"{macro}: this pair was never an anti-alias refusal, so the policy must have no "
+                f"opinion about its direct route")
+            assert (fi, fo) not in FENCE_UNQUALIFIED_DIRECT, (
+                f"{macro}: a fill-blocked pair must NOT be added to the anti-alias table -- that "
+                f"would state the wrong reason for the refusal")
+            assert not law_ok, (
+                f"{macro}: this pair DIRECT route must still be refused by the FILL LAW ({why}); "
+                f"the row lowers the rear step, it does not relax the law")
+            print(f"opt-in: {macro:34s} DIRECT still refused by the fill law (blocker fill): {why}")
+
+    # A count no row can change, because no row publishes (1, 1): stated so a future row that DID
+    # publish a direct route would show up here rather than only in a pair count.
+    base_direct = {c for c in cells
+                   if gate_accepts(c[0], 1, 1, c[1])[0] and fence_allows(c[0], 1, 1, c[1])}
+    print(f"opt-in: {len(base_direct)} cells accept a DIRECT route -- unchanged by every row")
+
+
+def gate_accepts(fs_in_hz: int, num: int, den: int, fs_out_hz: int) -> tuple[bool, str]:
+    """(accepted, why) for one direction, exactly as the two C predicates decide it.
+
+    STARVE SAFETY ONLY.  The qualification fence is a separate question and is applied after this
+    in audio_app_asrc_rate_pair_is_supported(); check_gate() below therefore reports the LAW's
+    verdict, and check_qualification_fence() covers the surface.
+    """
+    eff_num = fs_in_hz * num
+    eff_den = den * fs_out_hz
+    if eff_num > eff_den and eff_num * GATE_BURST_DEN >= GATE_BURST_NUM * eff_den:
+        return False, "burst: ring cannot hold the look-ahead"
+    _look, r_safe, set_required, setpoint, fits = fill_law(fs_in_hz, num, den, fs_out_hz)
+    if not fits:
+        return False, f"reserve: set_required {set_required} > TARGET_MAX {GATE_TARGET_MAX}"
+    return True, f"reserve {setpoint - r_safe} (R_safe {r_safe}, set {setpoint})"
 
 
 def frontend_denominator_96k(b_rate_hz: int) -> int:
@@ -214,7 +483,57 @@ def check_gate(label: str, fs_in_hz: int, fs_out_hz: int, den: int, expect: bool
     )
 
 
+def check_law(label: str, fs_in_hz: int, num: int, den: int, fs_out_hz: int,
+              expect_r_safe: int, expect_set: int) -> None:
+    """The reserve law's two published numbers for one direction."""
+    look, r_safe, req, setpoint, fits = fill_law(fs_in_hz, num, den, fs_out_hz)
+    print(f"law  {label:28s} look={look:3d} R_safe={r_safe:3d} req={req:3d} set={setpoint:3d} "
+          f"{'fits' if fits else 'DOES NOT FIT'}")
+    assert (r_safe, setpoint) == (expect_r_safe, expect_set), (
+        f"{label}: R_safe/set = {r_safe}/{setpoint}, expected {expect_r_safe}/{expect_set}")
+
+
+def check_reserve_law() -> None:
+    """A1: the lower reserve is one producer block + 1, from the NOMINAL rates, +1 on the floor.
+
+    The two numbers that matter are the pair that starved and the pair under listening approval.
+    32 -> 12 kHz is 8/3, so 15*step = 40 EXACTLY: floor()+1 = 41 is the whole point -- the servo
+    trims the applied step above nominal and a pull then advances 41, not 40.  Taking floor() of the
+    lock-time MEASURED ratio gave 39 or 40 depending on the ppm of that lock (R 55 or 56, seen on
+    consecutive runs of the same pair) and produced set 73 instead of 74.
+    """
+    check_law("32k -> 12k (the starve pair)", 32000, 1, 1, 12000, 57, 74)
+    check_law("12k -> 32k (its up-conv leg)", 12000, 1, 1, 32000, 22, 64)
+    # Listening-approved operating points must not move at all.
+    check_law("48k -> 44.1k", 48000, 1, 1, 44100, 33, 64)
+    check_law("44.1k -> 48k", 44100, 1, 1, 48000, 30, 64)
+    check_law("48k -> 48k", 48000, 1, 1, 48000, 32, 64)
+    # The pairs the deleted exact-step exemption used to carry, now on a real reserve.
+    check_law("48k -> 16k (was exempt)", 48000, 1, 1, 16000, 62, 79)
+    check_law("48k -> 12k (was exempt)", 48000, 1, 1, 12000, 77, 94)
+    check_law("24k -> 8k  (was exempt)", 24000, 1, 1, 8000, 62, 79)
+    # And the ones no reserve can fit in this ring: still refused, now for a stated reason.
+    for fs_in, fs_out in ((48000, 8000), (44100, 8000)):
+        _l, _r, req, setpoint, fits = fill_law(fs_in, 1, 1, fs_out)
+        assert not fits, f"{fs_in} -> {fs_out}: set_required {req} must not fit {GATE_TARGET_MAX}"
+        print(f"law  {fs_in} -> {fs_out:<6d} set_required={req} > TARGET_MAX -> refused")
+    # A profile-independent property: the reserve is a whole producer block, so every accepted pair
+    # has at least BLOCK+1 frames between its setpoint and what a pull needs.
+    for fs_in in (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000):
+        for fs_out in (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000):
+            ok, _why = gate_accepts(fs_in, 1, 1, fs_out)
+            if not ok:
+                continue
+            _l, r_safe, _req, setpoint, _f = fill_law(fs_in, 1, 1, fs_out)
+            assert setpoint - r_safe >= GATE_RESERVE, (
+                f"{fs_in} -> {fs_out}: accepted with only {setpoint - r_safe} frames of reserve")
+    print(f"law: every accepted direct pair keeps >= {GATE_RESERVE} frames of lower reserve")
+
+
 def main() -> int:
+    check_reserve_law()
+    check_qualification_fence()
+    check_optin_pair_gates()
     check("direct 48k -> 48k", rate_plan_step(48000.0, 48000.0, 1, 1), 1.0)
     check(
         "direct 48k -> 44.1k",
@@ -266,11 +585,20 @@ def main() -> int:
     # Every 96 kHz down-conversion the rate menu offers, judged with the table's own denominator.
     for b_hz in (8000, 11025, 12000, 16000, 22050, 24000):
         check_gate(f"96k -> {b_hz}", 96000, b_hz, frontend_denominator_96k(b_hz), True)
-    # 22.05 kHz is the row this block exists for: refused on the direct path, accepted composed.
-    check_gate("96k -> 22050 (no row)", 96000, 22050, 1, False)
+    # 22.05 kHz is the row this block exists for, and the reason moved without the verdict moving.
+    # Pre-A1 the direct path was refused for STARVE (setpoint pinned at R + JITTER = 4 slack).  The
+    # reserve law admits it (set 99, a full one-block reserve, inside the 104 cap) -- so check_gate,
+    # which reports the LAW, now says accept -- and the QUALIFICATION FENCE holds it out, because
+    # admitting a new unfiltered 4.35x decimation is not part of a starve fix.  Both halves are
+    # asserted, because "the pair is still refused" and "it is refused for a different reason" are
+    # two different facts and a log has to be able to tell them apart.
+    check_gate("96k -> 22050 (no row, law)", 96000, 22050, 1, True)
+    assert not fence_allows(96000, 1, 1, 22050), "96k -> 22.05k direct must stay out of the surface"
     check_gate("96k -> 22050 (composed /4)", 96000, 22050, 4, True)
-    # 24 kHz passed even with no row -- but only via the exact-step exemption, on 4 frames of slack.
-    # Both facts are asserted so the composed row is seen to REPLACE a dependency, not add one.
+    assert fence_allows(96000, 1, 4, 22050), "the filtered /4 row must stay qualified"
+    # 24 kHz passed even with no row.  It used to pass only via the exact-step exemption on 4 frames
+    # of slack; that exemption is deleted (an exact step is q = 1, the DEEPEST block-phase case), and
+    # the pair now passes on a real 17-frame reserve at set 94.  Same verdict, opposite reason.
     check_gate("96k -> 24000 (no row)", 96000, 24000, 1, True)
     check_gate("96k -> 24000 (composed /4)", 96000, 24000, 4, True)
     # 44.1 and 48 kHz JOINED ON 2026-09-03 (den 2, the pre-stage alone).  Both were accepted
@@ -281,7 +609,9 @@ def main() -> int:
     check_gate("96k -> 44100 (pre-stage)", 96000, 44100, 2, True)
     check_gate("96k -> 48000 (no row)", 96000, 48000, 1, True)
     check_gate("96k -> 48000 (pre-stage)", 96000, 48000, 2, True)
-    # 32 kHz still has no row: it leans on the exact-step exemption and runs unprotected.
+    # 32 kHz still has no row: it runs unprotected (it used to lean on the exact-step exemption for
+    # its acceptance; since 2026-09-12 it is accepted on a real reserve at set 79 and is still
+    # unprotected -- the gate never modelled band limiting).
     for b_hz in (32000, 44100, 48000, 96000):
         check_gate(f"96k -> {b_hz}", 96000, b_hz, frontend_denominator_96k(b_hz), True)
     # Every 96 kHz row names the coefficient set it loads.  A row that resolves to a bare
@@ -319,6 +649,7 @@ def main() -> int:
         print(f"width {a_hz} -> {b_hz:<6d} den=1   {'accept' if ok else 'REFUSE'}  ({why})")
         assert ok, f"{a_hz} -> {b_hz} needs no front end and must not be refused for its width"
 
+    check_direct_route_policy()
     check_q31_composed_geometry()
 
     print("PASS: general ASRC rate-plan equation")

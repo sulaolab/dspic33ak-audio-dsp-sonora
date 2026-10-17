@@ -67,6 +67,13 @@
 #define PLL2CON nora_fake_pllcon_word(2u)
 #define PLL2DIV nora_fake_plldiv_word(2u)
 
+/*
+ * No PLLxCONBITS / PLLxDIVBITS typedefs are needed here.  The reg layer reaches
+ * each PLL through an operations table whose members name that instance's own
+ * SFRs, so it never spells a DFP bitfield type and never assumes the two PLLs
+ * share a layout.
+ */
+
 #define OSCCTRLbits (*nora_fake_oscctrl())
 #define OSCCTRL     nora_fake_oscctrl_word()
 #define CLKFAIL     nora_fake_clkfail_word()

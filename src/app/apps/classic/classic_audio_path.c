@@ -154,11 +154,12 @@ static void process_regular( const int32_t* src_ptr,
 #endif
 
     app_fx_domain_48k_process( in, in );
-    app_gain_process( in, out );
 
 #if defined(ENA_SND_EFFECT_PLAY)
-    wav_to_tdm_float_process( out, out, STAGE_1_PROC_CH );
+    wav_to_tdm_float_process( in, in, STAGE_1_PROC_CH );
 #endif
+    /* Master mute covers the complete mix, including WAV effects. */
+    app_gain_process( in, out );
 
     level_meter_process( out );
 
@@ -170,6 +171,9 @@ static void process_regular( const int32_t* src_ptr,
     static int32_t tmp_tx[CLASSIC_AUDIO_PATH_TMP_TX_CH * APP_BLOCK_FRAMES];
     convert_codec_float_to_int(
         out, STAGE_1_PROC_CH, tmp_tx, CLASSIC_AUDIO_PATH_TMP_TX_CH, APP_BLOCK_FRAMES );
+#if PWM_AUDIO_SCOPE_ONLY
+    classic_audio_pwm_scope_process_pcm(tmp_tx, CLASSIC_AUDIO_PATH_TMP_TX_CH);
+#endif
 
     copy_to_codec( tmp_tx, CLASSIC_AUDIO_PATH_TMP_TX_CH, dest_ptr_a, 0 );
     copy_to_codec( tmp_tx, CLASSIC_AUDIO_PATH_TMP_TX_CH, dest_ptr_b, 0 );
@@ -178,9 +182,9 @@ static void process_regular( const int32_t* src_ptr,
 
 static void process_optional_pwm_audio_output( void )
 {
-#if APP_USE_PWM_AUDIO
-#if ENA_DRC_DF2T_CASCADE
-    /* The DRC path does not drive the Classic PWM DAC. */
+#if APP_USE_PWM_AUDIO && !ENA_DRC_DF2T_CASCADE && !PWM_AUDIO_SCOPE_ONLY
+#if APP_PWM_AUDIO_HAL
+    classic_audio_pwm_hal_process( &f_a_data[0][0], STAGE_1_PROC_CH );
 #else
     classic_audio_pwm_process_left_primary( &f_a_data[0][0], STAGE_1_PROC_CH );
     classic_audio_pwm_process_right_primary( &f_a_data[0][0], STAGE_1_PROC_CH );

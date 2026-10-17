@@ -63,6 +63,36 @@
 #define APP_ASRC_48K_TO_8_INTEGRATION (0)
 #endif
 
+// P0 (F-6 closed-loop THD+N tails) boot defaults, each still overridable at run time in MEAS.
+// Selected for the verified A=48 kHz to B=8 kHz A->B operating point:
+// QUIET_TRACK preset 4 needs the two-stage FF and the co-timed window, or it never enters, so the
+// four move together.  0 in any of them restores the pre-P0 behaviour of that piece.
+// ON in MEAS images and wherever APP_ASRC_QUIET_TRACK compiles the track in (the product BIDIR
+// preset since 2026-09-29, owner decision).  A product image applies them ONLY at the operating
+// point they were verified at -- APP_P0_POINT_A_HZ -> APP_P0_POINT_B_HZ, A->B engine
+// (asrc_clock_control.c ccpdet_p0_point_ok()).  Every other rate pair, and the B->A engine, keep
+// the pre-P0 256-period FF and the normal servo, so an unverified route is not changed.
+#ifndef APP_P0T_DEFAULT_MODE
+#define APP_P0T_DEFAULT_MODE        ( ( APP_ASRC_MEAS || APP_ASRC_QUIET_TRACK ) ? 4u : 0u )   // *ax06: QUIET_TRACK preset (0 = OFF, 1..4)
+#endif
+#ifndef APP_P0_FF_TWO_STAGE_DEFAULT
+#define APP_P0_FF_TWO_STAGE_DEFAULT ( ( APP_ASRC_MEAS || APP_ASRC_QUIET_TRACK ) ? 1u : 0u )   // *ax05: 256-period FF first, co-timed handover
+#endif
+#ifndef APP_P0_FF_COTIMED_DEFAULT
+#define APP_P0_FF_COTIMED_DEFAULT   ( ( APP_ASRC_MEAS || APP_ASRC_QUIET_TRACK ) ? 4u : 0u )   // *ax04: co-timed window T = code x 500 ms (4 = 2 s)
+#endif
+// The product operating point above: the presets count pulls and were tuned at 500 pulls/s
+// (B = 8 kHz / 16 frames); NEXT card section 3 item 1 has the runs.  MEAS ignores it.
+#ifndef APP_P0_POINT_A_HZ
+#define APP_P0_POINT_A_HZ           (48000u)
+#endif
+#ifndef APP_P0_POINT_B_HZ
+#define APP_P0_POINT_B_HZ           (8000u)
+#endif
+#ifndef APP_P0_CFILL_HW_INSTANT_DEFAULT
+#define APP_P0_CFILL_HW_INSTANT_DEFAULT (1u)   // *af08: continuous fill at leg B's hardware instant
+#endif
+
 // Boot bit-exactness selftest of the front ends compiled into this build (the
 // optimized mirrored-window path against the reference modulo-ring oracle kept
 // in the same file).  It is a startup check, not an audio-path feature, and its
@@ -196,10 +226,10 @@
 #define ASRC_POLY_M                 (32u)
 #endif
 #ifndef ASRC_POLY_KAISER_BETA
-#define ASRC_POLY_KAISER_BETA       (11.0f)
+#define ASRC_POLY_KAISER_BETA       (11.3f)
 #endif
 #ifndef ASRC_POLY_KAISER_NAME
-#define ASRC_POLY_KAISER_NAME       "poly-k11"
+#define ASRC_POLY_KAISER_NAME       "poly-k11.3"
 #endif
 #ifndef ASRC_POLY_FC
 #define ASRC_POLY_FC                (0.45f)
@@ -515,6 +545,19 @@
 #define APP_B_ROUTE_USES_BA   ( (APP_B_ROUTE == B_ROUTE_ASRC_FROM_B) || \
                                 (APP_B_ROUTE == B_ROUTE_ASRC_BIDIR)  || \
                                 (APP_B_ROUTE == B_ROUTE_ASRC_LIGHT) )
+// True when the image allocates the A->B engine.  Every image does, EXCEPT a BA MEAS image: it runs
+// the BIDIR route only for the B->A instance and never pulls A->B (pull_ab is not even linked), so
+// the ~10 KB A->B engine was pushed into and never read.  P2 of the 2026-09-30 RAM/stack ledger
+// (owner-approved) drops it there: ASRC_ENGINE_COUNT becomes 1 with B->A as the only entry, and leg A
+// no longer pushes (or front-end-filters) into A->B.  MEAS-only; AB MEAS and the product are unchanged.
+// NOTE the parity cost: this image no longer carries the A->B engine's CPU/bus load on leg A (the
+// A->B front end and push are gone from leg A's callback, so leg A is SHORTER, and leg A's callback
+// is what defers leg B).  APP_MEAS_BA_DROP_AB_ENGINE=0 keeps the old two-engine BA MEAS image.
+#ifndef APP_MEAS_BA_DROP_AB_ENGINE
+#define APP_MEAS_BA_DROP_AB_ENGINE (1)
+#endif
+#define APP_ASRC_HAS_AB_ENGINE ( !( APP_ASRC_MEAS && ( APP_MEAS_DIR == MEAS_DIR_BA ) && \
+                                    APP_MEAS_BA_DROP_AB_ENGINE ) )
 
 
 // --- CCP FS-DETECT (Theme 2 step: precise clock detection via CCP Input Capture) ---
@@ -665,6 +708,14 @@
 #error "APP_ASRC_Q31_PRE_HALFBAND only exists in the Q31 front end (ASRC_SAMPLE_Q31=1); the float pre-stage has no half-band kernel."
 #endif
 
+// P0 QUIET_TRACK and the two-stage / co-timed FF it enters from (audio_app_asrc.c p0t_step(),
+// asrc_clock_control.c CCPDET_FF_COTIMED).  Compiled into every MEAS Q31 image, and into the
+// product BIDIR preset by default (asrc_app_build_config.h), where it runs only at
+// APP_P0_POINT_A_HZ / _B_HZ.  0 = absent, i.e. the pre-P0 product image.
+#ifndef APP_ASRC_QUIET_TRACK
+#define APP_ASRC_QUIET_TRACK  ( APP_ASRC_MEAS && ASRC_SAMPLE_Q31 )
+#endif
+
 #if ASRC_SAMPLE_Q31
   #undef  ASRC_POLY_METHOD
   #define ASRC_POLY_METHOD  (ASRC_POLY_Q31)
@@ -703,12 +754,498 @@
 #define APP_ASRC_FULL_IIR_48_TO_32 (0)
 #endif
 
+/*
+ * EXPERIMENTAL 1:1 SOURCE-RATE ANTI-ALIAS LPF (Phase 1 prototype, 2026-09-14).
+ *
+ * WHAT IT ADDS, in one sentence: a front-end stage whose rate RATIO is 1/1 but which
+ * nevertheless FILTERS -- the first stage in this tree that is not also a rate change.
+ *
+ * WHY, because the reason is not cost.  The rear M30 resampler's cutoff is
+ * ASRC_POLY_FC = 0.464 of ITS OWN input rate, one constant per build.  A front end that
+ * decimates all the way to Fs_out leaves the resampler at step 1.0 and puts the protected
+ * 0.8125 * FN edge on the rear filter's transition shoulder.  Keeping the source rate and
+ * band-limiting there preserves rear-filter margin over the protected band.  Derivation and
+ * the 45-pair sweep:
+ * [internal] study_ak512_universal_nyquist_planner_2026-09-13.md sections 3 and 4.
+ *
+ * 0 in EVERY preset.  Opt in with -Define APP_ASRC_LPF1TO1_PROTOTYPE=1.  At 0 nothing here is
+ * reachable: the coefficient tables live behind the same gate, the plan does not publish the
+ * row, and the routing arm is compiled out -- so the image is the one a tree without this
+ * change produces.  Selection is NOT widened either: the only pair the plan gives a 1:1 row is
+ * 32 -> 16 kHz, which today runs `fe=direct` with no band limit at all.
+ *
+ * It needs the Q31 front end (the float front end has no generic stage descriptor, so a
+ * decim == 1 stage has nowhere to live there).  asrc_audio_path.c refuses to build otherwise.
+ */
+#ifndef APP_ASRC_LPF1TO1_PROTOTYPE
+#define APP_ASRC_LPF1TO1_PROTOTYPE (0)
+#endif
+
+/* Six source-rate 1:1 anti-alias rows confirmed by the 2026-09-24 full81 measurements:
+ * 11.025->8, 12->8, 16->8/11.025/12, and 22.05->11.025 kHz.  This is deliberately not the
+ * host model's full set of twenty possible direct-route holes.  Every row here has hardware alias
+ * evidence and reuses an existing, coefficient-identical normalised design; no new coefficient
+ * array or kernel is introduced.
+ *
+ * Default 1 only for APP_BUILD_ASRC_CODEC_BIDIR in asrc_app_build_config.h.  Every other preset,
+ * including 96 kHz and MEAS images, stays 0 unless explicitly requested. */
+#ifndef APP_ASRC_ANTIALIAS_DIRECT_1TO1
+#define APP_ASRC_ANTIALIAS_DIRECT_1TO1 (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1 && !APP_ASRC_LPF1TO1_PROTOTYPE
+#error "APP_ASRC_ANTIALIAS_DIRECT_1TO1 needs APP_ASRC_LPF1TO1_PROTOTYPE=1: all six rows use the Q31 source-rate 1:1 stage and its coefficient bank."
+#endif
+
+/* Nine further direct-route holes from the 2026-10-03 qualification, same class as the six above
+ * (existing coefficient arrays, selector rows only; list in asrc_decimator_48_to_8.h).  Default 1 in
+ * BIDIR and 96K_A_TO_B (asrc_app_build_config.h), 0 elsewhere; -Define APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT=0/1 overrides. */
+#ifndef APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT
+#define APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT && !APP_ASRC_ANTIALIAS_DIRECT_1TO1
+#error "APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT extends APP_ASRC_ANTIALIAS_DIRECT_1TO1's row list; it needs APP_ASRC_ANTIALIAS_DIRECT_1TO1=1."
+#endif
+
+/* The last five direct-route holes (two 1:1 rows, three composed /2 or /3 + 1:1), all on existing
+ * coefficient arrays (list in asrc_decimator_48_to_8.h).  Default 1 in BIDIR and 96K_A_TO_B
+ * (asrc_app_build_config.h), 0 elsewhere; -Define APP_ASRC_ANTIALIAS_DIRECT5=0/1 overrides. */
+#ifndef APP_ASRC_ANTIALIAS_DIRECT5
+#define APP_ASRC_ANTIALIAS_DIRECT5 (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_DIRECT5 && !APP_ASRC_ANTIALIAS_DIRECT_1TO1
+#error "APP_ASRC_ANTIALIAS_DIRECT5 extends APP_ASRC_ANTIALIAS_DIRECT_1TO1's row list; it needs APP_ASRC_ANTIALIAS_DIRECT_1TO1=1."
+#endif
+
+/*
+ * 22.05 -> 8 kHz ANTI-ALIAS FRONT END (Phase 2 first light, 2026-09-20).
+ *
+ * WHAT IT ADDS: a composed /2 + 1:1 front-end row for ONE pair, so that 22.05 <-> 8 kHz has a
+ * FILTERED route.  Its DIRECT route stays refused, and this gate does not change that -- see
+ * below.
+ *
+ * WHY THIS PAIR AND WHY IT COSTS NO FILTER DESIGN.  22050/8000 = 44100/16000 = 2.75625 EXACTLY,
+ * and the uniform spec derives both band edges from the output rate alone (passband
+ * 0.8125 * FN_out, the 1:1 stage's stopband Fs_out - passband).  So every stage of this chain has
+ * the same NORMALISED passband and stopband as its 44.1 -> 16 kHz counterpart, and a Kaiser
+ * design depends on nothing else: the two SHIPPED arrays are the correct coefficients at half the
+ * clock.  Verified coefficient-by-coefficient, not argued -- re-deriving both stages at the
+ * 22.05 kHz clock reproduces s_dec2_44k1_for_16k_coeff (51 taps) and s_lp1_22k05_to_16k_coeff
+ * (53 taps) to 1.0e-10 relative, and the shipped arrays evaluated as a 22.05 -> 8 kHz chain read
+ * -114.38 dBc, the identical figure already on record for 44.1 -> 16 kHz.
+ * [internal] study_antialias_frontend_feasibility_20260920.md sections 3 and 4.
+ *
+ * SO IT ADDS NO COEFFICIENTS AT ALL.  That is the whole reason this pair is the first light of
+ * the three the anti-alias policy refuses without a front-end row: there is no new filter to be
+ * wrong about, and the chain it runs has already run on hardware as 44.1 -> 16 kHz.
+ *
+ * WHAT IT DOES NOT TOUCH, stated because each is easy to assume:
+ *   - s_asrc_unsafe_direct_routes[] is UNCHANGED.  A filtered row publishes den != 1 and
+ *     asrc_direct_route_is_allowed() exempts a non-unit ratio as "a filtered row is its own
+ *     pair", so 22.05 -> 8 kHz DIRECT stays refused exactly as before.  The pair becomes
+ *     available only through this row.
+ *   - ASRC_POLY_FC stays at the production value (0.464).  It is one constant per build and
+ *     this row does not move it.
+ *   - No new kernel.  dec_q31_stage_run() takes the decimation as a runtime value and the
+ *     composed /d + 1:1 arm already exists for 44.1 -> 16 kHz.
+ *
+ * DEFAULT 1 ON THE BIDIR PRESET since 2026-09-20 (owner decision after listening); 0 everywhere
+ * else, including every MEAS preset.  The pin is in asrc_app_build_config.h, which the
+ * preprocessor reads BEFORE this file, so the #ifndef below is the fallback for every OTHER
+ * preset rather than the value the shipping image sees.  Opt out per row with
+ * -Define APP_ASRC_ANTIALIAS_22K05_TO_8K=0.  It rides on the prototype gate rather than
+ * duplicating it, because the stage kind, the composed init entry point and both coefficient
+ * arrays all live behind that gate; the #error below states that rather than an #ifndef quietly
+ * turning it on.
+ */
+#ifndef APP_ASRC_ANTIALIAS_22K05_TO_8K
+#define APP_ASRC_ANTIALIAS_22K05_TO_8K (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_22K05_TO_8K && !APP_ASRC_LPF1TO1_PROTOTYPE
+#error "APP_ASRC_ANTIALIAS_22K05_TO_8K needs APP_ASRC_LPF1TO1_PROTOTYPE=1: this row is a composed /2 + 1:1 chain, and the 1:1 stage kind, asrc_decimator_q31_init_dec_then_lpf1to1() and both coefficient arrays (s_dec2_44k1_for_16k_coeff, s_lp1_22k05_to_16k_coeff) all live behind the prototype gate.  With the prototype off the row would be PLANNED and never ARMED, which reads in the log exactly like a working direct path -- and for this pair a direct path is the thing the anti-alias policy refuses."
+#endif
+
+/*
+ * 32 -> 11.025 kHz ANTI-ALIAS FRONT END (Phase 1 of closing the remaining pairs, 2026-09-20).
+ *
+ * WHAT IT ADDS: a composed /2 + 1:1 front-end row for ONE pair, so that 32 <-> 11.025 kHz has a
+ * FILTERED route.  Its DIRECT route stays refused; this gate does not change that.
+ *
+ * WHY IT IS THE SECOND PAIR DONE, not the first: 22.05 -> 8 kHz needed no new filter at all (its
+ * chain is the 44.1 -> 16 kHz chain at half the clock), and this one needs exactly ONE new set --
+ * the /2 at 32 kHz.  Its 1:1 PARTNER already ships: s_lp1_16k_to_11k025_coeff (55 taps) is the
+ * second stage of the 48 -> 11.025 kHz composed row, and re-deriving it from the uniform spec
+ * reproduces the shipped array to 5.4e-11 relative, so the partner is shared rather than
+ * duplicated.  Host chain figure with the shipped partner and the new pre-stage: -108.53 dBc
+ * worst in-band alias, Q31, passband error 0.0003 dB, rear step 1.451247.
+ * [internal] study_remaining_rate_pairs_20260920.md, Phase 1.
+ *
+ * THE NEW SET IS GENERATED, NOT TYPED.  tools/asrc/asrc_lpf1to1_design.py carries the row
+ * ("dec2_32k_for_11k025", 32000, 2, 11025) and emits s_dec2_32k_for_11k025_coeff into
+ * asrc_lpf1to1_coeffs.inc with --write; its stopband is RELAXED BY THE PARTNER (9453.9 Hz rather
+ * than a stand-alone /2's 8000 Hz) and the generator gates the WHOLE composed chain, not the stage
+ * alone.  Regenerate, never patch.
+ *
+ * WHAT IT DOES NOT TOUCH, the same four things the 22.05 kHz row does not touch:
+ *   - s_asrc_unsafe_direct_routes[] is UNCHANGED.  A filtered row publishes den != 1 and
+ *     asrc_direct_route_is_allowed() exempts a non-unit ratio, so 32 -> 11.025 kHz DIRECT stays
+ *     refused exactly as before and the pair is reachable only through this row.
+ *   - ASRC_POLY_FC stays at the production value (0.464), one constant per build.
+ *   - No new kernel: the composed /d + 1:1 arm already exists.
+ *   - No existing coefficient array is rewritten -- the new set is a new symbol.
+ *
+ * DEFAULT 1 ON THE BIDIR PRESET since 2026-09-20 (owner decision after listening); 0 everywhere
+ * else, including every MEAS preset.  Pinned in asrc_app_build_config.h, which is read before
+ * this file.  Opt out with -Define APP_ASRC_ANTIALIAS_32K_TO_11K025=0.  It rides on the
+ * prototype gate for the same reason the 22.05 kHz row does, and says so with an #error.
+ */
+#ifndef APP_ASRC_ANTIALIAS_32K_TO_11K025
+#define APP_ASRC_ANTIALIAS_32K_TO_11K025 (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_32K_TO_11K025 && !APP_ASRC_LPF1TO1_PROTOTYPE
+#error "APP_ASRC_ANTIALIAS_32K_TO_11K025 needs APP_ASRC_LPF1TO1_PROTOTYPE=1: this row is a composed /2 + 1:1 chain, and the 1:1 stage kind, asrc_decimator_q31_init_dec_then_lpf1to1() and both coefficient arrays (s_dec2_32k_for_11k025_coeff, s_lp1_16k_to_11k025_coeff) all live behind the prototype gate.  With the prototype off the row would be PLANNED and never ARMED, which reads in the log exactly like a working direct path -- and for this pair a direct path is the thing the anti-alias policy refuses."
+#endif
+
+/*
+ * 44.1 -> 12 kHz ANTI-ALIAS FRONT END (Phase 2, 2026-09-20).
+ *
+ * WHAT IT ADDS: a composed /2 + 1:1 front-end row reaching 22.05 kHz, so that 44.1 <-> 12 kHz has a
+ * FILTERED route.  Its DIRECT route stays refused.
+ *
+ * TWO SHAPES WERE GENERATED AND THE CHEAPER ONE CHOSEN, which is why both sets exist in the
+ * generator: /2 to 22.05 kHz (N31 + N71) and /3 to 14.7 kHz (N115 + N47).  Both clear the design
+ * gate; /2 wins on every resource axis at once -- 34.2 % of the core against 36.2 %, 123 of the
+ * 209-sample arena against 182, and 408 B of new coefficients against 648 -- while still holding
+ * -109.54 dBc, 9.5 dB inside the product gate.  The /3 sets stay in the generator so the choice can
+ * be re-checked rather than taken on trust, and because a later CPU-versus-margin decision might
+ * reverse it.
+ *   [internal] study_remaining_rate_pairs_20260920.md, Phase 2.
+ *
+ * BOTH SETS ARE NEW HERE, unlike the two pairs before it: nothing in the image protects 12 kHz from
+ * 22.05 kHz.  Both are generated by tools/asrc/asrc_lpf1to1_design.py (rows "dec2_44k1_for_12k" and
+ * "lp1_22k05_to_12k"); regenerate with --write, never patch.
+ *
+ * WHAT IT DOES NOT TOUCH: s_asrc_unsafe_direct_routes[] (the pair stays listed and its DIRECT route
+ * stays refused -- the row is exempt by RATIO), ASRC_POLY_FC, the kernel, and no existing
+ * coefficient array.
+ *
+ * DEFAULT 1 ON THE BIDIR PRESET since 2026-09-20 (owner decision after listening); 0 everywhere
+ * else, including every MEAS preset.  Pinned in asrc_app_build_config.h, which is read before
+ * this file.  Opt out with -Define APP_ASRC_ANTIALIAS_44K1_TO_12K=0.
+ *
+ * THIS IS THE HEAVIEST OF THE FOUR: 72.5 % of the core at 16 ch, the worst of the new rows.  It
+ * is still 20.8 points under the image's own pre-existing worst (93.3 % at 22.05/48, an EXISTING
+ * row), so enabling it does not move the ceiling -- but it is the row to look at first if a
+ * later channel-count or rate-coverage change tightens the CPU window.
+ */
+#ifndef APP_ASRC_ANTIALIAS_44K1_TO_12K
+#define APP_ASRC_ANTIALIAS_44K1_TO_12K (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_44K1_TO_12K && !APP_ASRC_LPF1TO1_PROTOTYPE
+#error "APP_ASRC_ANTIALIAS_44K1_TO_12K needs APP_ASRC_LPF1TO1_PROTOTYPE=1: this row is a composed /2 + 1:1 chain, and the 1:1 stage kind, asrc_decimator_q31_init_dec_then_lpf1to1() and both coefficient arrays (s_dec2_44k1_for_12k_coeff, s_lp1_22k05_to_12k_coeff) all live behind the prototype gate.  With the prototype off the row would be PLANNED and never ARMED, which reads in the log exactly like a working direct path -- and for this pair a direct path is the thing the anti-alias policy refuses."
+#endif
+
+/*
+ * 44.1 -> 8 kHz ANTI-ALIAS FRONT END (Phase 3, 2026-09-20).
+ *
+ * THIS PAIR IS NOT LIKE THE OTHER THREE, and the difference decides the shape.  The other pairs are
+ * refused by the ANTI-ALIAS policy -- their direct step is starve-safe and the fill law accepts it.
+ * 44.1 -> 8 kHz is refused EARLIER, by the fill law itself: its direct step is 5.5125, which needs
+ * set_required = 116 against TARGET_MAX = 104.  So the front end here has to clear TWO independent
+ * gates, and "fix the fill and it works" was an assumption that had to be tested rather than
+ * inherited.  It holds, but only for some shapes:
+ *   /2  fill OK (set_required 75) but 205 taps to reach the product gate -> 68.7 % CPU, arena 219
+ *       of 209.  FAILS on resources, not on either gate.
+ *   /3  fill OK (61), spectrum -109.50 dBc, arena 138, 26.4 % CPU.  PASSES.
+ *   /4  fill OK (54), spectrum -113.01 dBc, arena 171, 26.1 % CPU.  PASSES, and is CHOSEN.
+ *
+ * WHY /4 OVER /3, on the axis that was blocking this pair: /4 leaves rear step 1.378125 where /3
+ * leaves 1.8375, so its predicted hr floor is +19 against +12 -- more margin on the FILL axis, which
+ * is the one that refused the pair in the first place.  It also holds 13.01 dB of spectral margin
+ * against /3's 9.50 dB.  It costs 624 B against 472 B and 82 % of the arena against 66 %, which is
+ * the trade made deliberately.  And rear step 1.378125 is a step this product has already measured
+ * for 42 minutes (PR #36's 22.05 -> 8 kHz row), so nothing about the ring behaviour is new.
+ *   [internal] study_remaining_rate_pairs_20260920.md, Phase 3, and the four-axis candidate scan
+ *   [internal tool] asrc_44k1_to_8k_candidate_scan.py.
+ *
+ * A /4 PRE-STAGE IS NOT A NEW KERNEL.  dec_q31_stage_set() takes the decimation as a runtime
+ * uint8_t and every buffer size in the arm is derived from it, so d0 = 4 is an ordinary value of the
+ * same arithmetic -- the same argument that made the /3 Universal rows a table entry.
+ *
+ * WHAT IT DOES NOT TOUCH: s_asrc_unsafe_direct_routes[] does not list this pair at all (it was
+ * never an anti-alias refusal), the fill law is UNCHANGED -- the front end lowers the step rather
+ * than the law being relaxed -- ASRC_POLY_FC, the kernel, and no existing coefficient array.
+ *
+ * DEFAULT 1 ON THE BIDIR PRESET since 2026-09-20 (owner decision after listening); 0 everywhere
+ * else, including every MEAS preset.  Pinned in asrc_app_build_config.h, which is read before
+ * this file.  Opt out with -Define APP_ASRC_ANTIALIAS_44K1_TO_8K=0.
+ *
+ * THIS IS THE ROW WITH THE LARGEST ARENA, 171 of 209.  Default-on therefore makes 171 the
+ * image's worst front-end arena figure; the _Static_asserts below hold it at compile time rather
+ * than leaving it to be re-derived.
+ */
+#ifndef APP_ASRC_ANTIALIAS_44K1_TO_8K
+#define APP_ASRC_ANTIALIAS_44K1_TO_8K (0)
+#endif
+
+#if APP_ASRC_ANTIALIAS_44K1_TO_8K && !APP_ASRC_LPF1TO1_PROTOTYPE
+#error "APP_ASRC_ANTIALIAS_44K1_TO_8K needs APP_ASRC_LPF1TO1_PROTOTYPE=1: this row is a composed /4 + 1:1 chain, and the 1:1 stage kind, asrc_decimator_q31_init_dec_then_lpf1to1() and both coefficient arrays (s_dec4_44k1_for_8k_coeff, s_lp1_11k025_to_8k_coeff) all live behind the prototype gate.  With the prototype off the row would be PLANNED and never ARMED, which reads in the log exactly like a working direct path -- and this pair's direct path is what the FILL LAW refuses, so it would then be refused again with a confusing reason."
+#endif
+
+/*
+ * THE UNIVERSAL SPEC PROFILE (Phase I, 2026-09-16).  A PROFILE, not a feature.
+ *
+ * WHAT IT SELECTS.  The 15 rate pairs whose SHIPPED front end was signed off against its own
+ * per-rate passband spec get a different chain -- one designed against the single uniform spec
+ * (PROTECT_RATIO 0.8125 of the output Nyquist, +/-0.10 dB in band, -105 dBc design alias).  The
+ * shipped chains are not touched: the Universal rows live in their own coefficient file
+ * (asrc_lpf1to1_coeffs.inc) and their own planner rows, so at 0 this image is the image a tree
+ * without this change produces.
+ *
+ * WHY IT IS A PROFILE AND NOT A FIX.  "The generator chain passes" and "the chain meets the
+ * uniform spec" are different statements, and reading the first as the second is the defect
+ * being migrated away from: 15 of 19 shipped sets are signed off at a passband edge between
+ * 0.7143 and 0.8333 of FN.  A profile keeps BOTH answers buildable and makes which one an image
+ * carries a build fact rather than a reading of a comment.
+ * [internal] study_ak512_universal_spec_migration_phase_h_2026-09-15.md sections 1-2,
+ * [internal] study_ak512_universal_phase_i_firmware_realization_2026-09-16.md.
+ *
+ * WHAT IT NEEDS, and why each is an #error rather than an #ifndef that quietly turns it on:
+ *   - APP_ASRC_LPF1TO1_PROTOTYPE.  Every Universal row ends in a 1:1 band-limit at the source
+ *     or intermediate rate -- that stage, its two entry points and its coefficient file all
+ *     live behind that gate.  Without it the rows would be planned and never armed, which reads
+ *     in the log exactly like a working direct path.
+ *   - ASRC_POLY_L == 256 on the AK512 M30 family.  6 of the 15 rows' passband deviation is
+ *     ENTIRELY the rear prototype's (96 -> 48 kHz: front-end contribution exactly 0.0000 dB),
+ *     so no front end this profile can build fixes them -- the phase count does.  The BIDIR
+ *     preset already pins L=256 and guards it; this states the dependency from the profile's
+ *     side so a preset that is not that one cannot claim the profile.
+ */
+/*
+ * WHAT THE PROFILE GUARANTEES, AND WHERE IT STOPS (owner, 2026-09-16).  Stated here because
+ * this is where the profile is defined, and because the band it does NOT cover is the one a
+ * reader is most likely to assume:
+ *
+ *   Universal profile guarantees spectral performance only through 0.8125 x output Nyquist.
+ *   Response from 0.8125 x Nyquist to Nyquist is transition-band behavior and is not
+ *   guaranteed.
+ *
+ * THE CASE THAT MADE THIS EXPLICIT.  At a 32 kHz output FN = 16 kHz, so the guarantee ends at
+ * 13 kHz.  Measured over 13-16 kHz the profile leaves about -6.03 dBc where the legacy Audio
+ * Mode chain reaches about -25.50 dBc, because the Universal 1:1 stage passes to ~0.8125 x
+ * 24 kHz and the rear runs at step 1.5, so 16-19.5 kHz folds back into 13-16 kHz almost
+ * unattenuated.  That 19.5 dB is DIFFERENT_BUT_VALID, not a FAIL: neither number is claimed
+ * inside the guaranteed band, the guaranteed band itself (0-13 kHz) is where the profile is
+ * better, and the Legacy Audio Mode image is retained rather than deleted -- build this preset
+ * without the profile and it is unchanged.
+ *
+ * DO NOT LENGTHEN THE UNIVERSAL FIR FOR THIS BAND.  If listening or a customer requirement
+ * ever asks for attenuation there, it is a NEW quality requirement with its own evidence, not
+ * a defect in this specification.
+ * [internal] study_ak512_universal_phase_i_firmware_realization_2026-09-16.md 10.3a.
+ */
+#ifndef APP_ASRC_UNIVERSAL_PROFILE
+#define APP_ASRC_UNIVERSAL_PROFILE (0)
+#endif
+#if APP_ASRC_UNIVERSAL_PROFILE && !APP_ASRC_LPF1TO1_PROTOTYPE
+#error "APP_ASRC_UNIVERSAL_PROFILE needs APP_ASRC_LPF1TO1_PROTOTYPE=1: every Universal row ends in a 1:1 band-limit stage, and that stage, its two init entry points and its coefficient file all live behind the prototype gate.  With the prototype off the Universal rows would be PLANNED and never ARMED, which reads in the log exactly like a working direct path."
+#endif
+/*
+ * THE RUNTIME FRONT END, DEMANDED FROM HERE -- and why this is not a duplicate of the check
+ * asrc_audio_path.c already has.
+ *
+ * That file's two prototype guards ("needs the Q31 front end" / "needs APP_ASRC_RUNTIME_48K_TO_8")
+ * sit INSIDE its `#if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8` region, which is
+ * where the front end's whole implementation lives.  So on a preset with neither -- the AK128
+ * bi-codec is one -- the guards are compiled out along with everything they guard: the gate is
+ * unreachable on exactly the presets it was written to refuse.  Measured 2026-09-16 by building
+ * APP_BUILD_ASRC_AK128_CODEC_BIDIR with the prototype gate on; it does not stop at either #error,
+ * it fails later in audio_app_asrc.c on an asrc_t member that only the runtime build has.
+ *
+ * This file is included before any of that and reads APP_ASRC_RUNTIME_48K_TO_8 after every preset
+ * has had its say (the default is at the top of this file), so the requirement can be stated where
+ * it is actually reachable.  Stated for the PROFILE and, separately, for the PROTOTYPE, because the
+ * two are different claims and a preset can fail the second without asking for the first.
+ *
+ * The pre-existing guards in asrc_audio_path.c are deliberately left where they are: they are still
+ * correct for every preset that HAS the region, and moving them is a change to the Phase 1 gate's
+ * structure rather than to this profile.  Recorded in the Phase I report instead.
+ */
+#if APP_ASRC_LPF1TO1_PROTOTYPE && !( APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8 )
+#error "APP_ASRC_LPF1TO1_PROTOTYPE needs the runtime-selected front end (APP_ASRC_RUNTIME_48K_TO_8, or the fixed APP_ASRC_48K_TO_8_INTEGRATION preset): the routing, the arming, the coefficient tables and the telemetry naming all live inside that region in asrc_audio_path.c and audio_app_asrc.c.  The guards inside asrc_audio_path.c cannot say this -- they are inside the region themselves -- so it is said here.  This preset (e.g. the AK128 bi-codec) has no such front end; leave the prototype at 0."
+#endif
+#if APP_ASRC_UNIVERSAL_PROFILE && !( APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8 )
+#error "APP_ASRC_UNIVERSAL_PROFILE needs the runtime-selected front end (APP_ASRC_RUNTIME_48K_TO_8): the profile's 15 rows are planner rows, and the planner's row table -- along with the coefficient row lists it expands -- is only compiled where the front-end implementation is.  Without it the profile's rows would not merely be unreachable, they would not compile."
+#endif
+/* THE PHASE-COUNT DEPENDENCY, as an invariant and not as a note.  Stated from the PROFILE's side
+ * so it holds on whatever preset claims the profile -- the BIDIR preset's own L=256 pin (see
+ * asrc_app_build_config.h) is the other half of the same statement, and either one alone can be
+ * satisfied by a preset the other was not written for.  ASRC_POLY_L is resolved above; the family
+ * macro comes from asrc_app_build_config.h, which is included before this file. */
+/* RESEARCH, DEFAULT OFF: quadratic phase blend for the Q31 rear (Hi-Fi 48 -> 44.1 kHz study,
+ * [internal] PLAN_asrc_hifi_48to44k1.md, axis A).  The shipped blend interpolates LINEARLY
+ * between table rows p and p+1; its error is a spur at 40*log10(f/(L*fs_in)) dBc (-113.7 dBc for a
+ * 17.5 kHz tone at 48 -> 44.1 kHz, measured).  A 3-row (p, p+1, p+2) Lagrange blend removes that
+ * term down to the filter's own floor on the host (-139.8 dBc).  Cost: one extra table row (136 B
+ * of flash) and one extra MAC plus two subtracts per tap of the ONE blended row per output frame,
+ * shared by all channels.  OFF leaves the image byte-identical in code and data: every addition
+ * below is under this gate. */
+#ifndef APP_ASRC_REAR_QUAD_BLEND
+#define APP_ASRC_REAR_QUAD_BLEND (0)
+#endif
+#if APP_ASRC_REAR_QUAD_BLEND && !( ASRC_SAMPLE_Q31 && ( ASRC_POLY_L == 256u ) && ( ASRC_POLY_M == 34u ) )
+#error "APP_ASRC_REAR_QUAD_BLEND is wired for the Q31 rear at L=256 M=34 only: its extra row (asrc_poly_q31_table_l256m34_xrow.h) belongs to that table"
+#endif
+#if APP_ASRC_REAR_QUAD_BLEND && ( APP_ASRC_Q31_OPT_KERNELS || APP_ASRC_STAGE_PROFILE )
+#error "APP_ASRC_REAR_QUAD_BLEND replaces only the plain blend call; the _opt and stage-profiled call sites still run the linear blend"
+#endif
+/* The SHIPPED linear blend read four taps per row per pass (_mchp_asrc_q31_blend_row_lin4,
+ * bit-exact to _mchp_asrc_q31_blend_row) from the table padded to a 16-byte row stride.  Boot
+ * bench: 606 -> 380 cycles per output frame.  Default 1 on the AK512 BIDIR / MEAS M34 Q31 rear
+ * (asrc_app_build_config.h, owner 2026-10-11); 0 everywhere else, and -Define APP_ASRC_REAR_LIN4=0
+ * returns those presets to mchp_asrc_q31_blend_row with the unpadded table. */
+#ifndef APP_ASRC_REAR_LIN4
+#define APP_ASRC_REAR_LIN4 (0)
+#endif
+#if APP_ASRC_REAR_LIN4 && APP_ASRC_REAR_QUAD_BLEND
+#error "APP_ASRC_REAR_LIN4 is the linear-blend arm; APP_ASRC_REAR_QUAD_BLEND already reads in groups of four (quad4)"
+#endif
+#if APP_ASRC_REAR_LIN4 && !( ASRC_SAMPLE_Q31 && ( ( ASRC_POLY_M % 4u ) == 2u ) )
+#error "APP_ASRC_REAR_LIN4 needs the Q31 rear with M = 4n + 2 (groups of four plus one pair)"
+#endif
+/* Research (Hi-Fi P5 axis D, default 0): compile the P0 kick log (?af01) into a BA MEAS image too.
+ * It was left out of BA on 2026-09-29 for RAM (stack region 10 308 B then); the BA MEAS image now has
+ * a 20.5 KB stack region, and the log costs 8 KB.  OFF leaves the image unchanged. */
+#ifndef APP_P0K_LOG_BA
+#define APP_P0K_LOG_BA (0)
+#endif
+#if APP_ASRC_REAR_LIN4 && ( APP_ASRC_Q31_OPT_KERNELS || APP_ASRC_STAGE_PROFILE )
+#error "APP_ASRC_REAR_LIN4 replaces only the plain blend call; the _opt and stage-profiled call sites still run the packed-table kernel"
+#endif
+
+#if APP_ASRC_UNIVERSAL_PROFILE && APP_ASRC_RING_IS_AK512_M30_FAMILY && ( ASRC_POLY_L != 256u )
+#error "APP_ASRC_UNIVERSAL_PROFILE on the AK512 M30 family needs ASRC_POLY_L == 256: six of its fifteen rows have a passband deviation that is ENTIRELY the rear prototype's -- 96 -> 48 kHz measures a front-end contribution of exactly 0.0000 dB -- so no front end this profile builds can meet the uniform +/-0.10 dB there, and the phase count is what does.  See the Phase H decomposition table."
+#endif
+
+/* THE REAR ARITHMETIC, as an invariant and for the same reason the phase count above is one.
+ *
+ * The profile is a two-image bundle, and its claim is that both images implement ONE
+ * architecture.  The L=256 demanded just above was chosen for the Q31 rear's
+ * phase-interpolation spur; a float rear does not have that spur, so on a float image L=256 buys
+ * nothing and the image is not what Phase H qualified.  A bundle whose two members disagree here
+ * has no single audio qualification -- each member's evidence would belong to a different filter.
+ *
+ * Member B's pin is in asrc_app_build_config.h (the 96k A->B preset block); member A's has been
+ * there since 2026-09-12.  This says it from the PROFILE's side so it holds on whatever preset
+ * claims the profile, and so that a stray -Define ASRC_SAMPLE_Q31=0 cannot quietly ship a bundle
+ * with two different rears.  The float arm remains fully buildable OUTSIDE the profile -- that is
+ * the Legacy Audio Mode image, which is kept, not deleted. */
+#if APP_ASRC_UNIVERSAL_PROFILE && APP_ASRC_RING_IS_AK512_M30_FAMILY && !ASRC_SAMPLE_Q31
+#error "APP_ASRC_UNIVERSAL_PROFILE on the AK512 M30 family needs the Q31 rear (ASRC_SAMPLE_Q31 == 1): the profile's ASRC_POLY_L == 256 was chosen for the Q31 rear's phase-interpolation spur (closed form 40*log10(f/(L*rear_in)), matched to 0.02 dB), so a float rear is a different resampler carrying a different qualification, and the two-image bundle would then implement two architectures under one profile name. Build the float arm without the profile (APP_ASRC_UNIVERSAL_PROFILE=0) -- that is the Legacy Audio Mode image, which is retained."
+#endif
+
+/*
+ * 96 -> 32 kHz THIRD-BAND front end (3-path polyphase allpass, 16 first-order sections).
+ * 0 in EVERY preset: opted into with -Define APP_ASRC_THIRDBAND_96_TO_32=1, and left at 0
+ * the image is byte-identical to one built without it -- the assembler kernel lives in its
+ * own sections and --gc-sections drops it, and nothing on the audio path references it.
+ *
+ * Compiling it in does NOT select it: unless APP_ASRC_THIRDBAND_DEFAULT_ON says otherwise the
+ * image boots on the composed 41-tap /2 + 97-tap 2/3 chain and `*av01` switches, so ONE image
+ * compares both front ends under identical DSP, TDM, console and instrument conditions.  Two images cannot: a 78-second
+ * window does not resolve the difference between two builds, which this tree has measured.
+ *
+ * It REPLACES the composed 96 -> 32 kHz chain and no other ratio, needs the Q31 front end
+ * (the state, the coefficients and the two arenas are all Q31), and needs a 96 kHz leg to
+ * have anything to decimate.  Refused below rather than silently doing nothing.
+ *
+ * The state, the gathered input block and the coefficients are carved out of the Q31 front
+ * end's existing arenas, so this costs no RAM -- and therefore the two front ends cannot
+ * both hold state, which is why switching modes re-initialises rather than flipping a flag.
+ * See src/app/apps/asrc/asrc_thirdband_96_to_32.inc.
+ */
+#ifndef APP_ASRC_THIRDBAND_96_TO_32
+#define APP_ASRC_THIRDBAND_96_TO_32 (0)
+#endif
+
+/* Which front end the image BOOTS on.  0 = the composed chain, which is what the runtime
+ * A/B is measured against, so that is the default and an image built without any of this
+ * is unaffected either way.
+ *
+ * It exists because the runtime switch is not always usable.  `*av 01` applies a mode by
+ * re-applying leg A's rate -- the mechanism `*aj` uses -- and on this preset that restart
+ * does not bring WM8904-B back: `audio_transport_start: WM8904-B did not answer` and only
+ * a USB reconnect recovers it (measured 2026-09-10, both before and after a power cycle,
+ * with and without a preceding `*ts`).  That is a property of this preset's restart path
+ * and not of this front end, but it means the CPU figure and the listening comparison need
+ * a way to reach the third band WITHOUT a restart.  This is it.
+ *
+ * For the CPU figure two images are sound: `fe=` is a per-block instrument on the leg's own
+ * telemetry line, not a long-dwell audio delta, so the "78 seconds cannot resolve two
+ * images" caution does not apply to it. */
+#ifndef APP_ASRC_THIRDBAND_DEFAULT_ON
+#define APP_ASRC_THIRDBAND_DEFAULT_ON (0)
+#endif
+
+/* Input headroom for the third band, in BITS, restored by the kernel's store.  3 = 18 dB,
+ * which is what the host gate measured as necessary: the section outputs are stored int32
+ * words and reach 1.011x full scale on a 997 Hz full-scale sine, 2.848x on full-scale noise
+ * and 4.970x at the L1 bound.  6 dB was the expectation and is NOT enough.  The shift is
+ * exact on an s24-left input, so it costs no precision and no alias (-110.11 dBc measured
+ * with it).  Must match ASRC_TB32_HSHIFT in the assembler kernel. */
+#ifndef APP_ASRC_THIRDBAND_HEADROOM_SHIFT
+#define APP_ASRC_THIRDBAND_HEADROOM_SHIFT (3)
+#endif
+
+/* The "needs a 96 kHz leg" check is NOT here: APP_USE_96K_RATE is decided in
+ * app_specific_config_defs.h, which includes THIS header on its way to deciding it, so a
+ * test here reads an undefined macro as 0 and fires in every build.  It lives in
+ * asrc_app_validate.h, which that header includes at the end of its validation section
+ * once every common fact is settled.  (An #if cannot see what has not been defined yet --
+ * the same trap as an #if that cannot see an enum.)
+ *
+ * The range check below depends on nothing but itself, so it can stay. */
+#if APP_ASRC_THIRDBAND_96_TO_32
+#if (APP_ASRC_THIRDBAND_HEADROOM_SHIFT < 0) || (APP_ASRC_THIRDBAND_HEADROOM_SHIFT > 8)
+#error "APP_ASRC_THIRDBAND_HEADROOM_SHIFT must be 0..8. Above 8 the shift stops being exact on an s24-left input and starts discarding signal; below 0 is not a shift."
+#endif
+#endif
+
 /* The Q31 correctness proof (coefficient digest, the 110 generated vectors, the
  * assembly-vs-C comparison and the 16-channel independence run).  Costs ~700 B of
  * stack while it runs and nothing afterwards; it runs once out of
  * audio_app_asrc_reset_all(), before asrc_reset() clears the scratch it borrows. */
 #ifndef APP_ASRC_Q31_SELFTEST
 #define APP_ASRC_Q31_SELFTEST (ASRC_SAMPLE_Q31)
+#endif
+
+/*
+ * THE REAR PER-CHANNEL BIT-EXACT ORACLE -- TEST ONLY, DEFAULT OFF.
+ *
+ * asrc_rear_isolation_selftest.inc: every one of the ASRC_CH logical channels of the rear Q31
+ * polyphase, at the PRODUCTION ring stride and through the producer's mirror overhang, compared
+ * bit-for-bit against an oracle that shares no indexing, no accumulator and no phase arithmetic
+ * with the shipping path.  It closes the hole section 25.5 of the Phase I report names: the front
+ * end had such an oracle and the rear did not.
+ *
+ * DEFAULT 0, AND THAT IS A REQUIREMENT RATHER THAN A PREFERENCE.  Every absolute CPU and Hard-RT
+ * figure in the Phase I record was measured on an image built with this off, so the shipping image
+ * must contain no code, no data and no runtime branch from it -- which is why it is one compile gate
+ * around a whole file instead of a runtime `if`.  Turning it on costs about 700 B of stack while it
+ * runs, once, and nothing afterwards.
+ *
+ * It BORROWS the live engine's ring, so it runs only out of audio_app_asrc_reset_all() and only
+ * while no audio ISR has ever executed; asrc_reset() clears the ring immediately afterwards.  The
+ * call site prints a SKIP rather than staying silent when that gate closes -- a capture log must
+ * never be ambiguous about whether a selftest passed or never ran.
+ */
+#ifndef APP_ASRC_REAR_ISOLATION_SELFTEST
+#define APP_ASRC_REAR_ISOLATION_SELFTEST (0)
 #endif
 
 // 1 = clamp then truncate float->24-bit sample (matches convert_codec_float_to_int fast path).

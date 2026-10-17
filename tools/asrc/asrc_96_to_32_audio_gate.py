@@ -59,7 +59,7 @@ dsg = _load("dsg", "tools/asrc/asrc_decimator_48_to_8_design.py")
 gate48 = _load("gate48", "tools/asrc/asrc_48_to_32_audio_gate.py")
 
 L_REAR = chk.L                       # 128 resampler phases
-SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11: 30 taps, fc 0.465 of ITS input rate
+SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11.3: 30 taps, fc 0.464 of ITS input rate
 IN_HZ = 96000.0                      # the leg's input rate
 MID_HZ = 48000.0                     # after the /2 pre-stage
 OUT_HZ = 32000.0

@@ -25,7 +25,7 @@ HALFRATE_TONES = (1000, 8000, 8800, 13000, 18000, 23000)
 # The 22.05 kHz variant of the same /2 structure.  7800 Hz sits just inside its 7875 Hz passband
 # edge.  11500 Hz is the tone that separates the two variants: it is ABOVE the 22.05 kHz output
 # Nyquist (11025 Hz) but BELOW the intermediate's (12000 Hz), so it does not fold in the stage at
-# all -- it survives to the resampler, which cannot remove it (its fc = 0.465*24000 = 11160 Hz
+# all -- it survives to the resampler, which cannot remove it (its fc = 0.464*24000 = 11136 Hz
 # sits above 11025 Hz).  The 24 kHz coefficients leave it ~-19 dB down; this variant must bury it.
 # 13000/18000/23000 are the same fold sources as above, kept so the two variants are compared on
 # identical ground.

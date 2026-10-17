@@ -115,6 +115,30 @@ static inline bool nora_ccp_icap_read_hot(nora_ccp_inst_t inst,
 }
 
 /*
+ * Current count of this instance's time base (CCPxTMR), the counter a capture latches into
+ * CCPxBUF. Backend-private helper with no portable twin, hence the chip in its name. Lets a
+ * consumer measure "now minus the last captured edge" on the capture's own counter, with no
+ * cross-counter offset to calibrate. Same constant-instance folding rule as above.
+ */
+static inline uint32_t nora_ccp_dspic33ak_timer_now(nora_ccp_inst_t inst)
+{
+    switch (inst)
+    {
+    case NORA_CCP1: return CCP1TMR;
+    case NORA_CCP2: return CCP2TMR;
+    case NORA_CCP3: return CCP3TMR;
+    case NORA_CCP4: return CCP4TMR;
+    case NORA_CCP5: return CCP5TMR;
+    case NORA_CCP6: return CCP6TMR;
+    case NORA_CCP7: return CCP7TMR;
+    case NORA_CCP8: return CCP8TMR;
+    case NORA_CCP9: return CCP9TMR;
+    default:
+        return 0u;
+    }
+}
+
+/*
  * Clear this instance's CPU interrupt flag. Twin of nora_ccp_icap_irq_clear().
  *
  * Writes the DFP bit alias with a literal 0, so register, bit and value are all

@@ -42,7 +42,8 @@ RE_TDM = re.compile(r"TDM(1|2):resp=([\d.]+)us margin=([\d.]+)us(?: fs=(\d+)Hz)?
                     r".*?\(run,act,blk,miss\)=\((\d+),(\d+),(\d+),(\d+)\)")
 RE_SUM = re.compile(r"TDMsum:max=([\d.]+)us\(([\d.]+)%\)margin=([-\d.]+)us sat=(\d+)")
 # 2026-08-27 telemetry: hr=fmin-R replaces fill=/fmin=/R=; rates moved to the ratio-lock line.
-RE_POLY = re.compile(r"\[poly-k11 x16ch\](AB|BA) hr=(-?\d+) set=(\d+)(!?) "
+# Kernel tag is `poly-k<beta>`: k11 / k11.3 (M30) and k14 (M34 rear, 2026-10-02).
+RE_POLY = re.compile(r"\[poly-k[\d.]+ x16ch\](AB|BA) hr=(-?\d+) set=(\d+)(!?) "
                      r"step=([\d.]+) pull=([\d.]+)us drop=(\d+) starve=(\d+)(!J)? fe=(\S+)")
 RE_PATH = re.compile(r"cbA=([\d.]+)us pushAB=([\d.]+)us .*?cbB=([\d.]+)us pushBA=([\d.]+)us")
 # The measured rates left the per-engine line in the 2026-08-27 diet (they are constant between

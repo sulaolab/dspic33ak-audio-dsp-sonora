@@ -36,6 +36,7 @@ buildtools/check_publication.ps1 export-ignore
 buildtools/check_publication_archive.ps1 export-ignore
 buildtools/check_publication_all.ps1 export-ignore
 buildtools/check_publication_selftest.ps1 export-ignore
+buildtools/check_vendor_source.ps1 export-ignore
 buildtools/publication_gate_common.ps1 export-ignore
 buildtools/publication_gate_exceptions.psd1 export-ignore
 buildtools/make_single_app_tree.ps1 export-ignore
@@ -50,3 +51,8 @@ tools/nora_hal_sync/ export-ignore
 tools/classic/avas_type_lb_l3/ export-ignore
 tools/rom_diet/_* export-ignore
 tools_local/ export-ignore
+_ai_out/ export-ignore
+NEXT_SONORA_DF2T_READY.md export-ignore
+buildtools/flash_df2t_sonora.ps1 export-ignore
+tools/pwm_audio_host/ export-ignore
+tools/asrc/asrc_rear_filter_full81_replay.py export-ignore

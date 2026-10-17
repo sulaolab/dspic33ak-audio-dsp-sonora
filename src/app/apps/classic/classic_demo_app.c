@@ -70,6 +70,15 @@ static void classic_transport_reset( void* user )
     classic_audio_path_reset();
 }
 
+#if APP_USE_PWM_AUDIO
+static void classic_transport_stop_aux_output( void* user )
+{
+    (void)user;
+    classic_audio_pwm_stop();
+    printf(" Classic PWM: stopped by *ts.\n");
+}
+#endif
+
 static const audio_transport_client_t s_classic_transport_client =
 {
     .capabilities = 0u,
@@ -79,6 +88,9 @@ static const audio_transport_client_t s_classic_transport_client =
     .prepare = classic_transport_prepare,
     .reset_stream_state = classic_transport_reset,
     .clock_progress = NULL,
+#if APP_USE_PWM_AUDIO
+    .stop_aux_output = classic_transport_stop_aux_output,
+#endif
     .user = NULL,
 };
 
@@ -110,14 +122,31 @@ void audio_application_telemetry_print(
     {
         extern uint32_t dt;   // biquad cascade process time (audio/biquad_cascade_4ch.c)
         const uint32_t iir_us10 = nora_high_res_timer_count_to_us_x10( dt );
-        printf("[stage=%d total=%d]", BIQUAD_CASCADE_4CH_NUM_STAGE,
+#if ENA_BIQUAD_CASCADE_4CH_X1S3P
+        const uint32_t measured_channels = 1u;
+#elif ENA_BIQUAD_CASCADE_4CH_X4T
+        const uint32_t measured_channels = 4u;
+#elif ENA_BIQUAD_CASCADE_4CH_X2
+        const uint32_t measured_channels = 2u;
+#else
+        const uint32_t measured_channels = 1u;
+#endif
+        const uint32_t sample_sos =
+            measured_channels * (uint32_t)APP_BLOCK_FRAMES *
+            (uint32_t)BIQUAD_CASCADE_4CH_NUM_STAGE;
+        const uint32_t ns10_per_sample_sos = (uint32_t)(
+            (((uint64_t)iir_us10 * 1000u) + (sample_sos / 2u)) / sample_sos);
+        printf("[SOS/ch=%d total=%d]", BIQUAD_CASCADE_4CH_NUM_STAGE,
                BIQUAD_CASCADE_4CH_NUM_STAGE * STAGE_2_PROC_CH);
 #if defined(USE_CMSIS_IIR_DSP_PROCESS)
-        printf("CMSIS-IIR:%lu.%luus", (unsigned long)(iir_us10 / 10u),
-               (unsigned long)(iir_us10 % 10u));
+        printf(" DF2T:%lu.%luns/sample/SOS",
+               (unsigned long)(ns10_per_sample_sos / 10u),
+               (unsigned long)(ns10_per_sample_sos % 10u));
+        printf(" kernel=%s", biquad_cascade_4ch_cmsis_kernel_name());
 #else
-        printf("C-IIR:%lu.%luus", (unsigned long)(iir_us10 / 10u),
-               (unsigned long)(iir_us10 % 10u));
+        printf(" DF2T:%lu.%luns/sample/SOS",
+               (unsigned long)(ns10_per_sample_sos / 10u),
+               (unsigned long)(ns10_per_sample_sos % 10u));
 #endif
     }
 #endif //ENA_BIQUAD_IIR_CASCADE
@@ -218,6 +247,12 @@ void sonora_app_start_aux_output( void )
 
 bool sonora_app_manage_audio( void )
 {
+#if PWM_AUDIO_SCOPE_ONLY
+    classic_audio_pwm_scope_service();
+#endif
+#if APP_PWM_OUTPUT == 1 || (APP_USE_PWM_AUDIO && APP_PWM_AUDIO_HAL)
+    if (classic_audio_pwm_fault_active()) classic_audio_pwm_stop();
+#endif
 #if defined(ENA_SAI_WRAPPER_LIVE)
     return audio_transport_cmsis_sai_manage();
 #else
@@ -257,6 +292,9 @@ void sonora_app_debug_print( void )
      * change a feature's state. So the gate is applied to each printf, and the control path runs
      * either way. */
     const bool dbg_on = audio_transport_dbg_enabled();
+#if PWM_AUDIO_SCOPE_ONLY
+    if (dbg_on) classic_audio_pwm_scope_print();
+#endif
 
     if( (uint32_t)(cur - last_prt_2) >= 200 )
     {

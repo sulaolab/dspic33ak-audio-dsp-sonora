@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""How much room is there above ASRC_POLY_FC = 0.465, and what does it buy at a 32 kHz output?
+"""How much room is there around ASRC_POLY_FC = 0.464, and what does it buy at a 32 kHz output?
 
 Follow-up to tools/asrc/asrc_48_to_32_feasibility.py, which found that a 48 -> 32 kHz
 L=2/M=3 front end drops the resampler's input rate to 32 kHz, so the resampler's own cutoff
-(a fixed fraction of ITS INPUT rate) lands at 0.465 * 32000 = 14880 Hz and costs -6.78 dB at
-15 kHz.  That ceiling belongs to the resampler, not to any front end.
+(a fixed fraction of ITS INPUT rate) lands at 0.464 * 32000 = 14848 Hz and defines the
+passband shoulder at 15 kHz.  That ceiling belongs to the resampler, not to any front end.
 
 Nothing here changes firmware.  Every number is host-side, computed from the same phase-row
 construction the firmware runs at init (chk.phase_rows), so a value adopted from this sweep is
@@ -12,9 +12,9 @@ adopted by editing one constant.
 
 Sections:
   1. The two gates the codebase actually pins (edge at 20 kHz >= -1.1 dB, worst prototype image
-     <= -105 dB), swept over fc.  This is what decides whether 0.465 is near a limit.
+     <= -105 dB), swept over fc.  This is what decides whether 0.464 is near a limit.
   2. The 32 kHz-input passband per fc, plus the -0.1 / -0.5 / -1 / -3 / -6 dB points.
-  3. Per-rate degradation: every supported pair, both legs, referenced to fc = 0.465.
+  3. Per-rate degradation: every supported pair, both legs, referenced to fc = 0.464.
   4. The five front-end cascades chk gates, recomputed per fc (the resampler is a factor in them).
   5. Candidate re-evaluation for 48 -> 32 with the improved resampler.
 
@@ -42,7 +42,7 @@ chk = _load("chk", "tools/asrc/asrc_headroom_filter_check.py")
 dsg = _load("dsg", "tools/asrc/asrc_decimator_48_to_8_design.py")
 
 L = chk.L
-SHIPPED = chk.CANDIDATES[1]           # headroom-m30-kaiser11, fc 0.465, the shipping resampler
+SHIPPED = chk.CANDIDATES[1]           # headroom-m30-kaiser11.3, fc 0.464, the shipping resampler
 NFFT = 1 << 16
 FREQS = np.linspace(0.0, 24000.0, 24001)
 GATE = -100.0
@@ -54,9 +54,9 @@ CH = 16
 OUT_HZ = 32000.0
 OUT_NYQ = 16000.0
 
-FCS = (0.4600, 0.4650, 0.4660, 0.4665, 0.4670, 0.4680, 0.4700, 0.4750)
-FC_REF = 0.4650
-FCS_STRICT = (0.4650, 0.4660, 0.4670)
+FCS = (0.4600, 0.4640, 0.4650, 0.4660, 0.4665, 0.4670, 0.4680, 0.4700, 0.4750)
+FC_REF = 0.4640
+FCS_STRICT = (0.4640, 0.4650, 0.4660)
 
 
 def cost_us(macs, calls):
@@ -118,7 +118,7 @@ def rule(title):
 rule("1. THE PINNED GATES, SWEPT OVER fc   (chk.analyze: ripple / edge at 20 kHz / worst image)")
 say("   These are the two limits the codebase itself enforces on the prototype, and they are")
 say("   RATE-INDEPENDENT (normalised to the resampler's own input rate).  Gates: edge >= -1.1 dB,")
-say("   worst image <= -105.0 dB.  M = 30, L = 128, Kaiser beta = 11 throughout.")
+say("   worst image <= -105.0 dB.  M = 30, L = 128, Kaiser beta = 11.3 throughout.")
 say(f"{'fc':>8} {'ripple':>9} {'edge@20k':>10} {'edge slack':>11} "
     f"{'worst image':>12} {'image slack':>12}  gate")
 gate1 = {}
@@ -147,7 +147,7 @@ for limit, label in ((IMAGE_GATE, "image <= -105.0 (Candidate gate)"),
         say(f"      {label:38} : nothing in 0.4600-0.4760 clears it")
     else:
         say(f"      {label:38} : fc <= {best[0]:.4f}  (image {best[1]:.2f} dB)")
-say("   The prototype has M = 30 taps and a FIXED Kaiser beta = 11, so raising fc narrows the")
+say("   The prototype has M = 30 taps and a FIXED Kaiser beta = 11.3, so raising fc narrows the")
 say("   transition band without buying back any stopband: the floor falls roughly 3 dB per")
 say("   0.001 of fc.  That is why this is a cliff and not a gradient.")
 
@@ -181,7 +181,7 @@ for fc in FCS:
 
 # =============================================================================================
 say()
-rule("3. PER-RATE DEGRADATION, BOTH LEGS, REFERENCED TO fc = 0.4650")
+rule("3. PER-RATE DEGRADATION, BOTH LEGS, REFERENCED TO fc = 0.4640")
 say("   Source content is assumed band-limited to 20/48 of the leg's INPUT rate -- exactly the")
 say("   assumption the -105 dB Candidate gate makes.  Under that convention a contribution")
 say("   counts only if it LANDS inside the protected band, which is why several legs report")
@@ -292,7 +292,7 @@ for label, kind, in_hz, arg, den in rows:
     say(f"{label:>14} {in_hz/1000.0:12.3f}k {kind:>7} "
         + "".join(f"{v:9.2f}" for v in vals) + f"  {degr:+10.2f}{fe}")
 say()
-say("   'worst degr' is the largest rise above the fc = 0.4650 column across the whole sweep,")
+say("   'worst degr' is the largest rise above the fc = 0.4640 column across the whole sweep,")
 say("   i.e. the price paid at fc = 0.4750 (the end of the grid).  Read the individual columns for a smaller step.")
 say("   NOTE the 8000 row's front end (43@48k + 147@16k) is not among the host-gated stage sets,")
 say("   so its cascade is not recomputed in section 4; its resampler factor is the row above.")

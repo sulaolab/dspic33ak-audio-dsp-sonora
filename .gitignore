@@ -20,6 +20,10 @@
 # than to the vendored (published) CMSIS-DSP tree.  -save-temps writes its dumps
 # under build/ and into *.X/, never into src/, so this cannot pick one up.
 !src/app/apps/**/*.s
+# And for hand-written assembly kept as documentation -- toolchain-bug
+# reproducers, which are never built as part of any configuration but are worth
+# preserving so a future reader can re-confirm the bug the notes describe.
+!docs_internal/**/repro/**/*.s
 
 # MPLAB X output directories
 build/

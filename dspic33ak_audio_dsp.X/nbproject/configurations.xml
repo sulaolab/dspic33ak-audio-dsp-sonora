@@ -33,6 +33,8 @@
           <itemPath>../src/app/apps/asrc/asrc_fir_hb_kernel_dspic33ak.s</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_fir_kernel_bench.c</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_fir_kernel_bench.h</itemPath>
+          <itemPath>../src/app/apps/asrc/asrc_thirdband_kernel_dspic33ak.s</itemPath>
+          <itemPath>../src/app/apps/asrc/asrc_thirdband_96_to_32_kernel_dspic33ak.s</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_full_iir_48_to_32.c</itemPath>
           <itemPath>../src/app/apps/asrc/asrc_full_iir_48_to_32.h</itemPath>
           <itemPath>../src/app/apps/asrc/audio_app_asrc.c</itemPath>
@@ -67,6 +69,7 @@
             <itemPath>../src/app/apps/classic/dsp/kinkon_synth.c</itemPath>
             <itemPath>../src/app/apps/classic/dsp/ch_expand_2to4.c</itemPath>
             <itemPath>../src/app/apps/classic/dsp/biquad_cascade_4ch.c</itemPath>
+            <itemPath>../src/app/apps/classic/dsp/biquad_tier1_bench.c</itemPath>
             <itemPath>../src/app/apps/classic/dsp/audio_sample_delay.c</itemPath>
             <itemPath>../src/app/apps/classic/dsp/fir_filter.c</itemPath>
             <itemPath>../src/app/apps/classic/dsp/fx_domain_48k.c</itemPath>
@@ -114,6 +117,9 @@
         <logicalFolder name="board_audio" displayName="audio" projectFiles="true">
           <itemPath>../src/app/board/audio/audio.c</itemPath>
           <itemPath>../src/app/board/audio/audio.h</itemPath>
+          <itemPath>../src/app/board/audio/nora_pwm_audio_conf.h</itemPath>
+          <itemPath>../src/app/board/audio/pwm_audio_board.h</itemPath>
+          <itemPath>../src/app/board/audio/pwm_audio_board_ak.c</itemPath>
           <itemPath>../src/app/board/audio/tdm.c</itemPath>
           <itemPath>../src/app/board/audio/tdm.h</itemPath>
           <itemPath>../src/app/board/audio/nora_spi_i2s_tdm_conf.h</itemPath>
@@ -156,6 +162,8 @@
         <itemPath>../src/app/diagnostics/app_silicon.h</itemPath>
         <itemPath>../src/app/diagnostics/app_traps.c</itemPath>
         <itemPath>../src/app/diagnostics/app_traps.h</itemPath>
+        <itemPath>../src/app/diagnostics/perf_monitor_dspic33a.c</itemPath>
+        <itemPath>../src/app/diagnostics/perf_monitor_dspic33a.h</itemPath>
       </logicalFolder>
       <logicalFolder name="f7" displayName="dspic33-cmsis-dsp" projectFiles="true">
         <logicalFolder name="f1" displayName="Source" projectFiles="true">
@@ -186,6 +194,23 @@
             <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/mchp_biquad_cascade_df2T_init_f32.s</itemPath>
             <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_opt_v1.s</itemPath>
             <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_opt_v2.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_opt_v3.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_gap.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_d1gap.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_storepos.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x2.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x2r.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x2c.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x3.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x3r.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x3rl.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x3t.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x3td.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x4t.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x1s2p.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x1s3p.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_cascade_df2T_f32_dspic33ak_x1s3p_readyN.s</itemPath>
+            <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/biquad_df2T_opt_v3_dispatch.c</itemPath>
             <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/mchp_fir_f32.s</itemPath>
             <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/mchp_fir_init_f32.s</itemPath>
             <itemPath>../src/app/dspic33-cmsis-dsp/Source/FilteringFunctions/mchp_fir_f32_ex.s</itemPath>
@@ -276,6 +301,13 @@
       <logicalFolder name="f24" displayName="hal_pwm" projectFiles="true">
         <itemPath>../src/app/hal_pwm/nora_pwm_dspic33ak.c</itemPath>
         <itemPath>../src/app/hal_pwm/nora_pwm.h</itemPath>
+      </logicalFolder>
+      <logicalFolder name="f24a" displayName="hal_pwm_audio" projectFiles="true">
+        <itemPath>../src/app/hal_pwm_audio/nora_pwm_audio.c</itemPath>
+        <itemPath>../src/app/hal_pwm_audio/nora_pwm_audio.h</itemPath>
+        <itemPath>../src/app/hal_pwm_audio/nora_pwm_audio_backend.h</itemPath>
+        <itemPath>../src/app/hal_pwm_audio/nora_pwm_audio_modulator.c</itemPath>
+        <itemPath>../src/app/hal_pwm_audio/nora_pwm_audio_modulator.h</itemPath>
       </logicalFolder>
       <logicalFolder name="f14" displayName="hal_spi" projectFiles="true">
         <itemPath>../src/app/hal_spi/nora_spi_dspic33ak.c</itemPath>
@@ -856,7 +888,7 @@
         <property key="enable-unroll-loops" value="false"/>
         <property key="expand-pragma-config" value="false"/>
         <property key="extra-include-directories"
-                  value="..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
+                  value="..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_pwm_audio;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
         <property key="isolate-each-function" value="true"/>
         <property key="keep-inline" value="false"/>
         <property key="oXC16gcc-cnsts-mauxflash" value="false"/>
@@ -2436,7 +2468,7 @@
         <property key="enable-unroll-loops" value="false"/>
         <property key="expand-pragma-config" value="false"/>
         <property key="extra-include-directories"
-                  value="..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
+                  value="..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_pwm_audio;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
         <property key="isolate-each-function" value="true"/>
         <property key="keep-inline" value="false"/>
         <property key="oXC16gcc-cnsts-mauxflash" value="false"/>
@@ -4290,7 +4322,7 @@
         <property key="enable-unroll-loops" value="false"/>
         <property key="expand-pragma-config" value="false"/>
         <property key="extra-include-directories"
-                  value="..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
+                  value="..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_pwm_audio;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
         <property key="isolate-each-function" value="true"/>
         <property key="keep-inline" value="false"/>
         <property key="oXC16gcc-cnsts-mauxflash" value="false"/>
@@ -4992,7 +5024,7 @@
       </item>
       <C30>
         <property key="extra-include-directories"
-                  value="..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
+                  value="..\src\app;..\src\app\apps\classic\dsp;..\src\app\board\audio;..\src\app\board\i2c;..\src\app\board\uart;..\src\app\dspic33-cmsis-dsp\Include;..\src\app\dspic33-cmsis-dsp\Include\dsp;..\src\app\uart_app;..\src\app\hal_uart;..\src\app\uart_platform;..\src\app\hal_dma;..\src\app\hal_pwm;..\src\app\hal_pwm_audio;..\src\app\hal_adc;..\src\app\hal_can;..\src\app\hal_ccp_input_capture;..\src\app\hal_clock;..\src\app\hal_timer;..\src\app\timer_app;..\src\app\hal_spi_i2s_tdm;..\src\app\audio_transport;..\src\app\hal_i2c;..\src\app\hal_spi;..\src\app\hal_gpio;..\src\app\hal_udid;..\src\app\hal_nvm;..\src\app\hal_reset;..\src\app\hal_noinit_ram;..\src\app\diagnostics;..\src\app\cmsis_driver;..\src\app\third_party\arm_cmsis_driver\Include;..\src\shared"/>
         <property key="isolate-each-function" value="true"/>
         <property key="optimization-level" value="s"/>
         <property key="preprocessor-macros"

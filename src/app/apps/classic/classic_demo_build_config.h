@@ -23,6 +23,27 @@
   #define APP_USE_CCP_FS_DETECT (0)
 #endif
 
+/* Sonora AK512 Classic 1: keep MikroBUS B available for a second codec.
+ * These defaults do not apply to AK128, ASRC, USB or 96 kHz presets. */
+#if (APP_BUILD == APP_BUILD_STD_DEMO_1) && defined(__dsPIC33AK512MPS512__)
+  #ifndef APP_PWM_OUTPUT
+    #define APP_PWM_OUTPUT (1)
+  #endif
+  #ifndef MPQ6612A_ENABLE_MIKROB
+    #if defined(MPQ6612A_STEREO) && MPQ6612A_STEREO
+      #define MPQ6612A_ENABLE_MIKROB (1) /* compatibility with the stereo recipe */
+    #else
+      #define MPQ6612A_ENABLE_MIKROB (0)
+    #endif
+  #endif
+  #ifndef MPQ6612A_ENABLE_XPRO1
+    #define MPQ6612A_ENABLE_XPRO1 (APP_PWM_OUTPUT == 1)
+  #endif
+  #ifndef APP_PWM_AUDIO_HAL
+    #define APP_PWM_AUDIO_HAL (APP_PWM_OUTPUT == 1)
+  #endif
+#endif
+
 #if (APP_BUILD == APP_BUILD_STD_DEMO_2)
   #ifndef APP_USE_SPI_TDM_CLK_MASTER
     #define APP_USE_SPI_TDM_CLK_MASTER  (1)

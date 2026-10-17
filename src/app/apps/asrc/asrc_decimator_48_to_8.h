@@ -192,10 +192,14 @@ typedef enum
  * Composed with each existing chain over that chain's own designed passband: ripple 0.0001 dB,
  * added droop -0.0001 dB, i.e. transparent in band.
  *
- * 21 -> 27 TAPS on 2026-09-02, to admit 96 k -> 22.05 kHz.  The widening is driven by a GATE, not
- * by a filter defect: ASRC_FILL_SLACK_REQUIRED refuses that pair on the direct path (step 4.3537
- * clamps the setpoint to R + ASRC_FILL_JITTER = 4 slack), and a composed /4 fixes it by putting the
- * resampler back at step 1.0884.  The old four-rate set could not be reused for that row -- at the
+ * 21 -> 27 TAPS on 2026-09-02, to admit 96 k -> 22.05 kHz.  The widening was driven by a GATE, not
+ * by a filter defect: the fill gate then in force (ASRC_FILL_SLACK_REQUIRED, retired 2026-09-12)
+ * refused that pair on the direct path because the setpoint was pinned at R + ASRC_FILL_JITTER = 4
+ * frames of slack, and a composed /4 fixed it by putting the resampler back at step 1.0884.  Under
+ * the reserve law that replaced it (asrc_fill_law) the direct path is no longer refused for STARVE
+ * -- it is held out of the qualified surface by the A1 fence instead -- so from 2026-09-12 this
+ * row's technical justification is BAND LIMITING alone, which is what these taps were measured for,
+ * and the row is what the pair runs on.  The old four-rate set could not be reused for that row -- at the
  * 36975 Hz fold edge it reads only -58.09 dB -- so the row and the coefficients go together.  The
  * set also covers 24 kHz, whose routing row is not published yet, because doing so cost 2 taps.
  *
@@ -581,7 +585,7 @@ bool asrc_decimator_48_to_24_process_s24_left(
  * Stage 1 is short because it only has to suppress what would fold into the FINAL band after
  * both halvings, so its stopband edge is (24000 - output Nyquist) and its transition is
  * enormous.  Stage 2 carries the whole anti-alias job and is mandatory in both variants: the
- * resampler's fixed fc = 0.465 of its input contributes about -0.2 dB at BOTH rates -- nowhere
+ * resampler's fixed fc = 0.464 of its input contributes about -0.2 dB at BOTH rates -- nowhere
  * near the -100 dB gate, because the worst aliases arrive at multiples of the intermediate rate
  * where the resampler sees a low frequency and passes them at full level.
  */
@@ -628,14 +632,23 @@ bool asrc_decimator_48_to_12_process_s24_left(
  * correct when it was written.  It used to read "22.05 and 24 kHz deliberately do NOT get this
  * stage: their R+jitter is already 85 and 80 against the cap of 104, so they resample directly and
  * pay nothing."  R+jitter against the cap is the HARD bound, and it still fits -- but
- * ASRC_FILL_SLACK_REQUIRED (2026-08-24) added a SOFT bound the direct path fails: at step 4.3537 the
- * setpoint clamps to R + ASRC_FILL_JITTER, leaving 4 frames of slack where the servo needs 8, so
- * audio_app_asrc_rate_pair_is_supported() refuses the pair outright.  A composed /4 takes the step
- * to 1.0884 (R 32, set 64, slack 32) and it is accepted.
+ * ASRC_FILL_SLACK_REQUIRED (2026-08-24, retired 2026-09-12) added a SOFT bound the direct path
+ * failed: at step 4.3537 the setpoint was pinned at R + ASRC_FILL_JITTER, leaving 4 frames of slack
+ * where the servo needed 8, so audio_app_asrc_rate_pair_is_supported() refused the pair outright.
+ * A composed /4 takes the step to 1.0884 (R 32, set 64, slack 32) and it is accepted.
  *
- * 24 kHz still has no row here.  It escapes the same refusal only because its step is exactly 4 and
- * floor == ceil earns the exact-step exemption -- so it RUNS, with no band limit but ASRC_POLY_FC of
- * 96 kHz (44.64 kHz), i.e. 12-44.64 kHz folds into its band.  The pre-stage coefficients above
+ * THE STARVE REFUSAL IS GONE as of 2026-09-12: the reserve law (asrc_fill_law) lets the setpoint
+ * rise with R, so 96 k -> 22.05 kHz direct is starve-safe at set 99 with a full one-block reserve.
+ * The pair is nevertheless still refused on the direct path, by the A1 QUALIFICATION FENCE -- A1
+ * fixes starve on the supported surface and does not widen it.  What the /4 row buys is the BAND
+ * LIMIT, so the row is unchanged and its reason is now stated once, in the taps paragraph above,
+ * instead of resting on a starve verdict.
+ *
+ * 24 kHz still has no row here.  It used to escape the same refusal only via the exact-step
+ * exemption (step exactly 4, floor == ceil) -- an exemption since deleted, because an exact step is
+ * the WORST block-phase case and not the safest; it is now admitted on a real reserve like every
+ * other row.  Either way it RUNS with no band limit but ASRC_POLY_FC of 96 kHz (44.64 kHz), i.e.
+ * 12-44.64 kHz folds into its band.  The pre-stage coefficients above
  * already cover it; publishing the row is a routing decision, not a filter one.
  * (Both rates' 48 kHz-input /2 rows are unaffected and still use asrc_decimator_48_to_24_*.)
  */
@@ -742,6 +755,282 @@ bool asrc_decimator_q31_init(uint32_t num, uint32_t den, uint8_t channels,
 #endif
                              bool with_prestage);
 
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+/*
+ * EXPERIMENTAL: arm a 1:1 anti-alias LPF -- a stage whose rate RATIO is 1/1 and which
+ * nevertheless filters.  Separate from asrc_decimator_q31_init() on purpose: that function
+ * dispatches on a divider and refuses den == 1, and both of those are correct for the chains it
+ * serves.  Everything downstream is shared -- the same stage descriptor, the same ring, the same
+ * assembler kernel with decim_bytes = 4, and the same single-stage arm of
+ * asrc_decimator_q31_process_s24_left().
+ *
+ * Selection is by BOTH rates: the stopband edge is Fs_out - 0.8125 * (Fs_out / 2), so the source
+ * rate alone cannot pick the set.  A pair with no coefficient set is REFUSED, never served by a
+ * neighbouring set's band edges.
+ *
+ * Emits one output frame per input frame, so the caller's scratch must hold a whole block --
+ * see DECIMATED_MIN_DEN in asrc_audio_path.c.
+ */
+bool asrc_decimator_q31_init_lpf1to1(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                     uint8_t channels);
+
+/* Host/target selftest for the 1:1 stage: impulse response against the coefficient table,
+ * N-in/N-out framing, block-boundary continuity over a multi-block random vector, and channel
+ * isolation at the full ASRC_CH width.  Returns false and fills
+ * asrc_decimator_q31_selftest_fail() on the first mismatch. */
+bool asrc_decimator_q31_lpf1to1_selftest(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                         uint32_t *rounding_ties);
+
+/*
+ * EXPERIMENTAL: arm a COMPOSED front end -- an integer decimating stage, then the 1:1 stage at
+ * the intermediate rate.  44.1 kHz -> /2 -> 22.05 kHz -> 1:1 -> rear ASRC at step 1.378125.
+ *
+ * This is the first front end in this tree whose two stages were designed AGAINST EACH OTHER:
+ * the /2 set's stopband only has to reach Fs_mid - Fstop(1:1), because the 1:1 stage behind it
+ * removes the rest, which is what makes it 51 taps instead of the shipped 107.  So the pair of
+ * coefficient sets is one design and is regenerated together (asrc_lpf1to1_design.py).
+ *
+ * `den` is the PUBLISHED ratio and is checked, not trusted: it is what the rear step and the
+ * caller's output sizing were computed from, so a row whose ratio disagrees with the chain is a
+ * planner bug and is refused instead of being served by a chain of a different ratio.
+ *
+ * The block path is unchanged -- the generic integer cascade already runs two stages; the only
+ * novelty is decim == 1 on the last one.
+ */
+bool asrc_decimator_q31_init_dec_then_lpf1to1(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                               uint32_t den, uint8_t channels);
+
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+/* THE SIX MEASURED DIRECT-ROUTE HOLES, WRITTEN ONCE.
+ *
+ * Each row keeps the rear ratio at 1/1 and inserts a source-rate band-limit.  The coefficient
+ * identifiers intentionally repeat existing arrays: re-derivation at each row's rates matched the
+ * stored coefficients to <= 7.4e-11 relative because the normalised band edges are identical.
+ * Planner, arm, telemetry tag and sizing asserts all expand this same list.
+ *
+ * X(fs_in, fs_out, TAPS, coefficient, tag) */
+#define ASRC_ANTIALIAS_DIRECT_1TO1_ROWS(X)                                                   \
+    X( 11025u,  8000u, ASRC_LP1_22K05_TO_16K_TAPS,  s_lp1_22k05_to_16k_coeff,  ":11k025>8k" ) \
+    X( 12000u,  8000u, ASRC_LP1_24K_TO_16K_TAPS,    s_lp1_24k_to_16k_coeff,    ":12k>8k" )     \
+    X( 16000u,  8000u, ASRC_LP1_16K_TO_8K_TAPS,     s_lp1_16k_to_8k_coeff,     ":16k>8k" )     \
+    X( 16000u, 11025u, ASRC_LP1_16K_TO_11K025_TAPS, s_lp1_16k_to_11k025_coeff, ":16k>11k025" ) \
+    X( 16000u, 12000u, ASRC_LP1_16K_TO_12K_TAPS,    s_lp1_16k_to_12k_coeff,    ":16k>12k" )    \
+    X( 22050u, 11025u, ASRC_LP1_16K_TO_8K_TAPS,     s_lp1_16k_to_8k_coeff,     ":22k05>11k025" ) \
+    ASRC_ANTIALIAS_DIRECT_1TO1_EXT_ROWS(X) \
+    ASRC_ANTIALIAS_DIRECT5_1TO1_ROWS(X)
+
+/* NINE MORE DIRECT-ROUTE HOLES, SAME CLASS (APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT, default 0).
+ *
+ * The 2026-10-03 qualification (509badd) still FAILs 14 direct down-conversions on protected-band
+ * alias.  For these nine, the normalised passband/stopband (0.8125 * fs_out/2 and
+ * fs_out - that, divided by fs_in) equals an array already in asrc_lpf1to1_coeffs.inc, so each row
+ * is a selector entry only -- no new coefficient array.  The remaining five (24->8, 24->11.025,
+ * 32->8, 32->12, 44.1->11.025) need a new design or are too heavy as a single 1:1 stage, and are
+ * not here. */
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT
+#define ASRC_ANTIALIAS_DIRECT_1TO1_EXT_ROWS(X)                                                   \
+    X( 22050u, 12000u, ASRC_LP1_22K05_TO_12K_TAPS,  s_lp1_22k05_to_12k_coeff,  ":22k05>12k" )   \
+    X( 22050u, 16000u, ASRC_LP1_22K05_TO_16K_TAPS,  s_lp1_22k05_to_16k_coeff,  ":22k05>16k" )   \
+    X( 24000u, 12000u, ASRC_LP1_16K_TO_8K_TAPS,     s_lp1_16k_to_8k_coeff,     ":24k>12k" )     \
+    X( 24000u, 16000u, ASRC_LP1_24K_TO_16K_TAPS,    s_lp1_24k_to_16k_coeff,    ":24k>16k" )     \
+    X( 32000u, 22050u, ASRC_LP1_16K_TO_11K025_TAPS, s_lp1_16k_to_11k025_coeff, ":32k>22k05" )   \
+    X( 32000u, 24000u, ASRC_LP1_16K_TO_12K_TAPS,    s_lp1_16k_to_12k_coeff,    ":32k>24k" )     \
+    X( 44100u, 22050u, ASRC_LP1_16K_TO_8K_TAPS,     s_lp1_16k_to_8k_coeff,     ":44k1>22k05" )  \
+    X( 44100u, 24000u, ASRC_LP1_22K05_TO_12K_TAPS,  s_lp1_22k05_to_12k_coeff,  ":44k1>24k" )    \
+    X( 44100u, 32000u, ASRC_LP1_22K05_TO_16K_TAPS,  s_lp1_22k05_to_16k_coeff,  ":44k1>32k" )
+#else
+#define ASRC_ANTIALIAS_DIRECT_1TO1_EXT_ROWS(X)
+#endif
+
+/* THE LAST FIVE DIRECT-ROUTE HOLES (APP_ASRC_ANTIALIAS_DIRECT5, default 0).
+ *
+ * The five the EXT note above left out (cd951f5 qualification: still alias X).  None needs a new
+ * coefficient array: every stage below has the same normalised band edges as an array the image
+ * already carries, re-derived and compared coefficient by coefficient
+ * ([internal tool] antialias_direct5_reuse_check.py, <= 1.6e-10 relative; chain alias -108.9 .. -115.0
+ * dBc Q31).  Two are single 1:1 rows and extend the list above; three are composed and get their
+ * own list, in the Universal composed shape, because no direct row has decimated before.
+ *
+ *   24 -> 11.025    1:1 = 48 -> 22.05 at half the clock
+ *   32 -> 12        1:1 = the 96 -> 12 row's 32 kHz partner (owner 2026-10-04: 1:1 rather than a
+ *                   /2 + 1:1 that would need a new /2 set; ~49 % front end at 16 ch, host model)
+ *   24 -> 8         /2 + 1:1 = 48 -> 16 at half the clock
+ *   32 -> 8         /3 + 1:1 = 48 -> 12 at 2/3 the clock
+ *   44.1 -> 11.025  /3 + 1:1 = 48 -> 12 at 0.91875 x the clock
+ *
+ * The composed tags name both rates like the Universal ones, so `fe=/3+lp1:32k>8k` cannot be read
+ * as the 48 -> 12 row whose arrays it shares. */
+#if APP_ASRC_ANTIALIAS_DIRECT5
+#define ASRC_ANTIALIAS_DIRECT5_1TO1_ROWS(X)                                                      \
+    X( 24000u, 11025u, ASRC_LP1_48K_TO_22K05_TAPS,  s_lp1_48k_to_22k05_coeff,  ":24k>11k025" )  \
+    X( 32000u, 12000u, ASRC_LP1_32K_TO_12K_TAPS,    s_lp1_32k_to_12k_coeff,    ":32k>12k" )
+#define ASRC_ANTIALIAS_DIRECT5_COMPOSED_ROWS(X)                                                  \
+    X( 24000u,  8000u, 2u, ASRC_DEC2_48K_FOR_16K_DECIM,                                          \
+       ASRC_DEC2_48K_FOR_16K_TAPS,      s_dec2_48k_for_16k_coeff,                                \
+       ASRC_LP1_24K_TO_16K_TAPS,        s_lp1_24k_to_16k_coeff,       ":24k>8k"      )           \
+    X( 32000u,  8000u, 3u, ASRC_DEC3_48K_FOR_12K_DECIM,                                          \
+       ASRC_DEC3_48K_FOR_12K_TAPS,      s_dec3_48k_for_12k_coeff,                                \
+       ASRC_LP1_16K_TO_12K_TAPS,        s_lp1_16k_to_12k_coeff,       ":32k>8k"      )           \
+    X( 44100u, 11025u, 3u, ASRC_DEC3_48K_FOR_12K_DECIM,                                          \
+       ASRC_DEC3_48K_FOR_12K_TAPS,      s_dec3_48k_for_12k_coeff,                                \
+       ASRC_LP1_16K_TO_12K_TAPS,        s_lp1_16k_to_12k_coeff,       ":44k1>11k025" )
+#else
+#define ASRC_ANTIALIAS_DIRECT5_1TO1_ROWS(X)
+#define ASRC_ANTIALIAS_DIRECT5_COMPOSED_ROWS(X)
+#endif
+
+/* The exact composed-row tag, or NULL when (rates, ratio) is not a DIRECT5 composed row. */
+const char* asrc_antialias_direct_composed_tag(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                               uint32_t den);
+
+/* The exact pair tag, or NULL when the pair is not one of the direct 1:1 rows. */
+const char* asrc_antialias_direct_1to1_tag(uint32_t out_rate_hz, uint32_t in_rate_hz);
+#endif
+
+#if APP_ASRC_UNIVERSAL_PROFILE
+/*
+ * THE UNIVERSAL PROFILE'S 15 ROWS, WRITTEN ONCE.
+ *
+ * WHY A LIST AND NOT THREE TABLES.  Four places need the same rows and need them to AGREE: the
+ * planner (which pair gets a Universal chain, and what ratio it publishes), the two arm functions
+ * (which coefficient sets), the compile-time sizing (every row's two rings against the arena) and
+ * the telemetry tag.  Phase H's own finding was that the same rate pair having its spec written in
+ * two places is what let "the generator passes" be read as "the uniform spec passes"; a second
+ * copy of the ROW SET is the same defect one level down.  So the rows are data here and every
+ * consumer expands them.  The host's single source is asrc_universal_coeff_provenance.py's
+ * UNIVERSAL_ROUTES; these two lists are its firmware counterpart, in the same order.
+ *
+ * THE ARGUMENTS ARE DELIBERATELY MORE THAN ANY ONE CONSUMER USES.  The coefficient identifiers and
+ * tap-count macros are private to asrc_lpf1to1_coeffs.inc, so an expansion outside that
+ * translation unit -- the planner's -- simply does not name them and they never resolve.  That is
+ * what lets one list serve both without the planner having to see the coefficients.
+ *
+ *   ASRC_UNIVERSAL_1TO1_ROWS(X)      X(fs_in, fs_out, TAPS, coeff, tag)
+ *   ASRC_UNIVERSAL_COMPOSED_ROWS(X)  X(fs_in, fs_out, den, DECIM, TAPS0, c0, TAPS1, c1, tag)
+ *
+ * `den` is the PUBLISHED composed ratio and DECIM is the stage-0 decimation the coefficient set
+ * was generated for.  They are equal on every row here -- stage 1 is 1:1, so it does not divide --
+ * and both are carried so that the arm can ASSERT the equality instead of assuming it.  That is
+ * the check that catches a row whose published ratio (which is what the rear step and the caller's
+ * scratch sizing were computed from) disagrees with the chain actually armed.
+ *
+ * THE TAG NAMES BOTH RATES, which the pre-Universal tags do not.  Those name only the protected
+ * rate because no two prototype rows shared one; here 48 -> 8 kHz and 96 -> 8 kHz are different
+ * chains with the same protected rate, and `fe=/3+lp1:8k` would not tell them apart.
+ */
+/* SPLIT BY LEG RATE, and then joined below.  A build with no 96 kHz leg cannot ever be asked for
+ * a 96 kHz row -- the rate is unreachable -- so including those rows would put their coefficient
+ * arrays in the image to serve a pair that cannot be selected.  Every array here is `static const`
+ * in one translation unit, so what keeps them out is not naming them, which is what this split
+ * does.  (Whether --gc-sections would have dropped them anyway is a MAP question and is section 7's
+ * to answer; not naming them does not depend on the answer.) */
+#define ASRC_UNIVERSAL_1TO1_ROWS_48K(X)                                                        \
+    X( 48000u, 22050u, ASRC_LP1_48K_TO_22K05_TAPS, s_lp1_48k_to_22k05_coeff, ":48k>22k05" )     \
+    X( 48000u, 24000u, ASRC_LP1_48K_TO_24K_TAPS,   s_lp1_48k_to_24k_coeff,   ":48k>24k"   )     \
+    X( 48000u, 32000u, ASRC_LP1_48K_TO_32K_TAPS,   s_lp1_48k_to_32k_coeff,   ":48k>32k"   )
+
+#define ASRC_UNIVERSAL_1TO1_ROWS_96K(X)                                                        \
+    X( 96000u, 48000u, ASRC_LP1_96K_TO_48K_TAPS,   s_lp1_96k_to_48k_coeff,   ":96k>48k"   )
+
+#define ASRC_UNIVERSAL_COMPOSED_ROWS_48K(X)                                                    \
+    X( 48000u,  8000u, 3u, ASRC_DEC3_48K_FOR_8K_DECIM,                                         \
+       ASRC_DEC3_48K_FOR_8K_TAPS,       s_dec3_48k_for_8k_coeff,                               \
+       ASRC_LP1_16K_TO_8K_TAPS,         s_lp1_16k_to_8k_coeff,        ":48k>8k"      )          \
+    X( 48000u, 11025u, 3u, ASRC_DEC3_48K_FOR_11K025_DECIM,                                     \
+       ASRC_DEC3_48K_FOR_11K025_TAPS,   s_dec3_48k_for_11k025_coeff,                            \
+       ASRC_LP1_16K_TO_11K025_TAPS,     s_lp1_16k_to_11k025_coeff,    ":48k>11k025"  )          \
+    X( 48000u, 12000u, 3u, ASRC_DEC3_48K_FOR_12K_DECIM,                                        \
+       ASRC_DEC3_48K_FOR_12K_TAPS,      s_dec3_48k_for_12k_coeff,                               \
+       ASRC_LP1_16K_TO_12K_TAPS,        s_lp1_16k_to_12k_coeff,       ":48k>12k"     )          \
+    X( 48000u, 16000u, 2u, ASRC_DEC2_48K_FOR_16K_DECIM,                                        \
+       ASRC_DEC2_48K_FOR_16K_TAPS,      s_dec2_48k_for_16k_coeff,                               \
+       ASRC_LP1_24K_TO_16K_TAPS,        s_lp1_24k_to_16k_coeff,       ":48k>16k"     )
+
+#define ASRC_UNIVERSAL_COMPOSED_ROWS_96K(X)                                                    \
+    X( 96000u,  8000u, 3u, ASRC_DEC3_96K_FOR_8K_DECIM,                                         \
+       ASRC_DEC3_96K_FOR_8K_TAPS,       s_dec3_96k_for_8k_coeff,                                \
+       ASRC_LP1_32K_TO_8K_TAPS,         s_lp1_32k_to_8k_coeff,        ":96k>8k"      )          \
+    X( 96000u, 11025u, 3u, ASRC_DEC3_96K_FOR_11K025_DECIM,                                     \
+       ASRC_DEC3_96K_FOR_11K025_TAPS,   s_dec3_96k_for_11k025_coeff,                            \
+       ASRC_LP1_32K_TO_11K025_TAPS,     s_lp1_32k_to_11k025_coeff,    ":96k>11k025"  )          \
+    X( 96000u, 12000u, 3u, ASRC_DEC3_96K_FOR_12K_DECIM,                                        \
+       ASRC_DEC3_96K_FOR_12K_TAPS,      s_dec3_96k_for_12k_coeff,                               \
+       ASRC_LP1_32K_TO_12K_TAPS,        s_lp1_32k_to_12k_coeff,       ":96k>12k"     )          \
+    X( 96000u, 16000u, 3u, ASRC_DEC3_96K_FOR_16K_DECIM,                                        \
+       ASRC_DEC3_96K_FOR_16K_TAPS,      s_dec3_96k_for_16k_coeff,                               \
+       ASRC_LP1_32K_TO_16K_TAPS,        s_lp1_32k_to_16k_coeff,       ":96k>16k"     )          \
+    X( 96000u, 22050u, 3u, ASRC_DEC3_96K_FOR_22K05_DECIM,                                      \
+       ASRC_DEC3_96K_FOR_22K05_TAPS,    s_dec3_96k_for_22k05_coeff,                             \
+       ASRC_LP1_32K_TO_22K05_TAPS,      s_lp1_32k_to_22k05_coeff,     ":96k>22k05"   )          \
+    X( 96000u, 24000u, 3u, ASRC_DEC3_96K_FOR_24K_DECIM,                                        \
+       ASRC_DEC3_96K_FOR_24K_TAPS,      s_dec3_96k_for_24k_coeff,                               \
+       ASRC_LP1_32K_TO_24K_TAPS,        s_lp1_32k_to_24k_coeff,       ":96k>24k"     )          \
+    X( 96000u, 32000u, 2u, ASRC_DEC2_96K_FOR_32K_DECIM,                                        \
+       ASRC_DEC2_96K_FOR_32K_TAPS,      s_dec2_96k_for_32k_coeff,                               \
+       ASRC_LP1_48K_TO_32K_TAPS,        s_lp1_48k_to_32k_coeff,       ":96k>32k"     )
+
+#if ASRC_DECIMATOR_HAS_96_TO_48
+#define ASRC_UNIVERSAL_1TO1_ROWS(X)                                                            \
+    ASRC_UNIVERSAL_1TO1_ROWS_48K(X)                                                            \
+    ASRC_UNIVERSAL_1TO1_ROWS_96K(X)
+#define ASRC_UNIVERSAL_COMPOSED_ROWS(X)                                                        \
+    ASRC_UNIVERSAL_COMPOSED_ROWS_48K(X)                                                        \
+    ASRC_UNIVERSAL_COMPOSED_ROWS_96K(X)
+#else
+#define ASRC_UNIVERSAL_1TO1_ROWS(X)      ASRC_UNIVERSAL_1TO1_ROWS_48K(X)
+#define ASRC_UNIVERSAL_COMPOSED_ROWS(X)  ASRC_UNIVERSAL_COMPOSED_ROWS_48K(X)
+#endif
+
+/* THE TAG for a Universal row, or NULL when the (rates, ratio) triple is not one.  NULL rather
+ * than "" so the caller can tell "not a Universal row" from "a Universal row with no tag", which
+ * is the distinction the pre-Universal tag code could not make (it returned "" for both and the
+ * log then printed a chain name with nothing after it). */
+const char* asrc_universal_1to1_tag(uint32_t out_rate_hz, uint32_t in_rate_hz);
+const char* asrc_universal_composed_tag(uint32_t out_rate_hz, uint32_t in_rate_hz, uint32_t den);
+#endif /* APP_ASRC_UNIVERSAL_PROFILE */
+
+/*
+ * FRAMES STAGE `stage` HAS PRODUCED since the last arm.  0 for a stage the live chain does not
+ * have, and 0 for one that never ran.
+ *
+ * The per-stage counterpart of asrc_audio_path_frontend_runs_ab(): that counts blocks the front
+ * end ran, which for a single-stage chain is the same as "the filter ran", and for a COMPOSITION
+ * is not -- a chain can run its first stage and skip its second, which is precisely the failure
+ * mode the 2026-09-14 ISR gate produced one level up (`fe=lp1` printed for twelve minutes while
+ * the FIR was never called).  A /2 followed by a 1:1 must report the SAME count on both stages.
+ */
+uint32_t asrc_decimator_q31_stage_output_frames(uint8_t stage);
+
+#if APP_ASRC_FRONTEND_SELFTEST
+/* Boot check for the COMPOSED chain, against the divider selftest's oracle (which walks
+ * s_q31.stages, so it follows whatever was armed -- it is reused, not copied).  Proves both
+ * stages ran, the intermediate stayed full-precision Q31, the two rings do not overlap,
+ * continuity across process() calls and ring wraps, and channel replication.  It also reads the
+ * per-stage counters where their answer is known, so the runtime instrument is proven at boot
+ * rather than trusted on the bench.  One-shot: re-entering it while a chain is live would race
+ * the block ISR. */
+bool asrc_decimator_q31_dec_then_lpf1to1_selftest(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                                  uint32_t den, uint32_t *rounding_ties);
+#endif
+#endif
+
+/* NON-ZERO HISTORY WORDS IN THE Q31 ARENA, right now.
+ *
+ * Called by the audio path where it publishes a freshly armed chain as ready, so that "arming
+ * leaves no history behind" is a number taken on the RUNTIME path (a console `*ar` rate change
+ * arms through asrc_transport_reset(), not through the boot selftests' direct init calls).
+ * Expected 0 at that moment.  Arm-time only -- it walks the whole arena. */
+uint16_t asrc_decimator_q31_history_nonzero_words(void);
+
+#if APP_ASRC_FRONTEND_SELFTEST
+/* Proves this check is worth reading, then proves the clear, in four steps: the arena really was
+ * dirty (the earlier checks' leftover history, or a poke if a reordering left it empty), an arm
+ * clears it, the scan COUNTS rather than always returning 0, and the arm clears that too.
+ * `out_seen` (optional) returns how dirty the arena was when the check ran.
+ * Boot only: it writes the live arena. */
+bool asrc_decimator_q31_arm_clear_selftest(uint16_t* out_seen);
+#endif
+
 /* Frames this front end would emit for `input_frames`, at its current phase. */
 size_t asrc_decimator_q31_output_frames(size_t input_frames);
 
@@ -774,6 +1063,138 @@ void asrc_decimator_q31_profile_read( uint32_t* pre_ticks, uint32_t* r23_ticks )
  * what a caller adds to its own rows so that every row describes one and the same block. */
 void asrc_decimator_q31_profile_take_last( uint32_t* pre_ticks, uint32_t* r23_ticks );
 #endif
+
+
+/* ---- 96 -> 32 kHz THIRD-BAND front end (opt-in, replaces the composed chain) ---------
+ *
+ * A 3-path polyphase allpass decimator: H(z) = (1/3)[A0(z^3) + z^-1 A1(z^3) + z^-2 A2(z^3)],
+ * 16 first-order sections against the composed chain's 138 taps, and -110.11 dBc of worst
+ * alias into the protected 0-15 kHz band against the composed chain's -22.51 dBc.
+ *
+ * It is NOT a strict full-band front end and is not sold as one: 0-15 kHz is protected,
+ * 15-16 kHz is RELAXED at -3.53 dBc, and the phase is not linear (group delay varies 388 us
+ * over 0-15 kHz).  Both are accepted specification for this front end.
+ *
+ * Entry points other than the mode switch are for the rate-change hook and the console.
+ * The block path reaches it through asrc_decimator_q31_process_s24_left(), which dispatches
+ * on `armed` -- there is deliberately no second process function for a caller to pick. */
+#if APP_ASRC_THIRDBAND_96_TO_32
+typedef enum
+{
+    ASRC_THIRDBAND_MODE_OFF = 0,   /* the composed 41-tap /2 + 97-tap 2/3 chain */
+    ASRC_THIRDBAND_MODE_ON  = 1,   /* the third band */
+} asrc_thirdband_mode_t;
+
+/* Arm or retire, from the rate-change hook ONLY -- transport stopped, between mute and
+ * unmute.  Arming loads this stage's coefficients over the composed chain's and zeroes 16
+ * sections of recursive state; that is the one point where clearing it is correct, and a
+ * per-block reset would turn the filter into a transient generator. */
+void asrc_thirdband_96_to_32_arm(bool on);
+bool asrc_thirdband_96_to_32_armed(void);
+
+/* Record which front end is wanted.  Switches NOTHING by itself: the two share one arena,
+ * so the caller must then take leg A through its ordinary mute-bounded restart (the console
+ * re-applies leg A's rate, exactly as `*aj` does) and the arm hook builds what this names.
+ * The switch is audible -- the third band needs 30.2 ms to settle to -120 dB -- which is the
+ * cost of costing no extra RAM. */
+void asrc_thirdband_96_to_32_set_mode(asrc_thirdband_mode_t mode);
+asrc_thirdband_mode_t asrc_thirdband_96_to_32_mode(void);
+
+/* Frames this front end would emit for `input_frames`, at its current commutator phase.
+ * 3:1 with a 0..2 frame remainder carried between blocks. */
+size_t asrc_thirdband_96_to_32_output_frames(size_t input_frames);
+
+/* `clips` counts OUTPUT words that came out at s24-left full scale, which a unity-gain
+ * filter whose L1 norm exceeds 1 does on transients -- the composed chain does it too
+ * (L1 1.81 against this one's 3.45).  It is a fact to be measured, not a fault: read it
+ * against real programme material rather than against a square wave.  `refused` counts
+ * blocks longer than the gather buffer, which is a build mismatch and should be 0. */
+/* Two coefficient-independent predictions of this structure, as a structural check: H(DC)
+ * is exactly 1 because every allpass has A_k(1) = 1, and H(32 kHz) is exactly 0 because
+ * 1 + W + W^2 = 0 there whatever the coefficients are.  Between them they catch the sign of
+ * the kernel's headroom shift, the commutator's branch order, the 1/3 constant and a
+ * coefficient row loaded backwards -- none of which the compiler can see.
+ *
+ * It runs the LIVE filter state, so stop audio first (`*ts`); it resets the state and the
+ * counters on the way out.  Reached from the console as `*av03`. */
+/* THE LIVE TAP.  Two 1024-sample 32 kHz windows, channel 0, filled from one arm inside the
+ * live block path: buffer 0 = the stage's output, buffer 1 = the block leg B hands to the
+ * codec.  So one capture spans push + AB FIFO + servo + the rear polyphase, which is what is
+ * left to localise now that both ends of the stage itself measure clean.
+ *
+ * Costs no RAM: it sits in the idle part of the arena this stage overlays -- which is also why
+ * arming REQUIRES the stage to be armed.  Those buffers belong to the composed chain's history
+ * whenever the third band is retired, so the arm/retire hook cancels any capture in flight and
+ * both fill paths refuse when the stage is not armed.
+ *
+ * The two sides finish INDEPENDENTLY (different interrupt domains, independent clocks) and
+ * `tap_ready()` is true only once both have.  Arm with `*av05`, read with `*av06`.  The 96 kHz
+ * input capture that used to be buffer 1 is gone -- it measured -96.90 dBc in band, which
+ * closed that side. */
+bool asrc_thirdband_96_to_32_tap_arm(void);   /* false = refused, the stage is not armed */
+bool asrc_thirdband_96_to_32_tap_ready(uint16_t* out_n, uint16_t* b_n);
+/* Per-side progress, so a console can name what it is still waiting for.  False = nothing
+ * armed. */
+bool asrc_thirdband_96_to_32_tap_side_done(bool* out_done, bool* b_done);
+/* Capacity of each capture, reported next to the counts. */
+void asrc_thirdband_96_to_32_tap_capacity(uint16_t* out_cap, uint16_t* b_cap);
+int32_t asrc_thirdband_96_to_32_tap_word(uint8_t which, uint16_t i);
+/* Called by leg B, right after the A->B pull.  No-op unless the stage and the tap are both
+ * armed and this side has not already filled. */
+void asrc_thirdband_96_to_32_tap_legb(const int32_t* block, uint32_t frames, uint32_t stride);
+
+/* THE DYNAMIC CHECK.  A real waveform through the whole stage -- gather, headroom shift,
+ * the 0..2 frame carry across blocks, kernel and the 1/3 -- against host-computed values.
+ *
+ * It exists because nothing else covered a MOVING signal: the kernel bench re-read one input
+ * buffer every frame, and both of *av03's cases hold each branch's input constant, so the
+ * allpass state never advanced in any earlier check.  It also drives every channel with the
+ * same sample and requires the outputs to match, which catches shared state between channels.
+ *
+ * `first_bad` is the output frame index that first disagreed (-1 if none), `bad_channel` the
+ * first channel that disagreed with channel 0 (-1 if none), `frames` how many outputs the
+ * stage produced (must equal the vector's count).  Run with audio stopped (`*ts`); resets the
+ * state and counters afterwards.  Reached from the console as `*av04`. */
+typedef struct
+{
+    uint16_t frames;      /* outputs the stage produced           */
+    uint16_t expect;      /* outputs the vector says it should    */
+    int16_t  first_bad;
+    int32_t  got;
+    int32_t  want;
+    int8_t   bad_channel;
+    bool     refused;
+    bool     pass;
+} asrc_thirdband_vector_t;
+bool asrc_thirdband_96_to_32_vector_check(asrc_thirdband_vector_t* r);
+
+typedef struct
+{
+    int32_t dc_out;      /* settled output for a constant input   */
+    int32_t dc_want;     /* the constant itself                   */
+    int32_t dc_tol;
+    int32_t null_out;    /* settled output for a 32 kHz input     */
+    int32_t null_tol;
+    bool    pass;
+} asrc_thirdband_selftest_t;
+bool asrc_thirdband_96_to_32_selftest(asrc_thirdband_selftest_t* r);
+
+void asrc_thirdband_96_to_32_stats(uint32_t* blocks, uint32_t* out_frames,
+                                   uint32_t* clips, uint32_t* refused);
+void asrc_thirdband_96_to_32_stats_clear(void);
+
+/* What is actually compiled in, for the console line: coefficient digest, section count,
+ * the headroom shift in bits, and the host-designed worst alias in milli-dBc. */
+void asrc_thirdband_96_to_32_identity(uint32_t* coeff_crc, uint16_t* sections,
+                                      int16_t* headroom_shift, int32_t* worst_alias_milli);
+
+#if APP_ASRC_LEG_PROFILE
+/* The same two halves the composed chain reports, so one telemetry line describes either
+ * front end: `gather` is everything ahead of the arithmetic (the channel repeat and the
+ * headroom shift), `kernel` is the whole 3:1 arithmetic.  Read-and-clear. */
+void asrc_thirdband_96_to_32_profile_take_last(uint32_t* gather, uint32_t* kernel);
+#endif
+#endif /* APP_ASRC_THIRDBAND_96_TO_32 */
 
 
 #if APP_ASRC_FRONTEND_SELFTEST

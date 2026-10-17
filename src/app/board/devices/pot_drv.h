@@ -23,6 +23,7 @@
 #define POT_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /**
  * @ingroup  pot
@@ -40,5 +41,7 @@ void POT_Initialize(void);
  */
 uint16_t POT_Read(void);
 void POT_Process(void);
+bool POT_IsReady(void);
+void POT_PrintStatus(void);
 
 #endif

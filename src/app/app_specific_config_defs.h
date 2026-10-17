@@ -349,8 +349,59 @@
 
 
 // --- PWM DAC OUTPUT ---
+// 0: existing MIC4607 stereo route; 1: MPQ6612A non-D.
+#ifndef APP_PWM_OUTPUT
+#define APP_PWM_OUTPUT (0)
+#endif
+#ifndef MPQ6612A_ENABLE_MIKROB
+#define MPQ6612A_ENABLE_MIKROB (APP_PWM_OUTPUT == 1)
+#endif
+#ifndef MPQ6612A_ENABLE_XPRO1
+#if defined(MPQ6612A_STEREO)
+#define MPQ6612A_ENABLE_XPRO1 (MPQ6612A_STEREO)
+#else
+#define MPQ6612A_ENABLE_XPRO1 (0)
+#endif
+#endif
+#ifndef MPQ6612A_STEREO
+#define MPQ6612A_STEREO (MPQ6612A_ENABLE_MIKROB && MPQ6612A_ENABLE_XPRO1)
+#endif
+// MPQ carrier periods per 48 kHz audio sample; preserve 48 kHz by default.
+#ifndef MPQ6612A_CARRIER_FACTOR
+#define MPQ6612A_CARRIER_FACTOR (1u)
+#endif
+#ifndef PWM_AUDIO_SCOPE_ONLY
+#define PWM_AUDIO_SCOPE_ONLY (0)
+#endif
+// External analog POT click on Nano slot2 (RB1/RP18/AD2AN2), opt-in.
+#ifndef ENA_NANO_POT
+#define ENA_NANO_POT (0)
+#endif
+#ifndef NANO_POT_SPAN_COUNTS
+#define NANO_POT_SPAN_COUNTS (2541u) // calculated 2.048V / 3.3V * 4095; calibrate by sweep
+#endif
+#ifndef NANO_POT_INVERT
+#define NANO_POT_INVERT (1) // CK/SAM POT click: clockwise lowers ADC counts
+#endif
+#ifndef PWM_AUDIO_SCOPE_TAG
+#define PWM_AUDIO_SCOPE_TAG IDE_direct
+#endif
+#if APP_PWM_OUTPUT == 1
+#ifndef APP_USE_PWM_AUDIO
+#define APP_USE_PWM_AUDIO (MPQ6612A_ENABLE_MIKROB || MPQ6612A_ENABLE_XPRO1)
+#endif
+#endif
 #ifndef APP_USE_PWM_AUDIO
 #define APP_USE_PWM_AUDIO         (0)   // 1 = PWM DAC output path
+#endif
+// PWM output implementation: 0 = classic_audio_pwm.c direct float->duty DMA
+// path; 1 = hal_pwm_audio (Sonora AK512 Classic 1 default, Q1.31 block API, board
+// backend board/audio/pwm_audio_board_ak.c). Both are compiled; this picks.
+#ifndef APP_PWM_AUDIO_HAL
+#define APP_PWM_AUDIO_HAL         (0)
+#endif
+#if (APP_PWM_AUDIO_HAL != 0) && (APP_PWM_AUDIO_HAL != 1)
+#error "APP_PWM_AUDIO_HAL must be 0 or 1."
 #endif
 
 // --- BOOT BANNER VISIBILITY (POR/BOR only) ---
@@ -365,6 +416,30 @@
 #ifndef APP_BOOT_BANNER_HOLD_ENABLE
 #define APP_BOOT_BANNER_HOLD_ENABLE    (1)     // 0 = compile the boot-banner hold out entirely
 #endif
+/*
+ * Re-print the banner on EVERY power-on-class reset, with no button held.
+ *
+ * The button is the right gate for normal use -- it keeps a production boot fast.
+ * It is the wrong gate for a scripted or repeated cold-power-on run, where the
+ * operator has to cut and restore power N times and cannot also be holding a
+ * button, and where the evidence being looked for is precisely the banner that the
+ * early print loses while the USB-CDC terminal is still enumerating (about 11 s on
+ * this board).
+ *
+ * Measured the hard way on 2026-09-13: three confirmed cold PORs left NO trace at
+ * all in the console log -- no banner, no RCON line -- because the image prints its
+ * banner once and the terminal was not back yet. The PLL2 diagnostic image was
+ * readable through the same power cycles only because it re-emits its whole record
+ * every 3 s. Absence of a banner is therefore not evidence that no power cycle
+ * happened, and this knob is what turns a cold POR into something the log can show.
+ *
+ * Default OFF: this delays every power-on boot by APP_BOOT_BANNER_HOLD_SECONDS, so
+ * it belongs to a verification image and not to a shipping one.
+ */
+#ifndef APP_BOOT_BANNER_HOLD_ALWAYS
+#define APP_BOOT_BANNER_HOLD_ALWAYS    (0)     // 1 = no button needed; hold on every power-on
+#endif
+
 #ifndef APP_BOOT_BANNER_HOLD_BUTTON
 #define APP_BOOT_BANNER_HOLD_BUTTON    (1)     // board button id (1..3) held at power-on to enter banner hold
 #endif
@@ -477,7 +552,15 @@
 /////////////////////////////////////////////
 //#define POST_GAIN_PWM_DB          ( 6.0f) // need some boost
 //#define POST_GAIN_PWM_DB          ( 10.0f) // need some boost
-#define POST_GAIN_PWM_DB          (14.0f) // at PAS music room test
+#if APP_PWM_OUTPUT == 1
+#if PWM_AUDIO_SCOPE_ONLY
+#define POST_GAIN_PWM_DB (0.0f) // logic-pin observation with bridge asleep
+#else
+#define POST_GAIN_PWM_DB (12.0f) // PWM-only gain; codec output gains remain independent
+#endif
+#else
+#define POST_GAIN_PWM_DB (14.0f) // existing MIC4607 setting
+#endif
 
 
 // gain for the sound effect wave data
@@ -509,7 +592,7 @@
 
 // Gain for the currently selected AVAS synth source (LAMB or TYPE_TY).
 // This is the final source gain; per-partial gains remain part of the timbre.
-#define PRE_GAIN_AVAS_SYNTH_DB    (-26.0f)
+#define PRE_GAIN_AVAS_SYNTH_DB    (-20.0f) // AVAS-only +6 dB relative to the -26 dB baseline
 
 
 /* ============================================================
@@ -735,6 +818,142 @@
 //       biquad-cascade / sample-delay working buffers (those DSP stages are DRC-only, enabled in
 //       (2.6)); the regular side needs only the block size.
 #if ENA_DRC_DF2T_CASCADE
+  // Tier 1 DF2T bench -- MEASUREMENT ONLY, opt-in, and OFF in every shipping
+  // configuration.
+  //
+  // A foreground, iterated, warmed-up, min/mean/max measurement of the DF2T
+  // kernel at 1 ch x 32 frames x N sections, over fixed reference coefficients
+  // and input data. It exists
+  // because the console's `CMSIS-IIR` telemetry -- the number the 84-section
+  // record was set with -- is a SINGLE INSTANTANEOUS SAMPLE of ONE CHANNEL
+  // taken inside the DMA0 ISR. The two methods answer different questions, so
+  // both numbers are kept under different names.
+  //
+  // Never in the audio path, never reachable from an ISR, and it compiles to
+  // nothing at 0 -- so the shipping DRC image is unchanged while this is off.
+  #ifndef ENA_BIQUAD_TIER1_BENCH
+   #define ENA_BIQUAD_TIER1_BENCH   (0)
+  #endif
+
+  // dsPIC33A Performance Monitor Unit -- MEASUREMENT ONLY, opt-in, OFF in every
+  // shipping configuration.
+  //
+  // Eight 64-bit counters that classify where a loop's cycles went: FPU register
+  // dependency stalls, FPU read/write stalls, CPU hazards, fetch stalls, branch
+  // mispredicts, plus the cycle and instruction references that give CPI
+  // (DS70005591D section 3.5). It exists because a cycle count says a loop is
+  // slow and does not say why -- and on this core "issue-bound" and "stalled on
+  // an FPU dependency" call for changes in OPPOSITE directions.
+  //
+  // The case that forced it: opt_v3 cut 15% of the DF2T inner loop's
+  // instructions and measured 21.8% SLOWER (2026-09-22). The explanation on
+  // offer was a cross-sample FPU dependency, argued from instruction distance
+  // with no counter behind it. This is how that stops being a hypothesis.
+  //
+  // Not in the audio path, not ISR-safe by design (the counters are global CPU
+  // state with no ownership protocol -- one caller at a time, in the
+  // foreground), and it compiles to nothing at 0.
+  #ifndef ENA_PERF_MONITOR
+   #define ENA_PERF_MONITOR         (0)
+  #endif
+
+  // Pair the 4ch DF2T cascade into two two-channel calls instead of four
+  // single-channel ones, using biquad_cascade_df2T_f32_dspic33ak_x2.
+  //
+  // WHY: the single-channel kernel is LATENCY-bound, not issue-bound. opt_v1
+  // retires 10.433 instructions per sample/section in 11.484 cycles and the PMU
+  // attributes the whole excess to one stall (ev9 = 0.999). Two independent
+  // channels interleaved cover each other's MAC latency -- measured 9.922
+  // cyc/sample/section with ev8 = ev9 = 0.000 and CPI 1.004, i.e. -13.6 %, on
+  // AK506 Nano at ap84 (2026-09-23). Bit-identical output to opt_v1 on both
+  // channels; the KAT passes at the existing tolerances.
+  //
+  // The kernel keeps opt_v1's 1..512 blockSize contract. The faster x2r variant
+  // (-15.8 %) is even-only and is deliberately not used in the audio path.
+  //
+  // Requires an even BIQUAD_CASCADE_NUM_CH and the same stage count on every
+  // channel, both of which the Classic 4ch path satisfies; the pairing site has
+  // a _Static_assert for the first and init() guarantees the second.
+  //
+  // Set to 0 to go back to four opt_v1 calls -- the A/B is a rebuild, not a
+  // code edit, so a listening comparison can be taken both ways.
+  // Full result: [internal] iir_df2t_phase_d_summary_2026-09-23.md
+  #ifndef ENA_BIQUAD_CASCADE_4CH_X2
+   #define ENA_BIQUAD_CASCADE_4CH_X2  (1)
+  #endif
+
+  // Four channels per call with biquad_cascade_df2T_f32_dspic33ak_x4t. TAKES
+  // PRECEDENCE over ENA_BIQUAD_CASCADE_4CH_X2 when both are 1.
+  //
+  // Measured on AK506 Nano at ap84 (2026-09-23): 7.605 cyc/sample/section,
+  // CPI 1.006, ev8 = 0.000, against x2's 9.921 -- -23.3 %. Bit-identical to
+  // opt_v1 on all four channels (0/128). Keeps opt_v1's 1..512 blockSize
+  // contract, including odd.
+  //
+  // Requires BIQUAD_CASCADE_NUM_CH == 4 exactly and the same stage count on
+  // every channel; the call site has a _Static_assert for the first.
+  //
+  // Set to 0 to fall back to x2 (or, with X2 also 0, to four opt_v1 calls) --
+  // a rebuild, not a code edit, so the A/B can be taken both ways.
+  // Full result: [internal] iir_df2t_phase_e_x3_2026-09-23.md §12
+  #ifndef ENA_BIQUAD_CASCADE_4CH_X4T
+   #define ENA_BIQUAD_CASCADE_4CH_X4T  (1)
+  #endif
+
+  // Normal Classic DRC kernel: run the one-channel, three-SOS-fused x1s3p
+  // kernel once for each of the four existing channel-major buffers.  It takes
+  // precedence over x4t/x2; setting it to 0 is the explicit rebuild-time
+  // fallback to the established x4t path below.
+  //
+  // x1s3p retains the public one-channel CMSIS contract: independent instance,
+  // coefficient and state per call; 1..512 frames; nonzero arbitrary stage
+  // count; and in-place/out-of-place operation.  Thus this switch changes the
+  // schedule only, not the four-channel DRC geometry or its coefficient model.
+  #ifndef ENA_BIQUAD_CASCADE_4CH_X1S3P
+   #define ENA_BIQUAD_CASCADE_4CH_X1S3P  (1)
+  #endif
+  #if (ENA_BIQUAD_CASCADE_4CH_X1S3P != 0) && (ENA_BIQUAD_CASCADE_4CH_X1S3P != 1)
+   #error "ENA_BIQUAD_CASCADE_4CH_X1S3P must be 0 or 1"
+  #endif
+
+  // The 48-kHz DRC default uses the hardware-validated general-block kernel.
+  // Keep the independently validated 96-kHz profile on the x1s3p control.
+  #ifndef BIQUAD_DRC_READY_VARIANT
+   #if defined(ENA_96K_RATE)
+    #define BIQUAD_DRC_READY_VARIANT (0)
+   #else
+    #define BIQUAD_DRC_READY_VARIANT (1)
+   #endif
+  #endif
+  #if (BIQUAD_DRC_READY_VARIANT < 0) || (BIQUAD_DRC_READY_VARIANT > 2)
+   #error "BIQUAD_DRC_READY_VARIANT must be 0 (control), 1 (readyN), or 2 (ready32)"
+  #endif
+  #if BIQUAD_DRC_READY_VARIANT && !ENA_BIQUAD_CASCADE_4CH_X1S3P
+   #error "DF2T readyN/ready32 experiment requires the x1s3p dispatch"
+  #endif
+
+  /*
+   * CSV bulk receive is a DRC-profile concern: at 230400 baud the default
+   * 256-byte platform ring only holds about 11 ms of traffic, whereas 2048
+   * bytes hold about 89 ms.  Keep the platform default in
+   * uart_platform_board.c unchanged; this profile override supplies the
+   * headroom for a routine continuous coefficient transfer.
+   *
+   * A fixture larger than this ring is deliberately still out of spec.  Its
+   * safe outcome is the CSV abort/recovery path, or a stopped transport / host
+   * throttle -- not an implicit promise that every file fits in RAM.
+   */
+  #define UART_PLATFORM_RX_RING_BUF_SIZE (2048u)
+
+  /*
+   * Deferred parse is retained as an A/B diagnostic path only.  The shipping
+   * Nano image keeps the proven per-line parser: the 8 KiB raw buffer is not
+   * reserved at APP_CSV_DEFER_PARSE=0, so the 22 KiB sample-delay pool and the
+   * Tier1 measurement-build RAM trade-off remain explicit and unchanged.
+   */
+  #define APP_CSV_DEFER_PARSE            (0)
+  #define APP_CSV_RAW_BUF_BYTES          (8u * 1024u)
+
 //
 // DRC test mode -- block size + DSP working buffers
 //
@@ -748,43 +967,74 @@
  #else
   #define APP_BLOCK_FRAMES              (32)          // frames per ping/pong half
 
-  // BIQUAD_CASCADE_4CH_NUM_STAGE -- the ONE place this value is chosen, and the one place the
-  // stage-count history is kept. Do not re-introduce a commented ladder of past values next to
-  // the #define (it used to live here AND in biquad_cascade_4ch.h, which disagreed); the header
-  // now only holds a fallback for builds that never reach this file.
+  // BIQUAD_CASCADE_4CH_NUM_STAGE -- the default is chosen here and the stage-count history is
+  // kept here. Do not re-introduce a commented ladder of past values next to the #define (it
+  // used to live here AND in biquad_cascade_4ch.h, which disagreed); the header now only holds
+  // a fallback for builds that never reach this file. A build-local -Define override is allowed
+  // for a measured capacity experiment and must win over this ordinary default.
   //
-  // Stage-count challenge: how many 4-ch DF2T stages fit under 100% load.
-  // Pass criterion = hardware measurement, TDMsum peak < 100% with miss=0 (not a clean compile).
-  //   48 kHz, block=32, CMSIS opt v1 / -O2, ~1.84 us per stage for 4 ch:
-  //     22 long-standing reference   ... 75 OK
-  //     80 OK  (TDM1 94.0%, margin 39.9 us)
-  //     82 OK  (TDM1 96.5%, margin 23.3 us, TDMsum peak 98.8%)   measured 2026-08-13
-  //     83 OK  (TDM1 97.6%, margin 15.9 us, TDMsum peak 99.8%)   measured 2026-08-13
-  //     83 OK  (TDM1 97.3%, margin 17.8 us) with the leg-B block-IRQ gate, listened OK
-  //     84 <-- current. OK (TDM1 98.7%, margin 8.6 us, miss=0, sat=0), listened OK, on the
-  //        gated build; re-measured 2026-08-13. Equals the old record.
-  //        81/82 were once noted "NG" in the header; stale.
-  //   Reading the numbers: the TDMsum peak saturates near the 666.6 us window (two ISRs can
-  //   straddle one window), so past ~99.5% it stops discriminating -- at 84 it sits at the
-  //   ceiling in 98% of windows and says nothing. Judge by TDM1's own max and miss=0, and by
-  //   listening (see AVAS acceptance: a full listen, not a residual).
-  //   Also do NOT read the per-stage cost off TDM1:max -- its absolute value shifts with build
-  //   layout (83->84 moved it 9.2 us). The stage cost is in the DSP line: CMSIS-IIR 152.6 ->
-  //   154.4 us, i.e. the expected ~1.8 us for one 4-ch stage.
-  //   96 kHz, block=32: 22 OK; 39 was tried as the 96 kHz challenge value.
-  #if defined(ENA_96K_RATE)
-    #define BIQUAD_CASCADE_4CH_NUM_STAGE  (22)
-  #else
-    #define BIQUAD_CASCADE_4CH_NUM_STAGE  (84)
-  #endif //defined(ENA_96K_RATE)
+  // Stage-count promotion: normal 48-kHz Sonora DRC uses the hardware-validated
+  // 156-stage x1s3p_readyN integration point.  157 stages advanced blocks but
+  // accumulated deadline misses and produced audible corruption.  96-kHz
+  // retains its independently validated 22-stage x1s3p control.
+  #if !defined(BIQUAD_CASCADE_4CH_NUM_STAGE)
+    #if defined(ENA_96K_RATE)
+      #define BIQUAD_CASCADE_4CH_NUM_STAGE  (22)
+    #else
+      #define BIQUAD_CASCADE_4CH_NUM_STAGE  (156)
+    #endif //defined(ENA_96K_RATE)
+  #endif //!defined(BIQUAD_CASCADE_4CH_NUM_STAGE)
 
-  // Was 25*1024=25600; the AK512 serial-update (resident bootloader) link for this
-  // profile has no headroom left in the single 64 KiB data-RAM region for the stack
-  // once BSS is placed (elf-ld "Not enough memory for stack", 2112 needed/104
-  // available) -- this pool is pure unused headroom (nothing in the tree sets a
-  // nonzero default delay; it is only ever configured live via the debug console),
-  // so trimming it is free RAM for the linker, not a feature cut.
-  #define AUDIO_SAMPLE_DELAY_POOL_BYTES  (22u * 1024u) // 22*1024=22528
+  // The CMSIS DF2T instance stores numStages in uint8_t.  Keep every build-local
+  // stage override in the representable, nonzero range: otherwise arrays and
+  // telemetry could describe N stages while the instance silently wraps N.
+  #if (BIQUAD_CASCADE_4CH_NUM_STAGE < 1) || (BIQUAD_CASCADE_4CH_NUM_STAGE > 255)
+   #error "BIQUAD_CASCADE_4CH_NUM_STAGE must be in the CMSIS uint8_t range 1..255"
+  #endif
+
+  // The resident-bootloader serial-update image has a tighter single 64-KiB
+  // data-RAM budget than the Nano image.  At 156 stages, a 6-KiB delay pool
+  // leaves 4104 bytes maximum dynamic memory in the validated image.
+  // The pool is demo headroom (no nonzero default delay is set),
+  // so this preserves the DSP working set and makes the RAM trade-off explicit.
+  //
+  // The delay pool is deliberately coupled to the chosen 4ch stage count:
+  // every additional SOS consumes 224 B (four channels of source coefficients,
+  // CMSIS coefficients, CMSIS DF2T state, and reference state), so the same
+  // 224 B is returned from the pool.  The Curiosity cap is 21 KiB: the former
+  // 22-KiB cap leaves only 1576 bytes for stack even at 84 stages.
+  // A build-local AUDIO_SAMPLE_DELAY_POOL_BYTES override still wins when an
+  // experiment deliberately needs a different allocation.
+  //
+  // Taking it from the delay pool rather than from the bench is the right way
+  // round: the pool is pure unused headroom (nothing in the tree sets a nonzero
+  // default delay; it is only ever configured live from the debug console), the
+  // bench build runs no sample delay, and shrinking the bench's instrumentation
+  // instead would weaken the measurement this build exists to make.
+  //
+  // This is also the concrete reason the bench build is not a shipping image:
+  // the two do not fit in the same RAM at the same time.
+  #define BIQUAD_DRC_CAPACITY_STAGE_REFERENCE       (156u)
+  #define BIQUAD_DRC_DELAY_POOL_AT_CAPACITY_BYTES   (6u * 1024u)
+  #define BIQUAD_DRC_DELAY_POOL_MAX_BYTES           (21u * 1024u)
+  #define BIQUAD_DRC_RAM_BYTES_PER_STAGE             (224u)
+
+  #if defined(ENA_BIQUAD_TIER1_BENCH) && ENA_BIQUAD_TIER1_BENCH
+   #define AUDIO_SAMPLE_DELAY_POOL_BYTES  (1u * 1024u)
+  #elif !defined(AUDIO_SAMPLE_DELAY_POOL_BYTES)
+   #if (BIQUAD_CASCADE_4CH_NUM_STAGE >= BIQUAD_DRC_CAPACITY_STAGE_REFERENCE)
+    #define AUDIO_SAMPLE_DELAY_POOL_BYTES  BIQUAD_DRC_DELAY_POOL_AT_CAPACITY_BYTES
+   #elif ((BIQUAD_DRC_DELAY_POOL_AT_CAPACITY_BYTES + \
+           ((BIQUAD_DRC_CAPACITY_STAGE_REFERENCE - BIQUAD_CASCADE_4CH_NUM_STAGE) * \
+            BIQUAD_DRC_RAM_BYTES_PER_STAGE)) >= BIQUAD_DRC_DELAY_POOL_MAX_BYTES)
+    #define AUDIO_SAMPLE_DELAY_POOL_BYTES  BIQUAD_DRC_DELAY_POOL_MAX_BYTES
+   #else
+    #define AUDIO_SAMPLE_DELAY_POOL_BYTES  \
+        (BIQUAD_DRC_DELAY_POOL_AT_CAPACITY_BYTES + \
+         ((BIQUAD_DRC_CAPACITY_STAGE_REFERENCE - BIQUAD_CASCADE_4CH_NUM_STAGE) * \
+          BIQUAD_DRC_RAM_BYTES_PER_STAGE))
+   #endif
+  #endif
 //  #define AUDIO_SAMPLE_DELAY_POOL_BYTES  (41000)      // in case of using far memory
 
  #endif //01
@@ -1004,7 +1254,11 @@
   * fits ROM after the hal_pwm HAL migration (2026-08-16),
   * and dropping the second voice's tables (avas_synth_type_lb*.c/.h) recovers
   * far more than the ~350 B still short. */
- #if !defined(ENA_AVAS_TYPE_LB_SYNTH) && (APP_TARGET != APP_TARGET_AK128)
+ /* The Tier 1 bench owns console key 'w' for its PMU sweep.  Do not auto-enable
+  * Type_LB in that measurement-only image: classic_console.c deliberately
+  * rejects the collision, while regular images keep both selectable voices. */
+ #if !defined(ENA_AVAS_TYPE_LB_SYNTH) && (APP_TARGET != APP_TARGET_AK128) \
+  && !(defined(ENA_BIQUAD_TIER1_BENCH) && ENA_BIQUAD_TIER1_BENCH)
   #define ENA_AVAS_TYPE_LB_SYNTH
  #endif
  #if !defined(ENA_AVAS_TYPE_TY_SYNTH)
@@ -1222,6 +1476,89 @@
 #endif
 
 
+// MPQ6612A slot ownership. Check route requests even when output is off.
+#if ((MPQ6612A_ENABLE_MIKROB != 0) && (MPQ6612A_ENABLE_MIKROB != 1)) || \
+    ((MPQ6612A_ENABLE_XPRO1 != 0) && (MPQ6612A_ENABLE_XPRO1 != 1))
+#error "MPQ6612A route enables must be 0 or 1."
+#endif
+#if (APP_PWM_OUTPUT != 1) && (MPQ6612A_ENABLE_MIKROB || MPQ6612A_ENABLE_XPRO1)
+#error "MPQ6612A route enables require APP_PWM_OUTPUT=1."
+#endif
+#if MPQ6612A_ENABLE_MIKROB && APP_REQ_MIKROB_WM8904
+#error "MikroBUS B conflict: CODEC-B and MPQ6612A PWM cannot both be enabled."
+#endif
+#if MPQ6612A_ENABLE_XPRO1
+#if APP_USE_USB_AUDIO_IN
+#error "MPQ6612A XPRO1 PWM conflicts with USB audio input pins."
+#endif
+#if !MPQ6612A_ENABLE_MIKROB && !APP_PWM_AUDIO_HAL
+#error "XPRO1-only PWM requires APP_PWM_AUDIO_HAL=1."
+#endif
+#endif
+#if (MPQ6612A_STEREO != 0) && (MPQ6612A_STEREO != 1)
+#error "MPQ6612A_STEREO must be 0 or 1."
+#endif
+#if MPQ6612A_STEREO != (MPQ6612A_ENABLE_MIKROB && MPQ6612A_ENABLE_XPRO1)
+#error "MPQ6612A_STEREO must match the enabled MikroBUS B and XPRO1 routes."
+#endif
+#if MPQ6612A_STEREO
+#if (APP_PWM_OUTPUT != 1) || (APP_TARGET != APP_TARGET_AK512)
+#error "MPQ6612A stereo requires Sonora AK512, MikroBUS B + upper XPRO1."
+#endif
+#if APP_USE_USB_AUDIO_IN
+#error "MPQ6612A XPRO1 stereo conflicts with USB audio input pins."
+#endif
+#endif
+#if (ENA_NANO_POT != 0) && (ENA_NANO_POT != 1)
+#error "ENA_NANO_POT must be 0 or 1."
+#endif
+#if ENA_NANO_POT
+#if !defined(APP_TARGET_AK506) || !SONORA_APP_IS_CLASSIC
+#error "ENA_NANO_POT requires Nano AK506 Classic."
+#endif
+#if defined(MPQ6612A_NANO_SLOT) && (APP_PWM_OUTPUT == 1) && (MPQ6612A_NANO_SLOT == 2)
+#error "Nano slot2 POT conflicts with slot2 PWM."
+#endif
+#if (NANO_POT_SPAN_COUNTS < 100) || (NANO_POT_SPAN_COUNTS > 4095)
+#error "NANO_POT_SPAN_COUNTS must be 100..4095."
+#endif
+#if (NANO_POT_INVERT != 0) && (NANO_POT_INVERT != 1)
+#error "NANO_POT_INVERT must be 0 or 1."
+#endif
+#endif
+#if (PWM_AUDIO_SCOPE_ONLY != 0) && (PWM_AUDIO_SCOPE_ONLY != 1)
+#error "PWM_AUDIO_SCOPE_ONLY must be 0 or 1."
+#endif
+#if PWM_AUDIO_SCOPE_ONLY && (APP_PWM_OUTPUT != 1)
+#error "PWM scope-only requires the MPQ6612A route."
+#endif
+#if PWM_AUDIO_SCOPE_ONLY && !APP_USE_PWM_AUDIO
+#error "PWM scope-only requires an enabled PWM output."
+#endif
+#if (APP_PWM_OUTPUT != 0) && (APP_PWM_OUTPUT != 1)
+#error "APP_PWM_OUTPUT must be 0 (legacy) or 1 (MPQ6612A)."
+#endif
+#if APP_PWM_OUTPUT == 1
+#if (APP_TARGET != APP_TARGET_AK512) || (APP_BUILD != APP_BUILD_STD_DEMO_1)
+#error "MPQ6612A requires AK512 Classic 1."
+#endif
+#if (MPQ6612A_ENABLE_MIKROB || MPQ6612A_ENABLE_XPRO1) && !APP_USE_PWM_AUDIO
+#error "Disable MPQ6612A route enables when disabling APP_USE_PWM_AUDIO."
+#endif
+#if APP_USE_PWM_AUDIO && !(MPQ6612A_ENABLE_MIKROB || MPQ6612A_ENABLE_XPRO1)
+#error "MPQ6612A PWM audio requires at least one enabled output route."
+#endif
+#if (MPQ6612A_CARRIER_FACTOR != 1) && (MPQ6612A_CARRIER_FACTOR != 2) && (MPQ6612A_CARRIER_FACTOR != 4)
+#error "MPQ6612A_CARRIER_FACTOR must be 1, 2 or 4 (48, 96 or 192 kHz)."
+#endif
+#if SAMPLE_RATE * MPQ6612A_CARRIER_FACTOR > 200000
+#error "MPQ6612A carrier exceeds the 200 kHz IC input limit."
+#endif
+#if SAMPLE_RATE != 48000
+#error "MPQ6612A requires 48 kHz audio."
+#endif
+#endif
+
 // Audio topology / source conflicts
 #if APP_USE_96K_RATE && !APP_USE_SPI2_AUDIO
   #error "ENA_96K_RATE requires a configured second WM8904/SPI2 audio path on dsPIC33AK512."
@@ -1255,13 +1592,10 @@
   #error "ALL4 needs the second TDM8 endpoint pin map and four-leg board system table; use SPI12 or SPI34_TEST for now."
 #endif
 
-// WM8904-B (dual codec on MikroBUS-B/SPI2) and PWM audio (PWM5-8) cannot coexist:
-// they collide on exactly one pin, RP97 -- used both as PWM5L and as the
-// CLC3 -> WM8904-B MCLK fan-out (board/audio/audio.c). The SPI2 data/clock lines
-// (RP29/90/89/92) do NOT overlap with the PWM pins; RP97 is the sole conflict, so
-// the two output paths are exclusive until PWM5L (or codec-B MCLK) is relocated.
-#if APP_USE_PWM_AUDIO && APP_REQ_MIKROB_WM8904
-  #error "Audio-out conflict: enable EITHER ENA_MIKRO_B_WM8904 (codec-B) OR ENA_PWM_AUDIO (PWM5-8), not both -- they share MikroBUS-B pin RP97 (PWM5L vs codec-B MCLK). Comment out one in app_specific_config_defs.h."
+// Legacy MIC4607 uses RP97 (codec-B MCLK); MPQ B uses RP29 (codec-B FS).
+// XPRO1-only MPQ PWM has neither conflict and can coexist with codec B.
+#if APP_USE_PWM_AUDIO && (APP_PWM_OUTPUT == 0) && APP_REQ_MIKROB_WM8904
+  #error "Legacy MIC4607 PWM conflicts with CODEC-B MCLK on RP97."
 #endif
 
 #if APP_USE_USB_AUDIO_IN && (APP_TARGET != APP_TARGET_AK512)

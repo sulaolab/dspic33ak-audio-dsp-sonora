@@ -20,6 +20,14 @@
 # program one that no longer matches the selection -- changing profile and flashing
 # without rebuilding would otherwise put the previous firmware on the board and
 # report success.
+#
+# THERE IS NO -Help SWITCH, AND PASSING ONE PROGRAMS THE BOARD. The param block below
+# carries no [CmdletBinding()] and no [Parameter()] attribute, so this is not an
+# advanced script: PowerShell puts an unrecognised -Help into $args instead of
+# refusing it, and the normal flash path then runs. `flashauto.ps1 -Help` is
+# therefore a flash, not a query -- verified the hard way on 2026-09-16, on a board
+# that was mid-measurement. To look up the arguments read this header; to see what
+# would happen use -DryRun or -List, which are declared and safe.
 
 param(
     # Reset the board WITHOUT flashing. Not "reset after flashing" - that is
@@ -65,6 +73,7 @@ param(
     # and never in a script that must work on an unresponsive board.
     [switch]$RequireAudioStop,
     [string]$MonitorUrl,
+    [string]$MonitorRoot,
     [ValidateRange(1, 60)]
     [int]$UartTimeoutSec = 20,
 
@@ -80,6 +89,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'serial-monitor-resolver.ps1')
 
 # The reset wait is deliberately not adjustable. Every observed "it timed out"
 # incident was a short timeout passed by a caller, and the reaction to a real
@@ -374,43 +384,17 @@ function Get-ExpectedMonitorProfile {
 function Resolve-MonitorUrl {
     param(
         [string]$RequestedUrl,
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        [string]$ExpectedProfile,
+        [string]$MonitorRoot
     )
 
     if (-not [string]::IsNullOrWhiteSpace($RequestedUrl)) {
         return $RequestedUrl.TrimEnd('/')
     }
 
-    # Do not bake 127.0.0.1 into this flash tool. Multiple monitors use the
-    # same port on different loopback aliases; the launcher resolves the alias
-    # from this worktree's .serial-monitor.json without opening a COM port.
-    $launcher = Join-Path (Split-Path -Parent $RepoRoot) 'serial-monitor\start-serial-monitor.ps1'
-    if (-not (Test-Path -LiteralPath $launcher)) {
-        throw "Cannot resolve serial-monitor URL: launcher not found at $launcher. Pass -MonitorUrl explicitly."
-    }
-
-    Push-Location -LiteralPath $RepoRoot
-    try {
-        # `*>&1`, not `2>&1`: the launcher prints the resolved bind with
-        # Write-Host, which goes to the information stream. Redirecting only
-        # stderr leaves $listing empty while the line is plainly on screen.
-        $listing = @(& $launcher -List *>&1 | ForEach-Object { [string]$_ })
-        $launcherExitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
-    # A PowerShell launcher that returns without `exit` leaves $LASTEXITCODE
-    # unset; only a non-zero value is a failure.
-    if (($null -ne $launcherExitCode) -and ($launcherExitCode -ne 0)) {
-        throw "serial-monitor URL resolution failed (exit $launcherExitCode). Pass -MonitorUrl explicitly."
-    }
-
-    foreach ($line in $listing) {
-        if ([string]$line -match "^Profile '[^']+'\s+->\s+bind\s+([^\s]+)") {
-            return "http://$($matches[1]):8080"
-        }
-    }
-    throw "Could not find the resolved serial-monitor bind in launcher output. Pass -MonitorUrl explicitly."
+    return Resolve-RunningSerialMonitorUrl -RequestedUrl $RequestedUrl `
+        -ExpectedProfile $ExpectedProfile -RepoRoot $RepoRoot -MonitorRoot $MonitorRoot
 }
 
 # Why every failure below is a warning and not a throw:
@@ -434,6 +418,7 @@ function Invoke-PreFlashAudioStop {
         [string]$Command,
         [string]$RequestedMonitorUrl,
         [string]$RepoRoot,
+        [string]$MonitorRoot,
         [int]$TimeoutSec,
         [bool]$DryRun,
         [bool]$Required
@@ -471,7 +456,8 @@ function Invoke-PreFlashAudioStop {
     $url = $null
     try {
         $expectedProfile = Get-ExpectedMonitorProfile -RepoRoot $RepoRoot
-        $url = Resolve-MonitorUrl -RequestedUrl $RequestedMonitorUrl -RepoRoot $RepoRoot
+        $url = Resolve-MonitorUrl -RequestedUrl $RequestedMonitorUrl -RepoRoot $RepoRoot `
+            -ExpectedProfile $expectedProfile -MonitorRoot $MonitorRoot
     } catch {
         Stop-OrWarn "could not resolve the serial-monitor for a pre-flash mute ($($_.Exception.Message))"
         return
@@ -615,7 +601,7 @@ if ($ResetOnly) {
         Invoke-ResetJavaCleanup -ResetTool $resetTool -DryRun $DryRun
     }
     Invoke-PreFlashAudioStop -Command $StopAudioCommand -RequestedMonitorUrl $MonitorUrl `
-        -RepoRoot $repoRoot -TimeoutSec $UartTimeoutSec -DryRun:$DryRun `
+        -RepoRoot $repoRoot -MonitorRoot $MonitorRoot -TimeoutSec $UartTimeoutSec -DryRun:$DryRun `
         -Required:$RequireAudioStop
     Invoke-CheckedExe -Exe $resetTool -Arguments $resetArgs
     Write-Status "flashauto: reset completed"
@@ -652,7 +638,7 @@ if ($Verbose) { $flashArgs += '--verbose' }
 if ($DryRun) { $flashArgs += '--dry-run' }
 
 Invoke-PreFlashAudioStop -Command $StopAudioCommand -RequestedMonitorUrl $MonitorUrl `
-    -RepoRoot $repoRoot -TimeoutSec $UartTimeoutSec -DryRun:$DryRun `
+    -RepoRoot $repoRoot -MonitorRoot $MonitorRoot -TimeoutSec $UartTimeoutSec -DryRun:$DryRun `
     -Required:$RequireAudioStop
 Invoke-CheckedExe -Exe $flashTool -Arguments $flashArgs
 

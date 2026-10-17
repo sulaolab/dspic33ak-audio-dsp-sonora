@@ -33,6 +33,9 @@ typedef struct {
     uint32_t foutswen_ticks;
     uint32_t source_switches;
     uint32_t on_clears;
+    uint32_t request_held;
+    uint32_t prev_effective;
+    uint32_t switch_refused;
 } nora_fake_pll_slot_t;
 
 static nora_fake_clkgen_slot_t s_clkgen[NORA_FAKE_CLKGEN_SLOTS];
@@ -92,8 +95,20 @@ static void nora_fake_tick_clkgen(nora_fake_clkgen_slot_t *slot)
     }
 }
 
+/*
+ * What actually keeps the block running: the ON bit OR any consumer's clock
+ * request (DS70005591D 12.4.1).  con.ON is left holding exactly what software
+ * wrote -- see nora_fake_pll_set_request_held for why that separation matters.
+ */
+static uint32_t nora_fake_pll_effective(const nora_fake_pll_slot_t *slot)
+{
+    return ((slot->con.ON != 0u) || (slot->request_held != 0u)) ? 1u : 0u;
+}
+
 static void nora_fake_tick_pll(nora_fake_pll_slot_t *slot, uint32_t *rdy)
 {
+    const uint32_t effective = nora_fake_pll_effective(slot);
+
     if ((slot->prev_on == 0u) && (slot->con.ON != 0u)) {
         /*
          * "ON starts an internal DIVSWEN asynchronously on this silicon" --
@@ -104,21 +119,43 @@ static void nora_fake_tick_pll(nora_fake_pll_slot_t *slot, uint32_t *rdy)
         slot->divswen_ticks = 0u;
     }
     if ((slot->prev_on != 0u) && (slot->con.ON == 0u)) {
+        /* Software's own writes, whether or not they stop anything. */
         slot->on_clears++;
-        /* Out of lock: a disabled PLL is not ready.  Without this the closing
-         * WAIT_SET(PLLxRDY) would pass on a stale 1 and prove nothing. */
+    }
+    if ((slot->prev_effective != 0u) && (effective == 0u)) {
+        /* NOW it is actually off, so it is out of lock.  Keyed on the effective
+         * enable and not on the ON bit: a PLL a consumer is still requesting has
+         * not stopped, and its lock indications are entitled to stay set.  Without
+         * this the closing poll would pass on a stale 1 and prove nothing. */
         *rdy = 0u;
+        slot->con.CLKRDY = 0u;
     }
     slot->prev_on = slot->con.ON;
+    slot->prev_effective = effective;
 
     (void)nora_fake_advance(&slot->con.DIVSWEN, &slot->divswen_ticks);
     (void)nora_fake_advance(&slot->con.PLLSWEN, &slot->pllswen_ticks);
     (void)nora_fake_advance(&slot->con.FOUTSWEN, &slot->foutswen_ticks);
 
     if (nora_fake_advance(&slot->con.OSWEN, &slot->oswen_ticks) != 0) {
-        slot->source_switches++;
-        if (slot->con.ON != 0u) {
-            *rdy = 1u;
+        if (slot->switch_refused != 0u) {
+            /* Completed without taking: the request bit clears, COSC keeps its
+             * old value, and the PLL goes on reporting lock -- on the source it
+             * never left.  See nora_fake_pll_set_switch_refused. */
+            if (effective != 0u) {
+                *rdy = 1u;
+                slot->con.CLKRDY = 1u;
+            }
+        } else {
+            slot->source_switches++;
+            /* The switch took: the selection becomes the current one.  COSC moves
+             * even when the block is off -- the mux is not the analog loop -- but
+             * neither ready indication does. */
+            slot->con.COSC = slot->con.NOSC;
+            if (effective != 0u) {
+                *rdy = 1u;
+                slot->con.CLKRDY = 1u;
+            }
         }
     }
 }
@@ -223,7 +260,8 @@ uint32_t nora_fake_pllcon_word(uint32_t pll)
      * the remaining positions are left where they were. */
     return (con->ON & 1u) | ((con->OSWEN & 1u) << 2) |
            ((con->DIVSWEN & 1u) << 3) | ((con->PLLSWEN & 1u) << 4) |
-           ((con->FOUTSWEN & 1u) << 5) | ((con->NOSC & 0xffu) << 8);
+           ((con->FOUTSWEN & 1u) << 5) | ((con->CLKRDY & 1u) << 6) |
+           ((con->NOSC & 0xffu) << 8) | ((con->COSC & 0xffu) << 16);
 }
 
 uint32_t nora_fake_plldiv_word(uint32_t pll)
@@ -292,4 +330,14 @@ uint32_t nora_fake_pll_source_switches(uint32_t pll)
 uint32_t nora_fake_pll_on_clears(uint32_t pll)
 {
     return pll_slot(pll)->on_clears;
+}
+
+void nora_fake_pll_set_request_held(uint32_t pll, uint32_t held)
+{
+    pll_slot(pll)->request_held = (held != 0u) ? 1u : 0u;
+}
+
+void nora_fake_pll_set_switch_refused(uint32_t pll, uint32_t refused)
+{
+    pll_slot(pll)->switch_refused = (refused != 0u) ? 1u : 0u;
 }

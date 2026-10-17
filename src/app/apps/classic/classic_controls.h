@@ -16,14 +16,16 @@ void UsrOperate_pinger( void );
 void UsrOperate_engine_synth( void );      /* SW2 (treble) long press: on/off toggle */
 void UsrOperate_avas_synth( void );        /* TYPE_TY       ('a', *cy00) */
 void UsrOperate_avas_synth_type_lb( void );  /* LAMB  ('A') */
+void UsrOperate_avas_synth_key( char key ); /* a=TY / A=LB start; either key stops playback */
 void UsrOperate_avas_synth_button( void ); /* Mute long press: start alternates TY/Type_LB */
 
 /* AVAS pitch trim status line ('?cs'), for whichever engine is switched on.
- * The trim itself has no key: the POT is its only control, sampled inside
+ * Up/down arrows adjust the trim; POT movement may then take over, sampled inside
  * classic_controls_process(): fully counter-clockwise is the engine's own pitch,
  * clockwise raises it.  Range/clamp live with each engine
  * (AVAS_TYPE_TY_POT_TOP_CENT / AVAS_TYPE_LB_POT_TOP_CENT). */
 void UsrOperate_avas_pitch_print( void );
+void UsrOperate_avas_pitch_step( float delta_cent );
 void UsrOperate_surround( void );
 void UsrOperate_Bmode( void );
 

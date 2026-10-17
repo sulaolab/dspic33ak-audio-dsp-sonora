@@ -150,7 +150,16 @@ typedef enum {
     /* A caller declared a frequency that contradicts one this HAL determines (the
      * contract's FRC frequency, or a PLL output read from its registers). Restating
      * the known value is accepted; disagreeing with it is not. */
-    NORA_CLOCK_DSPIC33AK_DIAG_SOURCE_HZ_CONFLICT    = 13
+    NORA_CLOCK_DSPIC33AK_DIAG_SOURCE_HZ_CONFLICT    = 13,
+
+    /* A PLL had to be stopped to change its dividers and would not stop: writing
+     * ON = 0 is a request that the hardware ORs with every consumer's clock
+     * request (DS70005591D 12.4.1), so a PLL something is still using keeps
+     * running. POSTDIV1/POSTDIV2 must not be changed while a PLL is operating
+     * (12.4.6.1 step 3b), so the call is refused with the dividers untouched
+     * rather than writing them to a running PLL. Requesting the settings it is
+     * ALREADY locked on is not affected -- that needs no write and succeeds. */
+    NORA_CLOCK_DSPIC33AK_DIAG_PLL_STOP_REFUSED      = 14
 } nora_clock_dspic33ak_diag_t;
 
 /* -------------------------------------------------------------------------- */

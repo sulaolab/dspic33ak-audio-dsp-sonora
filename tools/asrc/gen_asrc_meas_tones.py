@@ -59,9 +59,57 @@ FULL_SCALE = (2 ** 23) - 1
 # index 1 the DR stimulus, so the two most-used levels are the two lowest indices.
 LEVELS_DBFS = (-1, -60, -20, -40, -80, -6)
 
+# WHICH LEVELS A ROW NEEDS, keyed on the row-name prefix.  Added 2026-09-20.
+#
+# WHY THE TABLE IS NO LONGER RECTANGULAR.  It used to be len x 6 levels for EVERY row, and that
+# was affordable while the rows were short: the 34 rows before this change are 14,190 samples,
+# 56,760 B.  The four anti-alias pairs need long tables to land near their probe frequencies
+# points, because the integer-Hz grid at 22.05 / 32 / 44.1 kHz is coarse near them), and 28 such
+# rows x 6 levels is 223,320 B.  Measured, not estimated: the first regeneration of this change
+# produced a 280,080 B table, which is most of the flash a MEAS image has left.
+#
+# What makes the six levels unnecessary for most of them is what each row is FOR.  The level sweep
+# exists for DR and THD+N, which need a loud tone and a -60 dBFS tone at the SAME frequency.  A
+# fold-image row is a REJECTION measurement -- how far down the surviving tone and its image are
+# relative to a full-scale input -- and one stimulus level answers that; -1 dBFS is the level every
+# SFDR / alias run on this product has used.
+#
+# So a row declares its levels, and the accessor became ragged (per-row level count, per-row level
+# list).  Rows that predate this keep all six and their INDEX ORDER, so *at 02 VV is unchanged for
+# them and --check-legacy still pins their samples.
+#
+# The cost with this, plus picking the SHORTEST row inside each probe window rather than the one
+# nearest a nominal frequency: 29,644 B for the 28 new rows instead of 223,320 B.  Only the eight
+# MID / FP rows carry six levels, and they are the short ones.
+ROW_LEVELS = {
+    # prefix                 levels for rows whose name starts with it
+    "AA_": {
+        "MID":  LEVELS_DBFS,          # DR / THD+N stimulus -- needs the whole sweep
+        "FP":   LEVELS_DBFS,          # passband-edge THD+N / droop -- same
+        None:   (-1,),                # every fold-image point: rejection, one level
+    },
+    # The campaign coverage rows (aq_rowgen, 2026-09-23): every point they serve is a -1 dBFS
+    # spectral probe -- DR / THD+N are served by F1K_* / LOW at every source rate.
+    "AQ_": {
+        None:   (-1,),
+    },
+}
+
+
+def levels_for(name: str) -> tuple:
+    """The level set this row carries.  Default (and every pre-2026-09-20 row) is all six."""
+    for prefix, spec in ROW_LEVELS.items():
+        if not name.startswith(prefix):
+            continue
+        suffix = name.rsplit("_", 1)[-1]
+        return spec.get(suffix, spec[None])
+    return LEVELS_DBFS
+
+
 # One entry per tone ROW, in table order.  (name, len, cycles, nominal_fs_hz)
 # nominal_fs_hz is the source rate at which this row's tone_hz holds; the row is
 # still perfectly periodic at any other rate, just at a different frequency.
+# The LEVELS a row carries come from levels_for(name) above, not from this tuple.
 ROWS = (
     ("LOW",     48,  1, 48000),   # 1 kHz at 48 kHz  (2 kHz at 96 kHz)
     ("HIGH_48",  8,  3, 48000),   # 18 kHz at 48 kHz (36 kHz at 96 kHz -- unusable there)
@@ -97,6 +145,371 @@ ROWS = (
     ("SW_22000",  24,  11, 48000),   # 22 kHz at 48 kHz
     ("SW_23000",  48,  23, 48000),   # 23 kHz at 48 kHz
     ("SW_23900", 480, 239, 48000),   # 23.9 kHz at 48 kHz
+    # 44.1 kHz-SOURCE rows -- ADDED 2026-09-14 for the 44.1 -> 16 kHz `/2 -> 1:1 LPF`
+    # composition R2 (on-target spectral) study.  These exist because the rows above are
+    # 48 kHz-nominal and SAMPLE-DOMAIN exact: played on a 44.1 kHz leg every one of them
+    # lands at 0.91875x its name (SW_16000 becomes 14,700 Hz), so a 44.1 kHz pair cannot
+    # reuse them and have the printed frequency mean anything.
+    #
+    # WHAT EACH ONE IS FOR.  The chain is 44.1k --/2 51t--> 22.05k --1:1 53t--> 22.05k
+    # --rear M30 step 1.378125--> 16k, protected 0..6500 Hz (tools/asrc/asrc_lp1_chain_44k1_to_16k_gate.py).
+    # The two stages SHARE one specification, so they do not attenuate the same regions --
+    # which is exactly what an on-target measurement has to separate:
+    #
+    #   9,500..11,025 Hz  passes the /2 UNFOLDED (below its 12,550 Hz stopband start and
+    #                     below the 22.05 kHz Nyquist) and is killed by the 1:1 stage ALONE.
+    #                     This band is the composition's own risk and has no counterpart in
+    #                     any single-stage row measured so far.
+    #   12,550..22,050 Hz folds on the /2 (f -> 22050 - f) and is killed by the /2 ALONE.
+    #                     HOST worst case: 15,706 -> 6,344 Hz at -114.38 dB.
+    #   ~12,600 Hz        folds twice (22050 - f, then 16000 - that), so both stages contribute.
+    #
+    # Every row below is integer-Hz at 44,100 (tone_hz() requires it), minimal (gcd == 1) and
+    # under the 22.05 kHz source Nyquist.  Frequencies were chosen as the cheapest exact row
+    # near each target rather than the target itself; the HOST comparison is evaluated at the
+    # ACTUAL frequency, so the small offsets cost nothing.
+    #
+    # ROW CHOICE IS DRIVEN BY WHAT IS MEASURABLE, not by what is interesting.  The HOST
+    # prediction at every candidate frequency was computed first
+    # (tools/asrc/asrc_lp1_chain_44k1_to_16k_tones.py) and it changed the set twice:
+    #
+    #   * the 1:1-only band is far DEEPER than the spec.  9,800 -> -152.5 dB,
+    #     10,500 -> -141.7 dB: the 1:1 stopband and the rear M30's own roll-off compound,
+    #     so a 24-bit capture can only report "below the floor" there.  ONE row is kept
+    #     (AL44_9800) to demonstrate exactly that; a second would measure the same floor twice.
+    #   * the double-fold point is deeper still.  12,250 -> -212.6 dB (both stages attenuate
+    #     it), and 12,600 lands at 6,550 Hz -- OUTSIDE the protected band, so it is not a
+    #     protected-band alias test at all.  Both were dropped.
+    #
+    # What is left are the frequencies where the /2 stopband alone carries the attenuation and
+    # the predicted level is within reach of a 24-bit capture: -114 .. -126 dB.
+    ("PB44_980",    45,  1, 44100),   #    980 Hz -- mid-band passband reference
+    ("PB44_6468",   75, 11, 44100),   #  6,468 Hz -- protected-band edge, 32 Hz inside
+    ("AL44_9800",    9,  2, 44100),   #  9,800 Hz -> 6,200 Hz -- 1:1 stage ALONE; HOST -152.5 dB
+    ("AL44_15680",  45, 16, 44100),   # 15,680 Hz -> 6,370 Hz -- /2 ALONE; HOST -114.4 dB (WORST)
+    ("AL44_16800",  21,  8, 44100),   # 16,800 Hz -> 5,250 Hz -- /2 ALONE; HOST -125.6 dB
+    ("AL44_18900",   7,  3, 44100),   # 18,900 Hz -> 3,150 Hz -- /2 ALONE; HOST -122.2 dB
+
+    # ---- THE FOUR ANTI-ALIAS FRONT-END ROWS, added 2026-09-20 for the total MEAS of the pairs
+    # closed in PR #36 and PR #37 (DR, THD+N, and the fold image the owner heard in listening).
+    #
+    # WHY THEY ARE NEEDED AT ALL, which is the whole reason this block exists: table rows are
+    # SAMPLE-DOMAIN exact, so a row is only valid at the source rate it was generated for.  None
+    # of the 27 rows above is at a 32 kHz source -- that rate had NO rows -- and the six 44.1 kHz
+    # rows were all chosen for a 16 kHz OUTPUT (protected edge 6,468 Hz).  For a 12 kHz output
+    # FN is 6,000 Hz and for an 8 kHz output 4,000 Hz, so those six sit ABOVE the region of
+    # interest rather than in it.  Reusing them would have printed a frequency that means nothing
+    # for these pairs.  [internal] report_owner_listening_20260920.md section 5.
+    #
+    # WHAT EACH PROBE POINT IS FOR.  The uniform spec protects 0 .. Fp with Fp = 0.40625 * Fs_out
+    # and stops at Fstop = Fs_out - Fp, which puts the transition band's CENTRE exactly on
+    # Fs_out/2 -- so a uniform-spec row is ~-6 dB at the output Nyquist by construction, at every
+    # rate.  That is the specification, not a defect (every shipped row reads -6.02 dB there), and
+    # it is what the owner heard as a tone surviving above Fs_out/2 and a noise hill at Fs_out/2.
+    # These seven points per pair are what turn that into numbers:
+    #
+    #   MID   <= Fp/3, so H2 AND H3 stay inside the protected band.  A THD+N figure measured on a
+    #         tone whose harmonics fold is not a THD+N figure -- this bound is the requirement,
+    #         not "somewhere in the middle".
+    #   FP    STRICTLY inside Fp.  A tone above Fp is outside the protected band and would report
+    #         the transition band's roll-off as a passband error.
+    #   N095  0.95 FN -- the last point still below the fold.
+    #   FN    Fs_out/2 -- where the tone and its own image coincide at equal gain.  This is the
+    #         hill.
+    #   N105  1.05 FN -- the survivor, host-predicted ~-15 dB.
+    #   N110  1.10 FN -- the survivor, host-predicted ~-31 dB.
+    #   STOP  Fstop -- the "must be dead" reference; host says <= -107 dBc for every armed row.
+    #
+    # FREQUENCIES ARE THE NEAREST ACHIEVABLE, NOT THE NOMINAL TARGET, and the offset is printed
+    # below per row.  f = fs * cycles / len must be an integer (tone_hz() enforces it), so the
+    # reachable set is a grid, and the 2026-09-14 rows above set the precedent: the HOST comparison
+    # is evaluated at the ACTUAL frequency and the *ac arm line self-describes the real tone, so a
+    # sub-1 % offset costs nothing.  Worst here is -0.645 %.
+    #
+    # THE 32 kHz -> 11.025 kHz ROWS CANNOT BE EXACT, and it is arithmetic rather than sloppiness:
+    # 32000 = 2^8 * 5^3 so its integer-Hz grid is built from 2s and 5s, while 11025 = 3^2 * 5^2 *
+    # 7^2 carries a 7^2 that no grid point has.  Fp = 4,478.90625 Hz is therefore unreachable and
+    # the nearest grid point below it is 4,450 Hz (-0.645 %), at len 640.  Chasing closer costs
+    # len 1000 for 0.045 % -- the tolerance was widened for this row deliberately, not by accident.
+    #
+    # Table lengths are capped at 640 samples (15,360 B at six levels).  Total for this block:
+    # 30,864 B of flash, all const, inside #if APP_ASRC_MEAS -- a product build compiles none of it.
+    ("AA_22K05_8K_MID",     21,   1, 22050),  #  1,050 Hz  22.05 -> 8 k: MID (<= Fp/3)      [6 lev]
+    ("AA_22K05_8K_FP",      75,  11, 22050),  #  3,234 Hz (-0.49%)  Fp = 3,250.00            [6 lev]
+    ("AA_22K05_8K_N095",    35,   6, 22050),  #  3,780 Hz (-0.53%)  0.95 FN
+    ("AA_22K05_8K_FN",      50,   9, 22050),  #  3,969 Hz (-0.78%)  FN = 4,000
+    ("AA_22K05_8K_N105",    21,   4, 22050),  #  4,200 Hz (exact)   1.05 FN
+    ("AA_22K05_8K_N110",     5,   1, 22050),  #  4,410 Hz (+0.23%)  1.10 FN
+    ("AA_22K05_8K_STOP",    14,   3, 22050),  #  4,725 Hz (-0.53%)  Fstop = 4,750.00
+    ("AA_32K_11K025_MID",   25,   1, 32000),  #  1,280 Hz  32 -> 11.025 k: MID (<= Fp/3)     [6 lev]
+    ("AA_32K_11K025_FP",   640,  89, 32000),  #  4,450 Hz (-0.65%)  Fp = 4,478.91 (grid)     [6 lev]
+    ("AA_32K_11K025_N095",  80,  13, 32000),  #  5,200 Hz (-0.70%)  0.95 FN
+    ("AA_32K_11K025_FN",    64,  11, 32000),  #  5,500 Hz (-0.23%)  FN = 5,512.50
+    ("AA_32K_11K025_N105",  50,   9, 32000),  #  5,760 Hz (-0.49%)  1.05 FN
+    ("AA_32K_11K025_N110", 100,  19, 32000),  #  6,080 Hz (+0.27%)  1.10 FN
+    ("AA_32K_11K025_STOP",  64,  13, 32000),  #  6,500 Hz (-0.70%)  Fstop = 6,546.09
+    ("AA_44K1_12K_MID",     28,   1, 44100),  #  1,575 Hz  44.1 -> 12 k: MID (<= Fp/3)       [6 lev]
+    ("AA_44K1_12K_FP",     100,  11, 44100),  #  4,851 Hz (-0.49%)  Fp = 4,875.00            [6 lev]
+    ("AA_44K1_12K_N095",    70,   9, 44100),  #  5,670 Hz (-0.53%)  0.95 FN
+    ("AA_44K1_12K_FN",     126,  17, 44100),  #  5,950 Hz (-0.83%)  FN = 6,000
+    ("AA_44K1_12K_N105",     7,   1, 44100),  #  6,300 Hz (exact)   1.05 FN
+    ("AA_44K1_12K_N110",    20,   3, 44100),  #  6,615 Hz (+0.23%)  1.10 FN
+    ("AA_44K1_12K_STOP",    25,   4, 44100),  #  7,056 Hz (-0.97%)  Fstop = 7,125.00
+    ("AA_44K1_8K_MID",      42,   1, 44100),  #  1,050 Hz  44.1 -> 8 k: MID (<= Fp/3)        [6 lev]
+    ("AA_44K1_8K_FP",      150,  11, 44100),  #  3,234 Hz (-0.49%)  Fp = 3,250.00            [6 lev]
+    ("AA_44K1_8K_N095",     35,   3, 44100),  #  3,780 Hz (-0.53%)  0.95 FN
+    ("AA_44K1_8K_FN",      100,   9, 44100),  #  3,969 Hz (-0.78%)  FN = 4,000
+    ("AA_44K1_8K_N105",     21,   2, 44100),  #  4,200 Hz (exact)   1.05 FN
+    ("AA_44K1_8K_N110",     10,   1, 44100),  #  4,410 Hz (+0.23%)  1.10 FN
+    ("AA_44K1_8K_STOP",     28,   3, 44100),  #  4,725 Hz (-0.53%)  Fstop = 4,750.00
+
+    # ---- THE FORMAL ~1 kHz DR / THD+N ROWS, one per SOURCE rate, added 2026-09-20 (campaign
+    # Phase 4).  These are the L1 formal-measurement stimulus for the 81-cell DR / THD+N campaign:
+    # 1 kHz at -60 dBFS (DR) and at -1 dBFS (THD+N), on EVERY cell, tolerance +/-2 %.
+    #
+    # WHY `MID` CANNOT SERVE THIS, which is the reason the block exists rather than reusing rows.
+    # `MID` is bounded at Fp/3 so that H2 AND H3 stay inside the protected band -- that bound is what
+    # makes a THD+N figure measured on it a THD+N figure at all.  At a 22.05 kHz source that puts MID
+    # at 1,050 Hz and at 32 kHz at 1,280 Hz: 5 % and 28 % away from 1 kHz, i.e. outside the 2 %
+    # tolerance.  `MID` and the formal 1 kHz point are DIFFERENT REQUIREMENTS and want different
+    # rows; widening the tolerance to make one row serve both would change what is being measured.
+    # Measured, not assumed: before these rows the standard-profile plan blocked 63 DR points and
+    # 62 THD+N points, every one of them this exact 1 kHz request at one of eight source rates.
+    #
+    # ★ THE HANDOVER'S TABLE (`len = fs/1000, cycles = 1`) DOES NOT COMPILE AT THREE OF THE RATES.
+    # `tone_hz()` requires fs*cycles % len == 0, and 11025 % 11 = 3, 22050 % 22 = 6, 44100 % 44 = 12
+    # -- so 11/1, 22/1 and 44/1 are all rejected by check_geometry().  The 44.1 kHz FAMILY's
+    # integer-Hz grid near 1 kHz is coarse because 44100 = 2^2 * 3^2 * 5^2 * 7^2 carries a 7^2: the
+    # reachable points below 1,050 Hz are 980 Hz (len 45, -2.00 %), 990 Hz (len 490), 1,008 Hz
+    # (len 175, +0.80 %) and 1,000 Hz itself only at len 441.  980 Hz sits EXACTLY on the campaign's
+    # 2 % tolerance boundary (aq_plan.TONE_TOL_FRAC), so it is not used -- a probe point whose
+    # acceptance depends on a >= vs > comparison is not a probe point.  1,008 Hz at len 175 is the
+    # shortest row with real margin, and it is shared arithmetic across all three 44.1-family rates
+    # (176,400 / 175 in each case, with cycles riding the rate).
+    #
+    # The five 2^a*5^b rates reach 1,000 Hz exactly at len = fs/1000, cycles = 1.
+    #
+    # COST, MEASURED: 14,808 B of .rodata at six levels (2,208 B for the five short rows, 4,200 B
+    # each for the three len-175 rows).  That is ~3.6x the "roughly 4 KB" in the handover, and the
+    # difference is entirely the three len-175 rows the handover's 11/22/44 geometry would have
+    # avoided had it been achievable.  All six levels are kept deliberately: the campaign asks these
+    # rows for -60 (DR), -1 (THD+N) and -6 dBFS (the L3 headroom cross-check), and a level a row does
+    # not carry is a request the planner must not generate (see ROW_LEVELS above and aq_levels.py).
+    # Wholly inside #if APP_ASRC_MEAS -- a product build compiles none of it.
+    ("F1K_8K",               8,   1,  8000),  #  1,000 Hz (exact)     8 k source
+    ("F1K_11K025",         175,  16, 11025),  #  1,008 Hz (+0.80%)   11.025 k source (7^2 grid)
+    ("F1K_12K",             12,   1, 12000),  #  1,000 Hz (exact)    12 k source
+    ("F1K_16K",             16,   1, 16000),  #  1,000 Hz (exact)    16 k source
+    ("F1K_22K05",          175,   8, 22050),  #  1,008 Hz (+0.80%)   22.05 k source (7^2 grid)
+    ("F1K_24K",             24,   1, 24000),  #  1,000 Hz (exact)    24 k source
+    ("F1K_32K",             32,   1, 32000),  #  1,000 Hz (exact)    32 k source
+    ("F1K_44K1",           175,   4, 44100),  #  1,008 Hz (+0.80%)   44.1 k source (7^2 grid)
+    # 48 kHz needs no row: LOW (row 0) is 48/1 = 1,000 Hz exact at a 48 kHz source.
+
+    # ---- THE CAMPAIGN COVERAGE ROWS, added 2026-09-23 ([internal tool] asrc_audio_quality/aq_rowgen.py).
+    # Before them 131 of 1,059 planned points on the 12-define MEAS image were BLOCKED: the rows above
+    # are nominal at 48 / 44.1 kHz (plus the AA_ / F1K_ blocks), so a probe on any other leg rate --
+    # or a 48 / 44.1 kHz probe no row happens to sit near -- had nothing to play.  Each row below is
+    # the SHORTEST row inside the campaign's 2 % tone tolerance AND on the side of the landmark its
+    # role asks about (aq_freq.role_answerable_by); rowgen verifies the result against the real plan
+    # builder: 1,076 / 1,076 measurable.  One level (-1 dBFS, ROW_LEVELS "AQ_"): 19,424 B of const,
+    # wholly inside #if APP_ASRC_MEAS -- a product build compiles none of it.  Regenerate this block
+    # with the internal campaign row generator's --antialias-22k05 --out <file> options;
+    # it is appended, never interleaved, so every earlier row keeps its *at04VV index.
+    ("AQ_8_2400",   10,    3, 8000),   # 2400 Hz at 8000 Hz
+    #   serves campaign target(s): 2400Hz
+    ("AQ_11K025_3325",   63,   19, 11025),   # 3325 Hz at 11025 Hz  (target 3307.5 Hz, err +17.5 Hz)
+    #   serves campaign target(s): 3308Hz
+    ("AQ_12_3200",   15,    4, 12000),   # 3200 Hz at 12000 Hz  (target 3185.0 Hz, err +15.0 Hz)
+    #   serves campaign target(s): 3185Hz
+    ("AQ_12_3600",   10,    3, 12000),   # 3600 Hz at 12000 Hz
+    #   serves campaign target(s): 3600Hz
+    ("AQ_12_5600",   15,    7, 12000),   # 5600 Hz at 12000 Hz  (target 5540.1 Hz, err +59.9 Hz)
+    #   serves campaign target(s): 5540Hz
+    ("AQ_16_3750",   64,   15, 16000),   # 3750 Hz at 16000 Hz  (target 3700.0 Hz, err +50.0 Hz)
+    #   serves campaign target(s): 3700Hz
+    ("AQ_16_3840",   25,    6, 16000),   # 3840 Hz at 16000 Hz  (target 3850.0 Hz, err -10.0 Hz)
+    #   serves campaign target(s): 3850Hz
+    ("AQ_16_4032",  250,   63, 16000),   # 4032 Hz at 16000 Hz  (target 4020.0 Hz, err +12.0 Hz)
+    #   serves campaign target(s): 4020Hz
+    ("AQ_16_4400",   40,   11, 16000),   # 4400 Hz at 16000 Hz  (target 4478.9 Hz, err -78.9 Hz)
+    #   serves campaign target(s): 4479Hz
+    ("AQ_16_4800",   10,    3, 16000),   # 4800 Hz at 16000 Hz  (target 4777.5 Hz, err +22.5 Hz)
+    #   serves campaign target(s): 4778Hz, 4800Hz, 4823Hz
+    ("AQ_22K05_3430",   45,    7, 22050),   # 3430 Hz at 22050 Hz  (target 3400.0 Hz, err +30.0 Hz)
+    #   serves campaign target(s): 3400Hz
+    ("AQ_22K05_3675",    6,    1, 22050),   # 3675 Hz at 22050 Hz  (target 3700.0 Hz, err -25.0 Hz)
+    #   serves campaign target(s): 3700Hz
+    ("AQ_22K05_3920",   45,    8, 22050),   # 3920 Hz at 22050 Hz  (target 3880.0 Hz, err +40.0 Hz)
+    #   serves campaign target(s): 3880Hz
+    ("AQ_22K05_4050",   49,    9, 22050),   # 4050 Hz at 22050 Hz  (target 4020.0 Hz, err +30.0 Hz)
+    #   serves campaign target(s): 4020Hz
+    ("AQ_22K05_4851",   50,   11, 22050),   # 4851 Hz at 22050 Hz  (target 4875.0 Hz, err -24.0 Hz)
+    #   serves campaign target(s): 4875Hz
+    ("AQ_22K05_5145",   30,    7, 22050),   # 5145 Hz at 22050 Hz  (target 5099.1 Hz, err +45.9 Hz)
+    #   serves campaign target(s): 5099Hz, 5100Hz, 5102Hz, 5250Hz
+    ("AQ_22K05_5250",   21,    5, 22050),   # 5250 Hz at 22050 Hz  (target 5305.8 Hz, err -55.8 Hz)
+    #   serves campaign target(s): 5306Hz, 5347Hz
+    ("AQ_22K05_5600",   63,   16, 22050),   # 5600 Hz at 22050 Hz  (target 5540.1 Hz, err +59.9 Hz)
+    #   serves campaign target(s): 5540Hz
+    ("AQ_22K05_5880",   15,    4, 22050),   # 5880 Hz at 22050 Hz  (target 5775.0 Hz, err +105.0 Hz)
+    #   serves campaign target(s): 5775Hz
+    ("AQ_22K05_6125",   18,    5, 22050),   # 6125 Hz at 22050 Hz  (target 6030.0 Hz, err +95.0 Hz)
+    #   serves campaign target(s): 6030Hz
+    ("AQ_22K05_6615",   10,    3, 22050),   # 6615 Hz at 22050 Hz
+    #   serves campaign target(s): 6615Hz
+    ("AQ_22K05_8820",    5,    2, 22050),   # 8820 Hz at 22050 Hz  (target 8961.2 Hz, err -141.2 Hz)
+    #   serves campaign target(s): 8961Hz
+    ("AQ_24_1600",   15,    1, 24000),   # 1600 Hz at 24000 Hz  (target 1625.0 Hz, err -25.0 Hz)
+    #   serves campaign target(s): 1625Hz
+    ("AQ_24_2250",   32,    3, 24000),   # 2250 Hz at 24000 Hz  (target 2239.5 Hz, err +10.5 Hz)
+    #   serves campaign target(s): 2239Hz
+    ("AQ_24_3750",   32,    5, 24000),   # 3750 Hz at 24000 Hz  (target 3700.0 Hz, err +50.0 Hz)
+    #   serves campaign target(s): 3700Hz
+    ("AQ_24_4080",  100,   17, 24000),   # 4080 Hz at 24000 Hz  (target 4020.0 Hz, err +60.0 Hz)
+    #   serves campaign target(s): 4020Hz
+    ("AQ_24_4400",   60,   11, 24000),   # 4400 Hz at 24000 Hz  (target 4478.9 Hz, err -78.9 Hz)
+    #   serves campaign target(s): 4479Hz
+    ("AQ_24_4750",   96,   19, 24000),   # 4750 Hz at 24000 Hz  (target 4685.6 Hz, err +64.4 Hz)
+    #   serves campaign target(s): 4686Hz
+    ("AQ_24_5600",   30,    7, 24000),   # 5600 Hz at 24000 Hz  (target 5540.1 Hz, err +59.9 Hz)
+    #   serves campaign target(s): 5540Hz, 5550Hz
+    ("AQ_24_5760",   25,    6, 24000),   # 5760 Hz at 24000 Hz  (target 5775.0 Hz, err -15.0 Hz)
+    #   serves campaign target(s): 5775Hz
+    ("AQ_24_6080",   75,   19, 24000),   # 6080 Hz at 24000 Hz  (target 6030.0 Hz, err +50.0 Hz)
+    #   serves campaign target(s): 6030Hz
+    ("AQ_24_6400",   15,    4, 24000),   # 6400 Hz at 24000 Hz  (target 6370.0 Hz, err +30.0 Hz)
+    #   serves campaign target(s): 6370Hz
+    ("AQ_24_7200",   10,    3, 24000),   # 7200 Hz at 24000 Hz  (target 7217.0 Hz, err -17.0 Hz)
+    #   serves campaign target(s): 7217Hz
+    ("AQ_24_10800",   20,    9, 24000),   # 10800 Hz at 24000 Hz  (target 10762.0 Hz, err +38.0 Hz)
+    #   serves campaign target(s): 10762Hz
+    ("AQ_24_11200",   15,    7, 24000),   # 11200 Hz at 24000 Hz  (target 11080.1 Hz, err +119.9 Hz)
+    #   serves campaign target(s): 11080Hz
+    ("AQ_32_1600",   20,    1, 32000),   # 1600 Hz at 32000 Hz  (target 1625.0 Hz, err -25.0 Hz)
+    #   serves campaign target(s): 1625Hz
+    ("AQ_32_2240",  100,    7, 32000),   # 2240 Hz at 32000 Hz  (target 2239.5 Hz, err +0.5 Hz)
+    #   serves campaign target(s): 2239Hz
+    ("AQ_32_2400",   40,    3, 32000),   # 2400 Hz at 32000 Hz  (target 2437.5 Hz, err -37.5 Hz)
+    #   serves campaign target(s): 2438Hz
+    ("AQ_32_3750",  128,   15, 32000),   # 3750 Hz at 32000 Hz  (target 3700.0 Hz, err +50.0 Hz)
+    #   serves campaign target(s): 3700Hz
+    ("AQ_32_3840",   25,    3, 32000),   # 3840 Hz at 32000 Hz  (target 3850.0 Hz, err -10.0 Hz)
+    #   serves campaign target(s): 3850Hz
+    ("AQ_32_4096",  125,   16, 32000),   # 4096 Hz at 32000 Hz  (target 4020.0 Hz, err +76.0 Hz)
+    #   serves campaign target(s): 4020Hz
+    ("AQ_32_5440",  100,   17, 32000),   # 5440 Hz at 32000 Hz  (target 5347.1 Hz, err +92.9 Hz)
+    #   serves campaign target(s): 5347Hz
+    ("AQ_32_5600",   40,    7, 32000),   # 5600 Hz at 32000 Hz  (target 5540.1 Hz, err +59.9 Hz)
+    #   serves campaign target(s): 5540Hz
+    ("AQ_32_7500",   64,   15, 32000),   # 7500 Hz at 32000 Hz  (target 7400.0 Hz, err +100.0 Hz)
+    #   serves campaign target(s): 7400Hz
+    ("AQ_32_7680",   25,    6, 32000),   # 7680 Hz at 32000 Hz  (target 7700.0 Hz, err -20.0 Hz)
+    #   serves campaign target(s): 7700Hz, 7760Hz
+    ("AQ_32_8064",  250,   63, 32000),   # 8064 Hz at 32000 Hz  (target 8040.0 Hz, err +24.0 Hz)
+    #   serves campaign target(s): 8040Hz
+    ("AQ_32_8800",   40,   11, 32000),   # 8800 Hz at 32000 Hz  (target 8957.8 Hz, err -157.8 Hz)
+    #   serves campaign target(s): 8958Hz
+    ("AQ_32_9600",   10,    3, 32000),   # 9600 Hz at 32000 Hz  (target 9555.0 Hz, err +45.0 Hz)
+    #   serves campaign target(s): 9555Hz, 9600Hz, 9647Hz
+    ("AQ_32_12800",    5,    2, 32000),   # 12800 Hz at 32000 Hz  (target 12974.0 Hz, err -174.0 Hz)
+    #   serves campaign target(s): 12974Hz
+    ("AQ_32_14400",   20,    9, 32000),   # 14400 Hz at 32000 Hz  (target 14312.5 Hz, err +87.5 Hz)
+    #   serves campaign target(s): 14312Hz, 14374Hz
+    ("AQ_44K1_1620",  245,    9, 44100),   # 1620 Hz at 44100 Hz  (target 1625.0 Hz, err -5.0 Hz)
+    #   serves campaign target(s): 1625Hz
+    ("AQ_44K1_2205",   20,    1, 44100),   # 2205 Hz at 44100 Hz  (target 2239.5 Hz, err -34.5 Hz)
+    #   serves campaign target(s): 2239Hz
+    ("AQ_44K1_2450",   18,    1, 44100),   # 2450 Hz at 44100 Hz  (target 2437.5 Hz, err +12.5 Hz)
+    #   serves campaign target(s): 2438Hz
+    ("AQ_44K1_3430",   90,    7, 44100),   # 3430 Hz at 44100 Hz  (target 3400.0 Hz, err +30.0 Hz)
+    #   serves campaign target(s): 3400Hz, 3500Hz
+    ("AQ_44K1_3920",   45,    4, 44100),   # 3920 Hz at 44100 Hz  (target 3880.0 Hz, err +40.0 Hz)
+    #   serves campaign target(s): 3880Hz
+    ("AQ_44K1_5040",   35,    4, 44100),   # 5040 Hz at 44100 Hz  (target 5099.1 Hz, err -59.1 Hz)
+    #   serves campaign target(s): 5099Hz, 5100Hz
+    ("AQ_44K1_5292",   25,    3, 44100),   # 5292 Hz at 44100 Hz  (target 5250.0 Hz, err +42.0 Hz)
+    #   serves campaign target(s): 5250Hz, 5306Hz, 5347Hz
+    ("AQ_44K1_5600",   63,    8, 44100),   # 5600 Hz at 44100 Hz  (target 5540.1 Hz, err +59.9 Hz)
+    #   serves campaign target(s): 5540Hz
+    ("AQ_44K1_5880",   15,    2, 44100),   # 5880 Hz at 44100 Hz  (target 5820.0 Hz, err +60.0 Hz)
+    #   serves campaign target(s): 5820Hz
+    ("AQ_44K1_6125",   36,    5, 44100),   # 6125 Hz at 44100 Hz  (target 6012.0 Hz, err +113.0 Hz)
+    #   serves campaign target(s): 6012Hz
+    ("AQ_44K1_6860",   45,    7, 44100),   # 6860 Hz at 44100 Hz  (target 6800.0 Hz, err +60.0 Hz)
+    #   serves campaign target(s): 6800Hz
+    ("AQ_44K1_7350",    6,    1, 44100),   # 7350 Hz at 44100 Hz  (target 7400.0 Hz, err -50.0 Hz)
+    #   serves campaign target(s): 7400Hz
+    ("AQ_44K1_7875",   28,    5, 44100),   # 7875 Hz at 44100 Hz  (target 7760.0 Hz, err +115.0 Hz)
+    #   serves campaign target(s): 7760Hz
+    ("AQ_44K1_8100",   49,    9, 44100),   # 8100 Hz at 44100 Hz  (target 8040.0 Hz, err +60.0 Hz)
+    #   serves campaign target(s): 8040Hz
+    ("AQ_44K1_9702",   50,   11, 44100),   # 9702 Hz at 44100 Hz  (target 9750.0 Hz, err -48.0 Hz)
+    #   serves campaign target(s): 9750Hz
+    ("AQ_44K1_10290",   30,    7, 44100),   # 10290 Hz at 44100 Hz  (target 10198.1 Hz, err +91.9 Hz)
+    #   serves campaign target(s): 10198Hz, 10200Hz, 10205Hz, 10410Hz, 10500Hz
+    ("AQ_44K1_10500",   21,    5, 44100),   # 10500 Hz at 44100 Hz  (target 10611.6 Hz, err -111.6 Hz)
+    #   serves campaign target(s): 10612Hz, 10694Hz
+    ("AQ_44K1_11200",   63,   16, 44100),   # 11200 Hz at 44100 Hz  (target 11080.1 Hz, err +119.9 Hz)
+    #   serves campaign target(s): 11080Hz
+    ("AQ_44K1_11340",   35,    9, 44100),   # 11340 Hz at 44100 Hz  (target 11512.5 Hz, err -172.5 Hz)
+    #   serves campaign target(s): 11512Hz, 11550Hz
+    ("AQ_44K1_12250",   18,    5, 44100),   # 12250 Hz at 44100 Hz  (target 12060.0 Hz, err +190.0 Hz)
+    #   serves campaign target(s): 12060Hz
+    ("AQ_44K1_17640",    5,    2, 44100),   # 17640 Hz at 44100 Hz  (target 17906.0 Hz, err -266.0 Hz)
+    #   serves campaign target(s): 17906Hz, 17922Hz
+    ("AQ_44K1_19600",    9,    4, 44100),   # 19600 Hz at 44100 Hz  (target 19810.0 Hz, err -210.0 Hz)
+    #   serves campaign target(s): 19810Hz
+    ("AQ_48_1600",   30,    1, 48000),   # 1600 Hz at 48000 Hz  (target 1625.0 Hz, err -25.0 Hz)
+    #   serves campaign target(s): 1625Hz
+    ("AQ_48_2250",   64,    3, 48000),   # 2250 Hz at 48000 Hz  (target 2239.5 Hz, err +10.5 Hz)
+    #   serves campaign target(s): 2239Hz
+    ("AQ_48_2400",   20,    1, 48000),   # 2400 Hz at 48000 Hz  (target 2437.5 Hz, err -37.5 Hz)
+    #   serves campaign target(s): 2438Hz
+    ("AQ_48_3072",  125,    8, 48000),   # 3072 Hz at 48000 Hz  (target 3087.5 Hz, err -15.5 Hz)
+    #   serves campaign target(s): 3088Hz
+    ("AQ_48_3200",   15,    1, 48000),   # 3200 Hz at 48000 Hz  (target 3185.0 Hz, err +15.0 Hz)
+    #   serves campaign target(s): 3185Hz, 3250Hz
+    ("AQ_48_3360",  100,    7, 48000),   # 3360 Hz at 48000 Hz  (target 3400.0 Hz, err -40.0 Hz)
+    #   serves campaign target(s): 3400Hz
+    ("AQ_48_3840",   25,    2, 48000),   # 3840 Hz at 48000 Hz  (target 3850.0 Hz, err -10.0 Hz)
+    #   serves campaign target(s): 3850Hz
+    ("AQ_48_4080",  200,   17, 48000),   # 4080 Hz at 48000 Hz  (target 4020.0 Hz, err +60.0 Hz)
+    #   serves campaign target(s): 4020Hz
+    ("AQ_48_4400",  120,   11, 48000),   # 4400 Hz at 48000 Hz  (target 4478.9 Hz, err -78.9 Hz)
+    #   serves campaign target(s): 4479Hz
+    ("AQ_48_4608",  125,   12, 48000),   # 4608 Hz at 48000 Hz  (target 4685.6 Hz, err -77.6 Hz)
+    #   serves campaign target(s): 4686Hz
+    ("AQ_48_5600",   60,    7, 48000),   # 5600 Hz at 48000 Hz  (target 5540.1 Hz, err +59.9 Hz)
+    #   serves campaign target(s): 5540Hz, 5550Hz
+    ("AQ_48_5760",   25,    3, 48000),   # 5760 Hz at 48000 Hz  (target 5775.0 Hz, err -15.0 Hz)
+    #   serves campaign target(s): 5775Hz
+    ("AQ_48_6144",  125,   16, 48000),   # 6144 Hz at 48000 Hz  (target 6030.0 Hz, err +114.0 Hz)
+    #   serves campaign target(s): 6030Hz
+    ("AQ_48_7500",   32,    5, 48000),   # 7500 Hz at 48000 Hz  (target 7400.0 Hz, err +100.0 Hz)
+    #   serves campaign target(s): 7400Hz
+    ("AQ_48_8160",  100,   17, 48000),   # 8160 Hz at 48000 Hz  (target 8040.0 Hz, err +120.0 Hz)
+    #   serves campaign target(s): 8040Hz
+    ("AQ_48_8800",   60,   11, 48000),   # 8800 Hz at 48000 Hz  (target 8957.8 Hz, err -157.8 Hz)
+    #   serves campaign target(s): 8958Hz
+    ("AQ_48_9500",   96,   19, 48000),   # 9500 Hz at 48000 Hz  (target 9371.2 Hz, err +128.8 Hz)
+    #   serves campaign target(s): 9371Hz
+    ("AQ_48_11200",   30,    7, 48000),   # 11200 Hz at 48000 Hz  (target 11080.1 Hz, err +119.9 Hz)
+    #   serves campaign target(s): 11080Hz, 11100Hz, 11200Hz
+    ("AQ_48_11520",   25,    6, 48000),   # 11520 Hz at 48000 Hz  (target 11550.0 Hz, err -30.0 Hz)
+    #   serves campaign target(s): 11550Hz, 11640Hz
+    ("AQ_48_12160",   75,   19, 48000),   # 12160 Hz at 48000 Hz  (target 12060.0 Hz, err +100.0 Hz)
+    #   serves campaign target(s): 12060Hz, 12350Hz, 12400Hz
+    ("AQ_48_12800",   15,    4, 48000),   # 12800 Hz at 48000 Hz  (target 12740.0 Hz, err +60.0 Hz)
+    #   serves campaign target(s): 12740Hz
+    ("AQ_48_14400",   10,    3, 48000),   # 14400 Hz at 48000 Hz  (target 14435.0 Hz, err -35.0 Hz)
+    #   serves campaign target(s): 14435Hz, 14625Hz
+    ("AQ_48_19200",    5,    2, 48000),   # 19200 Hz at 48000 Hz  (target 19425.0 Hz, err -225.0 Hz)
+    #   serves campaign target(s): 19425Hz
+    ("AQ_48_19500",   32,   13, 48000),   # 19500 Hz at 48000 Hz  (target 19600.0 Hz, err -100.0 Hz)
+    #   serves campaign target(s): 19600Hz
+    ("AQ_48_22400",   15,    7, 48000),   # 22400 Hz at 48000 Hz  (target 22160.2 Hz, err +239.8 Hz)
+    #   serves campaign target(s): 22160Hz
 )
 
 # Rows 0 and 1 predate this generator.  --check-legacy pins their samples to the
@@ -157,6 +570,10 @@ def render_header() -> str:
     a(f"#define MEAS_TABLE_NOMINAL_FS_HZ   {low[3]}")
     a(f"#define MEAS_TABLE_TONE_LOW_HZ     {tone_hz(low[1], low[2], low[3])}")
     a(f"#define MEAS_TABLE_TONE_HIGH_HZ    {tone_hz(high48[1], high48[2], high48[3])}")
+    a("// MEAS_TABLE_N_LEVELS is the level count of a FULL row, i.e. the console's *at 02 range.")
+    a("// Since 2026-09-20 not every row carries all of them: a fold-image row carries -1 dBFS")
+    a("// only (see ROW_LEVELS in the generator), and audio_app_meas_table() clamps to that row's")
+    a("// own level 0.  Ask audio_app_meas_table_n_levels(row) for the per-row count.")
     a(f"#define MEAS_TABLE_N_LEVELS        {len(LEVELS_DBFS)}")
     a(f"#define MEAS_TABLE_N_TONES         {len(ROWS)}")
     a("")
@@ -171,13 +588,19 @@ def render_header() -> str:
     a(f"#define MEAS_TABLE_HIGH96_FS_HZ    {high96[3]}")
     if len(ROWS) > LEGACY_SWEEP_BASE:
         a("")
-        a("// Sweep rows for the 48 -> 32 kHz N=97 audio-mode alias study.  The bench selects one")
-        a("// with `*at 04 VV`, VV = the row index below as two hex digits.  Each row is")
-        a("// sample-domain exact at 48 kHz; f = 48000 * cycles / len.")
+        a("// Sweep and pair rows.  The bench selects one with `*at 04 VV`, VV = the row index")
+        a("// below as two hex digits.")
+        a("//")
+        a("// EVERY ROW CARRIES ITS OWN SOURCE RATE, and the `at <n> Hz` in each comment is not")
+        a("// decoration: a row is SAMPLE-DOMAIN exact (f = fs_source * cycles / len), so playing")
+        a("// it on a leg at a different rate scales the frequency.  The SW_* rows are 48 kHz, the")
+        a("// PB44_/AL44_ rows 44.1 kHz, and the AA_* rows 22.05 / 32 / 44.1 kHz per their pair.")
+        a("// Pick the row whose source rate matches the LIVE leg; the *ac arm line prints the")
+        a("// actual tone either way, so a mismatch shows up there rather than silently.")
         for row_idx, (name, length, cycles, fs_hz) in enumerate(ROWS):
             if row_idx < LEGACY_SWEEP_BASE:
                 continue
-            a("#define MEAS_TONE_ROW_%-8s   (%2uu)   // %5u Hz at %u Hz   len=%-3u cycles=%u"
+            a("#define MEAS_TONE_ROW_%-18s (%2uu)   // %5u Hz at %u Hz   len=%-3u cycles=%u"
               % (name, row_idx, tone_hz(length, cycles, fs_hz), fs_hz, length, cycles))
     a("")
     a("typedef struct {")
@@ -190,8 +613,12 @@ def render_header() -> str:
     a("} meas_tone_table_t;")
     a("")
     a("// tone_row: 0..MEAS_TABLE_N_TONES-1 (see MEAS_TONE_ROW_* above); out-of-range falls back to")
-    a("// row 0. level_idx 0..5 = {-1,-60,-20,-40,-80,-6} dBFS.")
+    a("// row 0. level_idx 0..5 = {-1,-60,-20,-40,-80,-6} dBFS -- but a row may carry FEWER than")
+    a("// six (the fold-image rows carry -1 dBFS only), and level_idx then clamps to that row's 0.")
+    a("// The returned struct reports the level actually served in level_dbfs, which every caller")
+    a("// already prints; audio_app_meas_table_n_levels() answers the count before arming.")
     a("const meas_tone_table_t *audio_app_meas_table( uint8_t tone_row, uint8_t level_idx );")
+    a("uint8_t audio_app_meas_table_n_levels( uint8_t tone_row );")
     a("#endif // APP_ASRC_MEAS")
     a("")
     a("#endif // AUDIO_APP_MEAS_TONES_H")
@@ -220,29 +647,55 @@ def render_source() -> str:
     a("_Static_assert( (int)APP_MEAS_TONE_HIGH_HZ == MEAS_TABLE_TONE_HIGH_HZ,")
     a('                "MEAS tone tables stale: high tone changed; regenerate" );')
     a("")
-    for row_idx, (_name, length, cycles, fs_hz) in enumerate(ROWS):
+    for row_idx, (name, length, cycles, fs_hz) in enumerate(ROWS):
         f_hz = tone_hz(length, cycles, fs_hz)
-        for lvl_idx, level in enumerate(LEVELS_DBFS):
+        for lvl_idx, level in enumerate(levels_for(name)):
             samples = quantise(length, cycles, level)
             body = ", ".join(str(v) for v in samples)
             a(f"static const int32_t tbl_t{row_idx}_l{lvl_idx}[{length}] = {{ {body} }};"
               f"  // tone={f_hz}Hz level={level}dBFS cycles={cycles} fs={fs_hz}Hz")
     a("")
-    a(f"static const meas_tone_table_t k_tables[{len(ROWS)}][{len(LEVELS_DBFS)}] = {{")
+    a("// PER-ROW LEVEL ARRAYS, not one rectangular [row][level] block.  A fold-image row is a")
+    a("// rejection measurement and carries -1 dBFS only; a DR / THD+N row carries all six.  The")
+    a("// rectangular form cost 223,320 B for these rows against a 159,744 B application region")
+    a("// (see ROW_LEVELS in the generator).  Rows that predate 2026-09-20 still carry all six,")
+    a("// in their original index order, so *at 02 VV is unchanged for them.")
     for row_idx, (name, length, cycles, fs_hz) in enumerate(ROWS):
         f_hz = tone_hz(length, cycles, fs_hz)
+        levels = levels_for(name)
         entries = ", ".join(
             f"{{ tbl_t{row_idx}_l{lvl_idx}, {length}u, {cycles}u, {level}, {f_hz}u, {fs_hz}u }}"
-            for lvl_idx, level in enumerate(LEVELS_DBFS)
+            for lvl_idx, level in enumerate(levels)
         )
-        a(f"    {{ {entries} }},  // tone {name}")
+        a(f"static const meas_tone_table_t k_row{row_idx}[{len(levels)}] = "
+          f"{{ {entries} }};  // {name}")
+    a("")
+    a("typedef struct {")
+    a("    const meas_tone_table_t *levels;")
+    a("    uint8_t                  n_levels;")
+    a("} meas_tone_row_t;")
+    a("")
+    a(f"static const meas_tone_row_t k_rows[{len(ROWS)}] = {{")
+    for row_idx, (name, _length, _cycles, _fs_hz) in enumerate(ROWS):
+        a(f"    {{ k_row{row_idx}, {len(levels_for(name))}u }},  // {name}")
     a("};")
+    a("")
+    a("uint8_t audio_app_meas_table_n_levels( uint8_t tone_row )")
+    a("{")
+    a(f"    if( tone_row >= {len(ROWS)}u )  {{ tone_row = 0u; }}")
+    a("    return k_rows[tone_row].n_levels;")
+    a("}")
     a("")
     a("const meas_tone_table_t *audio_app_meas_table( uint8_t tone_row, uint8_t level_idx )")
     a("{")
     a(f"    if( tone_row >= {len(ROWS)}u )  {{ tone_row = 0u; }}")
-    a(f"    if( level_idx >= {len(LEVELS_DBFS)}u ) {{ level_idx = 0u; }}")
-    a("    return &k_tables[tone_row][level_idx];")
+    a("    /* A row that carries fewer levels CLAMPS TO ITS OWN 0 (-1 dBFS), which is the level")
+    a("     * every fold-image measurement wants anyway.  Silently serving level 0 while the")
+    a("     * console still says -60 dBFS would be the wrong kind of quiet, so the arm and")
+    a("     * selection prints read level_dbfs back OUT of the table -- they always did.  Callers")
+    a("     * that need to know before arming ask audio_app_meas_table_n_levels(). */")
+    a("    if( level_idx >= k_rows[tone_row].n_levels ) { level_idx = 0u; }")
+    a("    return &k_rows[tone_row].levels[level_idx];")
     a("}")
     a("")
     a("#endif // APP_ASRC_MEAS")

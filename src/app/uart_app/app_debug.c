@@ -188,6 +188,20 @@ void app_uart_process(void)
         s_input_src    = INPUT_SRC_NONE;
     }
     app_biquad_coeff_csv_task();
+
+    /*
+     * The CSV module can now end a transaction without a byte to carry the
+     * transition: its inactivity deadline and its RX-integrity abort both fire
+     * from the task, not from local_uart_process_rx_char().  Release RX mode
+     * and the source lock here as well, so timeout recovery cannot leave the
+     * console owned forever.
+     */
+    if( (s_uart_rx_mode == APPDBG_UART_RX_BIQUAD_CSV) &&
+        !app_biquad_coeff_csv_is_receiving() )
+    {
+        s_uart_rx_mode = APPDBG_UART_RX_NORMAL;
+        s_input_src    = INPUT_SRC_NONE;
+    }
 #endif //defined(ENA_BIQUAD_IIR_CASCADE)
 }
 

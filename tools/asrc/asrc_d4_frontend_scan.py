@@ -89,7 +89,7 @@ print(f"  units {u3:5.1f}  ({u3*US_PER_UNIT:5.1f} us)  worst alias {w3:8.2f} dB 
 
 print()
 print("=== /4 candidates: stage1 48->24 (/2), stage2 24->12 (/2), 12 kHz intermediate ===")
-print("    (resampler fc = 0.465*12000 = 5580 Hz, only 67 Hz above the 5512.5 Hz output Nyquist)")
+print("    (resampler fc = 0.464*12000 = 5568 Hz, only 55.5 Hz above the 5512.5 Hz output Nyquist)")
 print(f"{'P (Hz)':>7} {'N1':>4} {'N2':>4} {'units':>6} {'us':>6} {'d-us':>6} {'worst':>8} {'no-S2':>8} {'edge':>8}")
 for P in (4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0):
     N1 = 27

@@ -42,6 +42,11 @@
 /* Global gain controller instance */
 /*static*/ audiogain_t My_Gain;
 
+/* Foreground publishes one aligned 32-bit word (duration + mute bit).
+ * The audio block owns all multi-field mute ramp updates, as in CK-nano. */
+static volatile uint32_t s_mute_request;
+static uint32_t s_mute_applied;
+
 
 /**
  * @brief Initialise the global gain controller.
@@ -52,6 +57,8 @@
  */
 void app_gain_init( uint32_t sample_rate_Hz )
 {
+    s_mute_request = 0u;
+    s_mute_applied = 0u;
     /* User-tweakable default parameters */
     gain_init( &My_Gain,
                1.0f,                  /* initialGain      : unity gain                 */
@@ -63,17 +70,44 @@ void app_gain_init( uint32_t sample_rate_Hz )
 
 void app_gain_process( float* p_in, float* p_out )
 {
+    const uint32_t request = s_mute_request;
+    if( request != s_mute_applied )
+    {
+        mute_set( &My_Gain, (int)(request & 1u), (int)(request >> 1) );
+        s_mute_applied = request;
+    }
     gain_process( &My_Gain, p_in, p_out );
 }
 
 
 void app_mute_set( bool mute, int rampTime_ms )
 {
-    int mute_on = (mute ? 1:0);
-
-    mute_set( &My_Gain, mute_on, rampTime_ms );
+    const uint32_t duration = (rampTime_ms > 0) ? (uint32_t)rampTime_ms : 0u;
+    s_mute_request = (duration << 1) | (mute ? 1u : 0u);
 }
 
+
+bool app_mute_requested( void )
+{
+    return (s_mute_request & 1u) != 0u;
+}
+
+bool app_mute_toggle( int rampTime_ms )
+{
+    const bool mute = (s_mute_request & 1u) == 0u;
+    app_mute_set( mute, rampTime_ms );
+    return mute;
+}
+
+void app_mute_print( void )
+{
+    const uint32_t request = s_mute_request;
+    printf(" MUTE requested=%u applied=%d gain=%.5f target=%.5f ramp_ms=%lu remain=%lu status=%d\n",
+           (unsigned)(request & 1u), My_Gain.mute_on,
+           (double)My_Gain.prevGain, (double)My_Gain.targetGain,
+           (unsigned long)(request >> 1), (unsigned long)My_Gain.rampRemainSamples,
+           (int)My_Gain.status );
+}
 
 /**
  * @brief Map a 0..255 UI value to a linear gain target.

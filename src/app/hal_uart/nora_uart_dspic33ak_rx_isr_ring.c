@@ -240,15 +240,28 @@ void nora_uart_dspic33ak_rx_isr_status_get(
     nora_uart_instance_t inst,
     nora_uart_dspic33ak_rx_isr_status_t *status)
 {
-    uint8_t ie;
-
     if (status == NULL || !uart_inst_is_valid(inst)) {
         return;
     }
 
-    ie = uart_rx_irq_get_enable(inst);
-    (void)uart_rx_irq_enable(inst, false);   /* atomic snapshot vs the ISR */
-
+    /*
+     * No RX interrupt mask here, deliberately -- it used to take one, and that
+     * is what silently killed UART1 RX.
+     *
+     * The mask made the whole set of counters one consistent instant. Nothing
+     * links these counters to each other, so that instant bought nothing; what
+     * it cost was a window with RX masked, and on this part the RX FIFO is 8
+     * bytes deep -- 347 us at 230400 baud. At 98% DSP load the 654 us audio
+     * block ISR preempts almost any window, so the FIFO overflowed, RXFOIF
+     * latched, and reception stopped for good: the ISR that clears RXFOIF never
+     * ran again, which is also why every error counter still read zero.
+     * Measured on sonora 2026-09-18 -- a CSV bulk transfer died at the same
+     * point every time, immediately after the counter access at BEGIN.
+     *
+     * Each counter is a 32-bit object on a 32-bit core, so every load below is
+     * atomic on its own. Two counters may come from instants microseconds
+     * apart; for diagnostics that is not a defect.
+     */
     status->rx_isr_count            = g_rx_status[inst].rx_isr_count;
     status->rx_byte_count           = g_rx_status[inst].rx_byte_count;
     status->rx_fifo_overflow_count  = g_rx_status[inst].rx_fifo_overflow_count;
@@ -258,8 +271,36 @@ void nora_uart_dspic33ak_rx_isr_status_get(
     status->tx_collision_count      = g_rx_status[inst].tx_collision_count;
     status->rx_ring_overflow_count  = g_rx_status[inst].rx_ring_overflow_count;
     status->rx_max_drain_count      = g_rx_status[inst].rx_max_drain_count;
+    status->rx_integrity_fault_count = g_rx_status[inst].rx_integrity_fault_count;
+}
 
-    (void)uart_rx_irq_enable(inst, (ie != 0u));
+/* -------------------------------------------------------------------------- */
+/* nora_uart_dspic33ak_rx_isr_ring_overflow_count                                  */
+/* -------------------------------------------------------------------------- */
+uint32_t nora_uart_dspic33ak_rx_isr_ring_overflow_count(nora_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return 0u;
+    }
+
+    /* Deliberately no IE mask: a single 32-bit load is already atomic against
+     * the ISR on this core, and masking RX to read a counter is what breaks a
+     * bulk transfer (see the header note on ..._rx_isr_status_get). */
+    return g_rx_status[inst].rx_ring_overflow_count;
+}
+
+/* -------------------------------------------------------------------------- */
+/* nora_uart_dspic33ak_rx_isr_integrity_fault_count                               */
+/* -------------------------------------------------------------------------- */
+uint32_t nora_uart_dspic33ak_rx_isr_integrity_fault_count(nora_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return 0u;
+    }
+
+    /* Same reasoning as ..._rx_isr_ring_overflow_count(): a single 32-bit load
+     * is already atomic on this core, so no IE mask. */
+    return g_rx_status[inst].rx_integrity_fault_count;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -267,16 +308,29 @@ void nora_uart_dspic33ak_rx_isr_status_get(
 /* -------------------------------------------------------------------------- */
 void nora_uart_dspic33ak_rx_isr_status_clear(nora_uart_instance_t inst)
 {
-    uint8_t ie;
-
     if (!uart_inst_is_valid(inst)) {
         return;
     }
 
-    ie = uart_rx_irq_get_enable(inst);
-    (void)uart_rx_irq_enable(inst, false);
-    memset((void *)&g_rx_status[inst], 0x00, sizeof(g_rx_status[inst]));
-    (void)uart_rx_irq_enable(inst, (ie != 0u));
+    /*
+     * Mask-free, for the reason spelled out in ..._rx_isr_status_get() above --
+     * and this one mattered more, because a bulk-transfer path calls it at the
+     * start of every transfer, exactly when RX must not be masked.
+     *
+     * Each store below is atomic on its own. Racing the ISR can lose one
+     * increment of one counter; masking RX to prevent that lost the whole
+     * transfer.
+     */
+    g_rx_status[inst].rx_isr_count            = 0u;
+    g_rx_status[inst].rx_byte_count           = 0u;
+    g_rx_status[inst].rx_fifo_overflow_count  = 0u;
+    g_rx_status[inst].framing_error_count     = 0u;
+    g_rx_status[inst].parity_error_count      = 0u;
+    g_rx_status[inst].autobaud_overflow_count = 0u;
+    g_rx_status[inst].tx_collision_count      = 0u;
+    g_rx_status[inst].rx_ring_overflow_count  = 0u;
+    g_rx_status[inst].rx_max_drain_count      = 0u;
+    g_rx_status[inst].rx_integrity_fault_count = 0u;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -289,6 +343,7 @@ void nora_uart_rx_irq_handler(nora_uart_instance_t inst)
     uint32_t events = 0u;            /* async event bits to report after drain  */
     uint32_t ring_overflow_before;  /* ring-overflow counter snapshot          */
     bool ring_got_data = false;     /* at least one byte routed to the ring     */
+    bool integrity_fault = false;   /* any event this pass that taints the byte stream */
 
     if (!uart_inst_is_valid(inst)) {
         return;
@@ -329,16 +384,24 @@ void nora_uart_rx_irq_handler(nora_uart_instance_t inst)
         g_rx_status[inst].rx_fifo_overflow_count++;
         nora_uart_dspic33ak_reg_clear(r->STAT, NORA_UART_DSPIC33AK_STAT_RXFOIF);
         events |= NORA_UART_EVENT_RX_OVERRUN_ERROR;
+        integrity_fault = true;
     }
     if (nora_uart_dspic33ak_reg_is_set(r->STAT, NORA_UART_DSPIC33AK_STAT_FERIF)) {
         g_rx_status[inst].framing_error_count++;
         nora_uart_dspic33ak_reg_clear(r->STAT, NORA_UART_DSPIC33AK_STAT_FERIF);
         events |= NORA_UART_EVENT_RX_FRAMING_ERROR;
+        /* The byte that triggered this was already read and pushed to the ring
+         * above -- unconditionally, before this flag was even checked -- so a
+         * framing error does not mean a byte was dropped. It means a byte in the
+         * ring may have the wrong VALUE. That is what rx_integrity_fault_count
+         * exists to flag; see its declaration. */
+        integrity_fault = true;
     }
     if (nora_uart_dspic33ak_reg_is_set(r->STAT, NORA_UART_DSPIC33AK_STAT_PERIF)) {
         g_rx_status[inst].parity_error_count++;
         nora_uart_dspic33ak_reg_clear(r->STAT, NORA_UART_DSPIC33AK_STAT_PERIF);
         events |= NORA_UART_EVENT_RX_PARITY_ERROR;
+        integrity_fault = true;   /* same reasoning as FERIF above */
     }
     if (nora_uart_dspic33ak_reg_is_set(r->STAT, NORA_UART_DSPIC33AK_STAT_ABDOVIF)) {
         g_rx_status[inst].autobaud_overflow_count++;
@@ -352,11 +415,18 @@ void nora_uart_rx_irq_handler(nora_uart_instance_t inst)
     /* Software ring overflow (a byte was dropped during the drain above). */
     if (g_rx_status[inst].rx_ring_overflow_count != ring_overflow_before) {
         events |= NORA_UART_EVENT_RX_OVERFLOW;
+        integrity_fault = true;
     }
 
     /* Unsolicited byte-stream data landed in the ring this pass. */
     if (ring_got_data) {
         events |= NORA_UART_EVENT_RX_READY;
+    }
+
+    /* One pulse per ISR pass, not one per flag: a caller polling this wants
+     * "did anything happen since I last looked", not a count of flags. */
+    if (integrity_fault) {
+        g_rx_status[inst].rx_integrity_fault_count++;
     }
 
     if (events != 0u) {

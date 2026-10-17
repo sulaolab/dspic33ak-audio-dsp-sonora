@@ -99,4 +99,19 @@ void asrc_full_iir_precheck_bench_run( uint32_t trials );
  * measuring something else. */
 void asrc_hb_kernel_bench_run( uint32_t trials );
 
+/* Third-band 3-path polyphase allpass 96 -> 32 kHz decimator kernel ("*an").
+ * Host feasibility put the filter at K=16 first-order allpass sections for
+ * -110.33 dBc worst alias into 0-15 kHz -- 16 multiplies per 32 kHz output per
+ * channel against the shipping front end's 110.  The Full-IIR trial already
+ * showed a kernel with fewer multiplies losing on hardware, so this measures the
+ * real kernel: 16ch channel-major, state load/store, coefficient load, the
+ * arithmetic, the commutator fetch, the branch sum and every loop the form needs.
+ * Q31 is the primary format and float32 the comparison.  Prints a slope (marginal
+ * cost of one section) next to the absolute per-output cost, and re-derives the
+ * tick-to-cycle constant from fir_ring_q31 in the same run so a wrong constant
+ * cannot pass silently.  Foreground-only, changes no default, no rate and no live
+ * filter; the ring and the M30 resampler are outside the measured window on
+ * purpose and are added separately. */
+void asrc_thirdband_kernel_bench_run( uint32_t trials );
+
 #endif /* ASRC_FIR_KERNEL_BENCH_H */

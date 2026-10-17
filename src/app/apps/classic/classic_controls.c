@@ -36,7 +36,11 @@
 // app_debug.c raw hotkey handler) invoke. Moved out of main.c per Phase 5.
 //===========================================================
 
+#if defined(APP_TARGET_AK506) && (APP_TARGET == APP_TARGET_AK506)
+#define APP_MUTE_RAMP_MS          (800) // Nano SW0: audible fade like CK-nano
+#else
 #define APP_MUTE_RAMP_MS          (200)
+#endif
 
 // Classic Audio Demo control state used by the operations below.
 extern audiogain_t My_Gain;
@@ -64,6 +68,9 @@ static void   UsrOperate_temp_test_3( void );
 void classic_controls_process( void )
 {
     local_button_handler();
+#if defined(APP_TARGET_AK506) && (APP_TARGET == APP_TARGET_AK506)
+    LED_heartbeat_set_muted( app_mute_requested() );
+#endif
     local_touch_handler();
 #if defined(ENA_AVAS_TYPE_TY_SYNTH) || defined(ENA_AVAS_TYPE_LB_SYNTH)
     local_avas_pot_process();   /* AVAS pitch knob; self-rate-limited to 100 ms */
@@ -73,29 +80,20 @@ void classic_controls_process( void )
 
 void UsrOperate_mute( void )
 {
-    static uint8_t mute_enabled = 0;
-
-    mute_enabled ^= 1;
+    const bool mute_enabled = app_mute_toggle( APP_MUTE_RAMP_MS );
     if( mute_enabled )
     {
         printf(" MUTE: start mute @%ld\n", GetTicks());
-        app_mute_set( true, APP_MUTE_RAMP_MS );   // mute
+        // The audio block applies the published request.
     }
     else
     {
         printf(" MUTE: start unmute @%ld\n", GetTicks());
-        app_mute_set( false, APP_MUTE_RAMP_MS );  // unmute
+        // The audio block applies the published request.
     }
 
-    audiogain_t* pgain = &My_Gain;
+    app_mute_print(); // requested/applied state differs until the next block
 
-    printf(" cur_gain=%.3f tar_gain=%.3f ramp_ms=%.1f ramp_samples=%lu status=%d\n",
-           pgain->prevGain,
-           pgain->targetGain,
-           pgain->DBG_ramp_ms,
-           (unsigned long)pgain->rampTotalSamples,
-           pgain->status
-          );
 }
 
 
@@ -343,7 +341,7 @@ void UsrOperate_avas_synth( void )   /* TYPE_TY */
 
 #if defined(ENA_AVAS_TYPE_TY_SYNTH) || defined(ENA_AVAS_TYPE_LB_SYNTH)
 /* ---------------------------------------------------------------------------
- * The POT is the AVAS pitch knob, for whichever engine is the sounding one.
+ * POT movement and cursor keys control the sounding AVAS engine pitch.
  *
  * Both AVAS engines take a fine pitch trim in cent (TYPE_TY rebuilds its step
  * tables, TYPE_LB scales its wander factor -- see each engine's header).  They are
@@ -370,12 +368,18 @@ void UsrOperate_avas_synth( void )   /* TYPE_TY */
  *     at full travel, which is what makes the stop-time reset to 0 cent mean
  *     anything (otherwise it would be undone within 100 ms of every start).
  *
- * See docs_public/avas_pitch_pot_design.md for the measured numbers behind these.
+ * The parameters above were chosen from measured control behavior.
  */
+#if (APP_TARGET == APP_TARGET_AK506) && ENA_NANO_POT
+#define AVAS_POT_MAX            (NANO_POT_SPAN_COUNTS)
+#define AVAS_POT_ZERO_SNAP      (NANO_POT_SPAN_COUNTS * 2u / 100u)
+#else
 #define AVAS_POT_MAX            (4095)
+#define AVAS_POT_ZERO_SNAP      (82)
+#endif
 #define AVAS_POT_EMA_SHIFT      (4)      /* same idiom/constant as the LED ramp in main.c */
 #define AVAS_POT_DEADBAND       (24)     /* counts; ~1.2 cent over a 200 cent travel */
-#define AVAS_POT_ZERO_SNAP      (82)     /* counts; the bottom 2 % reads as exactly 0 cent */
+
 #define AVAS_POT_SAMPLE_MS      (100u)   /* knob follow rate */
 #define AVAS_POT_SETTLE_MS      (300u)   /* print once the sweep has stopped */
 
@@ -397,6 +401,24 @@ static void local_avas_pot_release( void )
 
 /* Print the trim of whichever engine is switched on (both when neither is, which
  * is what "?cs" wants).  Also the settle-time line after a knob sweep. */
+void UsrOperate_avas_pitch_step( float delta_cent )
+{
+    /* A key re-seeds the absolute POT at its present position. Only a real
+     * subsequent knob movement may take control; filter decay cannot undo keys. */
+    local_avas_pot_release();
+#if defined(ENA_AVAS_TYPE_TY_SYNTH)
+    if (s_avas_type_ty_on) {
+        app_avas_type_ty_set_pitch_cent(app_avas_type_ty_get_pitch_cent() + delta_cent);
+    }
+#endif
+#if defined(ENA_AVAS_TYPE_LB_SYNTH)
+    if (s_avas_type_lb_on) {
+        app_avas_type_lb_set_pitch_cent(app_avas_type_lb_get_pitch_cent() + delta_cent);
+    }
+#endif
+    UsrOperate_avas_pitch_print();
+}
+
 void UsrOperate_avas_pitch_print( void )
 {
 #if defined(ENA_AVAS_TYPE_TY_SYNTH)
@@ -437,6 +459,10 @@ void UsrOperate_avas_pitch_print( void )
  * the deadband those counts cannot be resolved as distinct settings anyway. */
 static float local_avas_pot_to_cent( uint16_t pot, float top_cent )
 {
+    if (pot > AVAS_POT_MAX) pot = AVAS_POT_MAX;
+#if (APP_TARGET == APP_TARGET_AK506) && ENA_NANO_POT && NANO_POT_INVERT
+    pot = AVAS_POT_MAX - pot;
+#endif
     if( pot <= AVAS_POT_ZERO_SNAP )
     {
         return 0.0f;
@@ -454,6 +480,10 @@ static void local_avas_pot_process( void )
     uint16_t        pot_f;
     int16_t         moved;
 
+#if (APP_TARGET == APP_TARGET_AK506) && !ENA_NANO_POT
+    return; // no external control configured; internal VDD reference is not a knob
+#endif
+    if (!POT_IsReady()) return;
     /* Only while an AVAS engine is the selected source.  Otherwise the POT is
      * the engine synth's throttle and must not be interpreted here at all. */
     if( !( 0
@@ -566,6 +596,34 @@ void UsrOperate_avas_synth_type_lb( void )
         }
     }
 #endif // defined(ENA_AVAS_TYPE_LB_SYNTH)
+}
+
+
+/* Both AVAS keys stop the currently enabled voice before selecting a start.
+ * Keep the individual toggles (including their release-fade exclusion) for
+ * console subcommands and the alternating button route. */
+void UsrOperate_avas_synth_key( char key )
+{
+#if defined(ENA_AVAS_TYPE_TY_SYNTH)
+    if( s_avas_type_ty_on ) { UsrOperate_avas_synth(); return; }
+#endif
+#if defined(ENA_AVAS_TYPE_LB_SYNTH)
+    if( s_avas_type_lb_on ) { UsrOperate_avas_synth_type_lb(); return; }
+#endif
+/* A release tail still counts as playback: do not restart it from a key. */
+#if defined(ENA_AVAS_TYPE_TY_SYNTH)
+    if( app_avas_type_ty_is_active() ) { return; }
+#endif
+#if defined(ENA_AVAS_TYPE_LB_SYNTH)
+    if( app_avas_type_lb_is_active() ) { return; }
+#endif
+#if defined(ENA_AVAS_TYPE_TY_SYNTH)
+    if( key == 'a' ) { UsrOperate_avas_synth(); return; }
+#endif
+#if defined(ENA_AVAS_TYPE_LB_SYNTH)
+    if( key == 'A' ) { UsrOperate_avas_synth_type_lb(); return; }
+#endif
+    (void)key;
 }
 
 
@@ -819,6 +877,20 @@ static void UsrOperate_temp_test_3( void )
 
 static void local_button_handler( void )
 {
+#if defined(APP_TARGET_AK506) && (APP_TARGET == APP_TARGET_AK506)
+    /* A short RELEASE toggles mute; long hold acts once and never mutes. */
+    switch( BUTTON_GetEvent(1) ) {
+    case BUTTON_EVENT_RELEASED:
+        UsrOperate_mute();
+        break;
+    case BUTTON_EVENT_LONG_PRESS_REACHED:
+        printf(" SW0: AVAS long press (1500ms).\n");
+        UsrOperate_avas_synth_button();
+        break;
+    default:
+        break;
+    }
+#else
     BUTTON_EVENT_t ev[3];
 
     ev[0] = BUTTON_GetEvent(1);
@@ -885,6 +957,7 @@ static void local_button_handler( void )
     default:
         break;
     }
+#endif
 }
 
 

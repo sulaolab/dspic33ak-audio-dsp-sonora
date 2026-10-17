@@ -14,6 +14,7 @@
 #include "audio_app_asrc.h"
 #include "audio_app_meas.h"
 #include "asrc_full_iir_48_to_32.h"
+#include "diagnostics/app_traps.h"     // APP_TRAP_DIAG_FRAME, app_traps_count()
 
 /*
  * The codec rate query and the TDM leg handles below are needed by TWO things: the low-rate
@@ -31,6 +32,9 @@
  */
 #include "board/devices/wm8904.h"
 #include "board/audio/audio.h"
+#if APP_ASRC_MEAS && (APP_MEAS_DIR == MEAS_DIR_BA)
+#include "asrc_clock_control.h"        // B1: asrc_clock_control_legb_defer_ticks()
+#endif
 
 #define I2C_INST_A (2u)   // I2C2 -- WM8904-A on MikroBUS-A
 #if APP_AK128_J3_TDM_B
@@ -139,6 +143,15 @@ static volatile uint8_t s_audio_isr_started;
 #define PRESTAGE_STRIDE       (PATH_FRONTEND_CH)
 #define PATH_SOURCE_REAL_CH   (2u)
 
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+#if !PATH_FRONTEND_Q31
+#error "APP_ASRC_LPF1TO1_PROTOTYPE needs the Q31 front end: the 1:1 stage is a decim == 1 setting of the Q31 generic stage descriptor, and the float front end has no stage descriptor for it to be a setting OF.  Build with the Q31 arm (the default on the AK512 presets) or leave the prototype at 0."
+#endif
+#if !APP_ASRC_RUNTIME_48K_TO_8
+#error "APP_ASRC_LPF1TO1_PROTOTYPE needs APP_ASRC_RUNTIME_48K_TO_8: the routing, the arming and the telemetry naming for a runtime-selected front end all live behind that gate, so with it off the 1:1 row would be planned and never applied -- which reads in the log exactly like a working direct path."
+#endif
+#endif
+
 /* DISQUALIFICATION, and there is no override.  An implementation that cannot carry ASRC_CH does
  * not get to serve a narrower path: it is simply not usable as a front end.  There is deliberately
  * no acknowledgement macro, no -Define escape and no "the codec is 2 ch anyway" exemption --
@@ -169,7 +182,21 @@ bool asrc_audio_path_frontend_can_serve_logical_width( void )
 // all-or-nothing on output capacity, so a one-frame shortfall makes every call return false,
 // no block is ever pushed, and the path goes MUTE rather than degrading.  Hence the guards
 // below rather than a bare literal.
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+// A 1:1 stage emits ONE frame per input frame, so the smallest selectable ratio is no longer 1/2
+// and the scratch has to hold a whole block.  This is the only geometry the prototype moves, and
+// it moves it ONLY under the gate: at APP_ASRC_LPF1TO1_PROTOTYPE == 0 the line below is the 2 it
+// has always been and the buffer is byte-identical.
+//
+// Cost, stated rather than left to be discovered: DECIMATED_BLOCK_CAPACITY goes from 11 frames
+// (the 2/3 chain's count, which is the current maximum) to 16, i.e. 5 extra frames of
+// PATH_DECIMATED_STRIDE channels at 4 bytes = 320 B of data RAM at ASRC_CH == 16.  Nothing else
+// in the front end grows: the FIR history ring for a 77-tap 1:1 stage needs 77 + 16 - 1 = 92
+// samples per channel against the 209 the 48 kHz chains' arena already reserves.
+#define DECIMATED_MIN_DEN (1u)
+#else
 #define DECIMATED_MIN_DEN (2u)
+#endif
 // ...and, since 2026-08-23, the LARGEST NUMERATOR.  A front end whose ratio is num/den emits at
 // most ceil(in * num / den) frames, so what sizes the buffer is the largest RATIO the gate can
 // select -- which until now was the same thing as the smallest divider only because every front end
@@ -317,6 +344,43 @@ static volatile uint8_t s_path_decimator_ready;
 static volatile uint8_t s_path_frontend_dual_den_unsupported;
 static volatile uint8_t s_path_frontend_den_ab;
 static volatile uint8_t s_path_frontend_den_ba;
+
+/*
+ * IS THERE A STAGE ON THIS LEG -- the question the block ISR actually needs, and the one
+ * `den != 1` answered only by accident.
+ *
+ * The leg callbacks used to gate on `s_path_frontend_den_ab != 1u`, which is a test of the RATIO.
+ * That was correct for as long as every front end was also a rate change, and it silently became
+ * wrong the moment a 1:1 stage existed: ratio 1/1, filter present, gate not taken, FIR never
+ * called.  It was not a compile error and not a runtime error -- the audio kept flowing on the
+ * direct path and the telemetry field said `fe=lp1` because that field reports the ARMED kind.
+ * Measured 2026-09-14: a twelve-minute 32 -> 16 kHz dwell that looked healthy had no filter in it.
+ *
+ * So presence is published as its own per-direction fact.  `den`/`num` keep meaning THE RATIO and
+ * are still what the step and the reserve law read.
+ *
+ * Written in main-loop context by asrc_audio_path_reset() AFTER the arming attempt, read in the
+ * block ISR.  The ISR requires present AND ready, and `ready` is written last, so a torn read can
+ * only ever produce "not ready" -- the existing fail-closed path that drops the block.
+ */
+static volatile uint8_t s_path_frontend_present_ab;
+static volatile uint8_t s_path_frontend_present_ba;
+
+/*
+ * HOW MANY BLOCKS THE FRONT END ACTUALLY FILTERED, per direction.
+ *
+ * The lesson of the 2026-09-14 miss is that a field naming the armed chain is not evidence that
+ * any block went through it: `fe=lp1` was true about the plan and false about the audio.  A
+ * counter incremented where the work happens cannot say that.  It is also what proves the
+ * invariant this architecture depends on -- at most ONE direction owns the shared front end -- as
+ * a number rather than as an argument: the other direction must read exactly 0.
+ *
+ * One volatile increment per block on a path that already runs a multi-tap FIR over ASRC_CH
+ * channels.  Read-only from the foreground printer; a torn 32-bit read can misprint one line and
+ * cannot corrupt the count, the same treatment the neighbouring dbg_ counters get.
+ */
+static volatile uint32_t s_path_frontend_runs_ab;
+static volatile uint32_t s_path_frontend_runs_ba;
 // The matching NUMERATORS.  1 for every integer chain, 2 for 48 -> 32 kHz, and never 0 once the
 // gate has run.  Deliberately NOT read by the block ISR: the Q31 front end resolved its whole
 // chain in init(), so path_decimator_process() already ignores the divider (see the (void)den
@@ -343,6 +407,11 @@ static volatile uint8_t s_path_frontend_second_den;
 // identical in the log.  Written in main-loop context here, read in main-loop context by the
 // telemetry printer; a pointer store is atomic on this core.
 static const char* s_path_frontend_tag = "";
+
+/* Which kind is ARMED, alongside the tag and written in the same place, for the same reason: the
+ * telemetry field and the pair gate must be able to ask "is there a stage" without inspecting a
+ * divider that a 1:1 stage leaves at 1.  NONE until reset() arms one. */
+static asrc_frontend_kind_t s_path_frontend_kind_armed = ASRC_FRONTEND_NONE;
 
 /* The pre-stage set that a COMPOSED chain always uses: a second stage behind the pre-stage means
  * the shared 27-tap set by construction (a wide variant is designed for a 44.1/48 kHz final band
@@ -529,8 +598,8 @@ static bool path_second_stage_init( uint32_t num, uint32_t den, uint32_t low_rat
 // Both are needed: /2 means "48 -> 24 kHz" from a 48 kHz leg but "96 -> 48 kHz" from a 96 kHz one,
 // so the divider alone cannot name the front end.  A 96 kHz leg always runs the pre-stage, then
 // den/2 of the 48 kHz chain behind it.
-static bool path_decimator_init( uint32_t num, uint32_t den, uint32_t low_rate_hz,
-                                uint32_t in_rate_hz )
+static bool path_decimator_init( asrc_frontend_kind_t kind, uint32_t num, uint32_t den,
+                                uint32_t low_rate_hz, uint32_t in_rate_hz )
 {
     /* Second line of defence behind the pair gate: an implementation narrower than ASRC_CH is
      * disqualified, so it never arms.  The caller leaves s_path_decimator_ready clear and prints
@@ -540,6 +609,147 @@ static bool path_decimator_init( uint32_t num, uint32_t den, uint32_t low_rate_h
         s_path_frontend_tag = "";
         return false;
     }
+
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+    /*
+     * The 1:1 arm, and it is deliberately the FIRST thing tested: every branch below keys off a
+     * divider, and this chain has none.  It is also the only arm whose stage is not a rate
+     * change, so it cannot share path_second_stage_init() -- that function's whole job is the
+     * capacity inequality `capacity * den >= in * num`, which for den == 1 reduces to
+     * "the scratch must hold a whole block" and is checked by the static assert on
+     * DECIMATED_BLOCK_CAPACITY instead (see DECIMATED_MIN_DEN).
+     */
+    if( kind == ASRC_FRONTEND_FILTER_1TO1 )
+    {
+        if( ( num != 1u ) || ( den != 1u ) )
+        {
+            /* A 1:1 kind with a ratio is a planner bug, not a chain: refuse rather than pick
+             * one of the two contradictory statements and run it. */
+            s_path_frontend_tag = "";
+            return false;
+        }
+        if( !asrc_decimator_q31_init_lpf1to1( low_rate_hz, in_rate_hz,
+                                              (uint8_t)PATH_FRONTEND_CH ) )
+        {
+            s_path_frontend_tag = "";
+            return false;
+        }
+        /* s_path_frontend_second_den is already 0 here: reset() sets it from in_rate_hz, and a
+         * 1:1 row never names a 96 kHz leg.  Not re-written, so this arm adds no store to a
+         * variable the block ISR reads. */
+        /* The tag names the PROTECTED rate, because that is what picks the coefficient set --
+         * the source rate alone does not (see asrc_decimator_q31_init_lpf1to1).  The `fe=` field
+         * prints `fe=lp1` and appends this, so the log reads `fe=lp1:16k`.
+         *
+         * It was `":lp1"` in the first flashed image, which printed `fe=lp1:lp1` -- correct in
+         * that the stage was named and active, but it said the same thing twice and named no
+         * rate.  Fixed here; the 2026-09-14 first-light log shows the duplicated form. */
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+        {
+            const char* const atag =
+                asrc_antialias_direct_1to1_tag( low_rate_hz, in_rate_hz );
+            if( atag != NULL )
+            {
+                s_path_frontend_tag = atag;
+                return true;
+            }
+        }
+#endif
+#if APP_ASRC_UNIVERSAL_PROFILE
+        /* A Universal row's tag names BOTH rates, because this profile has two rows that protect
+         * the same rate from different sources (48 -> 8 and 96 -> 8 kHz).  Asked FIRST, and by the
+         * PAIR: the pre-Universal tags below key on the protected rate alone, so 96 -> 48 kHz
+         * would have fallen through them to "" and printed `fe=lp1` naming nothing.  NULL means
+         * "not a Universal row", which is why the helper returns NULL and not "". */
+        {
+            const char* const utag = asrc_universal_1to1_tag( low_rate_hz, in_rate_hz );
+            if( utag != NULL )
+            {
+                s_path_frontend_tag = utag;
+                return true;
+            }
+        }
+#endif
+        s_path_frontend_tag = ( low_rate_hz == 16000u )  ? ":16k"
+                            : ( low_rate_hz == 11025u ) ? ":11k025"
+                                                        : "";
+        return true;
+    }
+
+    /*
+     * The COMPOSED arm.  Tested next, and before every divider branch below, for the same reason
+     * the 1:1 arm is first: those branches key off `den` alone, and this chain's den is 2 -- it
+     * would be served by the shipped /2 chain, which has no 1:1 stage and a coefficient set with
+     * different band edges.  Nothing in the log would say so: `fe=/2` is exactly what a working
+     * shipped /2 prints.  So the KIND, not the divider, chooses here.
+     */
+    if( kind == ASRC_FRONTEND_FIXED_THEN_1TO1 )
+    {
+        if( num != 1u )
+        {
+            /* A rational numerator with a composed integer chain has no implementation; refuse
+             * rather than drop the numerator silently. */
+            s_path_frontend_tag = "";
+            return false;
+        }
+        if( !asrc_decimator_q31_init_dec_then_lpf1to1( low_rate_hz, in_rate_hz, den,
+                                                      (uint8_t)PATH_FRONTEND_CH ) )
+        {
+            s_path_frontend_tag = "";
+            return false;
+        }
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+        {
+            const char* const dtag =
+                asrc_antialias_direct_composed_tag( low_rate_hz, in_rate_hz, den );
+            if( dtag != NULL )
+            {
+                s_path_frontend_tag = dtag;
+                return true;
+            }
+        }
+#endif
+#if APP_ASRC_UNIVERSAL_PROFILE
+        /* Same rule as the 1:1 arm, and here the ratio is part of the key: this profile reaches
+         * 16 kHz from a 48 kHz leg at /2 and from a 96 kHz leg at /3, and both would read
+         * `fe=/N+lp1:16k` under the pre-Universal tag with only N to tell them apart. */
+        {
+            const char* const utag =
+                asrc_universal_composed_tag( low_rate_hz, in_rate_hz, den );
+            if( utag != NULL )
+            {
+                s_path_frontend_tag = utag;
+                return true;
+            }
+        }
+#endif
+        /* Same reasoning as the 1:1 tag: the PROTECTED rate is what picks the set -- here it
+         * picks BOTH sets, since the two were designed against each other.
+         *
+         * 8 kHz IS NAMED EXPLICITLY rather than left to fall through to "".  Its row reuses the
+         * 16 kHz arrays verbatim (same normalised spec at half the clock -- see the plan row), so
+         * ":16k" would have been true of the COEFFICIENTS and false of the chain, and "" would
+         * have printed `fe=/2+lp1` naming no rate at all.  Neither is what a reader needs from a
+         * log line, so the row gets its own rate. */
+        s_path_frontend_tag = ( low_rate_hz == 16000u ) ? ":16k"
+#if APP_ASRC_ANTIALIAS_22K05_TO_8K || APP_ASRC_ANTIALIAS_44K1_TO_8K
+                            /* Both 8 kHz rows (from 22.05 and from 44.1 kHz) protect the same rate,
+                             * so they share this name.  `fe=/2+lp1:8k` and `fe=/4+lp1:8k` differ in
+                             * the RATIO the shared field prints, which is what tells them apart. */
+                            : ( low_rate_hz == 8000u ) ? ":8k"
+#endif
+#if APP_ASRC_ANTIALIAS_32K_TO_11K025
+                            : ( low_rate_hz == 11025u ) ? ":11k025"
+#endif
+#if APP_ASRC_ANTIALIAS_44K1_TO_12K
+                            : ( low_rate_hz == 12000u ) ? ":12k"
+#endif
+                                                       : "";
+        return true;
+    }
+#else
+    (void)kind;
+#endif
 
 #if APP_USE_96K_RATE
     if( in_rate_hz == 96000u )
@@ -1019,6 +1229,23 @@ static inline void path_push_ba( const int32_t* src )
     profile_peak_ticks( &s_path_profile.push_ba_ticks, started );
 #endif
 }
+
+/* Same probe on leg B's front-end-fed push, for the same reason push_ab_frames_profiled()
+ * carries it: when leg B is the down-sampling direction, its push goes through
+ * audio_app_asrc_push_ba_frames() and never through path_push_ba(), so `pushBA` would read
+ * 0.0 us on exactly the pairs where the front end is armed on B.  (Leg B's finer
+ * decomposition is taken at the call site with leg_b_mark(), which is why there is no leg_b
+ * part added here.) */
+static inline void push_ba_frames_profiled( const int32_t* src, size_t frames, size_t stride )
+{
+#if APP_ASRC_HEADROOM_INSTRUMENT
+    const uint32_t started = nora_high_res_timer_get_count();
+#endif
+    audio_app_asrc_push_ba_frames( src, frames, stride );
+#if APP_ASRC_HEADROOM_INSTRUMENT
+    profile_peak_ticks( &s_path_profile.push_ba_ticks, started );
+#endif
+}
 #endif
 
 static inline void path_meter_submit( const int32_t* buf, uint8_t leg )
@@ -1052,16 +1279,29 @@ static inline void leg_a_add( uint32_t* part, uint32_t started )
 }
 #endif
 
-#if APP_ASRC_LEG_PROFILE
-/* The A->B ring push AS LEG A MAKES IT.  Leg A calls audio_app_asrc_push_ab_frames() directly
- * with the front end's output, so it never went through path_push_ab() and the existing
- * push_ab_ticks probe never saw it: `pushAB` read 0.0 us in the first instrumented image while
- * the work was really sitting in the unexplained remainder. */
+#if APP_ASRC_HEADROOM_INSTRUMENT
+/* The A->B ring push AS LEG A MAKES IT, carrying BOTH instruments.
+ *
+ * Leg A pushes the front end's output with audio_app_asrc_push_ab_frames() rather than
+ * path_push_ab(), so the peak-held push_ab_ticks probe has to sit HERE too -- no block that
+ * went through a front end ever reaches path_push_ab().  Without it `pushAB` reads 0.0 us for
+ * the whole class of front-end-armed builds while the work sits in the callback's unexplained
+ * remainder: seen at 0.0 us on 32 -> 16 kHz with the 1:1 LPF armed (2026-09-14), and before
+ * that on the first instrumented Full-IIR image.  The leg-A accumulator is the second, finer
+ * instrument and is only compiled when APP_ASRC_LEG_PROFILE asks for it -- which requires
+ * APP_ASRC_HEADROOM_INSTRUMENT, so `started` always exists.
+ *
+ * Accumulate first, peak-hold second: whichever runs second is charged with the other's few
+ * cycles, and pushAB is a coarse peak in microseconds whereas the leg-A parts have to add up
+ * to the callback. */
 static inline void push_ab_frames_profiled( const int32_t* src, size_t frames, size_t stride )
 {
     const uint32_t started = nora_high_res_timer_get_count();
     audio_app_asrc_push_ab_frames( src, frames, stride );
+#if APP_ASRC_LEG_PROFILE
     leg_a_add( &s_leg_a_cur.push, started );
+#endif
+    profile_peak_ticks( &s_path_profile.push_ab_ticks, started );
 }
 #else
 #define push_ab_frames_profiled audio_app_asrc_push_ab_frames
@@ -1104,6 +1344,257 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
                                     asrc_frontend_plan_t* plan )
 {
     if( plan == NULL ) { return; }
+    /* NONE first, so every early return below is safe: a row that forgets to name its kind
+     * reports "no stage", which is the answer that makes a caller refuse or run direct rather
+     * than route a stage that was never selected. */
+    plan->kind_ab = ASRC_FRONTEND_NONE;
+    plan->kind_ba = ASRC_FRONTEND_NONE;
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+    /* The six full81-confirmed direct-route alias holes.  These are source-rate 1:1 filters:
+     * ratio 1/1 is intentional, and kind carries the otherwise invisible fact that a stage exists.
+     * The row list is shared with coefficient selection, tags and sizing asserts. */
+#define PATH_ANTIALIAS_DIRECT_1TO1_PLAN( FS_IN, FS_OUT, TAPS, COEFF, TAG )       \
+    if( ( a_rate_hz == (FS_IN) ) && ( b_rate_hz == (FS_OUT) ) )                 \
+    {                                                                            \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                    \
+        plan->den_ab = 1u; plan->den_ba = 1u;                                    \
+        plan->kind_ab = ASRC_FRONTEND_FILTER_1TO1;                               \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                \
+        return;                                                                  \
+    }                                                                            \
+    if( ( a_rate_hz == (FS_OUT) ) && ( b_rate_hz == (FS_IN) ) )                 \
+    {                                                                            \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                    \
+        plan->den_ab = 1u; plan->den_ba = 1u;                                    \
+        plan->kind_ba = ASRC_FRONTEND_FILTER_1TO1;                               \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                \
+        return;                                                                  \
+    }
+    ASRC_ANTIALIAS_DIRECT_1TO1_ROWS( PATH_ANTIALIAS_DIRECT_1TO1_PLAN )
+#undef PATH_ANTIALIAS_DIRECT_1TO1_PLAN
+    /* The DIRECT5 composed rows: the stage sits on the leg whose engine input is FS_IN, as for the
+     * Universal composed rows; the up-conversion leg stays direct. */
+#define PATH_ANTIALIAS_DIRECT5_COMPOSED_PLAN( FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG ) \
+    if( ( a_rate_hz == (FS_IN) ) && ( b_rate_hz == (FS_OUT) ) )                     \
+    {                                                                              \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                      \
+        plan->den_ab = (DEN); plan->den_ba = 1u;                                    \
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;                              \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                    \
+        return;                                                                    \
+    }                                                                              \
+    if( ( a_rate_hz == (FS_OUT) ) && ( b_rate_hz == (FS_IN) ) )                      \
+    {                                                                              \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                      \
+        plan->den_ab = 1u; plan->den_ba = (DEN);                                    \
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;                              \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                    \
+        return;                                                                    \
+    }
+    ASRC_ANTIALIAS_DIRECT5_COMPOSED_ROWS( PATH_ANTIALIAS_DIRECT5_COMPOSED_PLAN )
+#undef PATH_ANTIALIAS_DIRECT5_COMPOSED_PLAN
+#endif
+    /*
+     * EXPERIMENTAL 1:1 row, and it is the whole reason the kind is a separate field: the RATIO
+     * is 1/1 and the FILTER is present.  Only 32 -> 16 kHz, in either direction, because that
+     * is the pair Phase 1 qualifies -- everything else keeps the plan it has.
+     *
+     * Placed FIRST so it is unambiguous that this row is an override and not a fall-through:
+     * 32 -> 16 kHz has no row in the table below at all (neither leg is 48 or 96 kHz), so
+     * without this it runs `fe=direct` with no band limit but ASRC_POLY_FC of 32 kHz, i.e.
+     * 8-14.88 kHz folding into the output band.  Host worst alias there is 0.00 dB.
+     *
+     * low_rate_hz / in_rate_hz keep their meanings: the rate the stage protects, and the leg
+     * the stage sits on.  The stage sits on the 32 kHz leg in both directions, because that is
+     * the leg whose ENGINE INPUT is 32 kHz -- the same rule the 48 kHz table uses.
+     */
+    if( ( a_rate_hz == 32000u ) && ( b_rate_hz == 16000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FILTER_1TO1;
+        plan->low_rate_hz = 16000u; plan->in_rate_hz = 32000u;
+        return;
+    }
+    if( ( a_rate_hz == 16000u ) && ( b_rate_hz == 32000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 1u;
+        plan->kind_ba = ASRC_FRONTEND_FILTER_1TO1;
+        plan->low_rate_hz = 16000u; plan->in_rate_hz = 32000u;
+        return;
+    }
+    /*
+     * EXPERIMENTAL COMPOSED row: 44.1 -> 16 kHz as /2 then 1:1, the first chain in this tree
+     * whose front end is more than one KIND of thing.
+     *
+     * The ratio published is 1/2, the same as any /2 row, and everything that reads num/den is
+     * therefore already right: the rear resampler sees step 22050/16000 = 1.378125, and the A1
+     * qualification fence exempts the pair because a filtered row "is its own pair" -- which is
+     * the fence working as written, not being bypassed.  Note what that means: this row ADMITS
+     * 44.1 -> 16 kHz, a pair the direct-path fence lists as unqualified.  Under the prototype
+     * gate only, so the production surface is unchanged.
+     *
+     * in_rate_hz is the 44.1 kHz leg -- the leg the front end sits on, the same rule the 48 kHz
+     * table uses -- and low_rate_hz is the FINAL 16 kHz, which is what picks the coefficient
+     * PAIR (both sets were designed against each other for this output rate).
+     *
+     * Neither direction is symmetric here: 16 -> 44.1 kHz is UP-conversion, which needs no
+     * anti-alias stage at all, so only the leg with 44.1 kHz as its ENGINE INPUT gets one.
+     */
+    if( ( a_rate_hz == 44100u ) && ( b_rate_hz == 16000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 2u; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 16000u; plan->in_rate_hz = 44100u;
+        return;
+    }
+    if( ( a_rate_hz == 16000u ) && ( b_rate_hz == 44100u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 2u;
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 16000u; plan->in_rate_hz = 44100u;
+        return;
+    }
+#if APP_ASRC_ANTIALIAS_22K05_TO_8K
+    /*
+     * 22.05 -> 8 kHz, and it is the SAME CHAIN as the two rows above at half the clock.
+     *
+     * 22050/8000 = 44100/16000 = 2.75625 exactly, and the uniform spec derives both band edges
+     * from the output rate alone, so the /2 stage and its 1:1 partner have the same NORMALISED
+     * specification here as they do for 44.1 -> 16 kHz.  A Kaiser design depends on nothing else,
+     * so the two SHIPPED arrays are the correct coefficients for this pair -- checked
+     * coefficient-by-coefficient rather than argued (1.0e-10 relative), and the shipped arrays
+     * evaluated as this chain read -114.38 dBc, the figure already on record for 44.1 -> 16 kHz.
+     * [internal] study_antialias_frontend_feasibility_20260920.md sections 3.1 and 4.
+     *
+     * low_rate_hz IS 8000, THE RATE THIS ROW ACTUALLY PROTECTS, even though the coefficient
+     * arrays it resolves to are named for 16 kHz.  Naming 16000 here would also have worked --
+     * the arm keys on (in_rate_hz, out_rate_hz, den) and a 22050/16000/2 row could have pointed at
+     * the same two arrays -- and it was rejected: this field is what the `fe=` tag is derived
+     * from, so the log would have read `:16k` on an 8 kHz output and looked exactly like the wrong
+     * chain armed.  The REUSE IS A PROPERTY OF THE COEFFICIENTS, not a rate to be restated, so it
+     * is expressed where the coefficients are chosen (the arm's row for 22050/8000/2 names the two
+     * 16 kHz arrays and says why) and this field keeps telling the truth.
+     *
+     * Asymmetric like its 44.1 kHz sibling: 8 -> 22.05 kHz is UP-conversion and needs no
+     * anti-alias stage, so only the leg whose ENGINE INPUT is 22.05 kHz gets one.
+     */
+    if( ( a_rate_hz == 22050u ) && ( b_rate_hz == 8000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 2u; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 8000u; plan->in_rate_hz = 22050u;
+        return;
+    }
+    if( ( a_rate_hz == 8000u ) && ( b_rate_hz == 22050u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 2u;
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 8000u; plan->in_rate_hz = 22050u;
+        return;
+    }
+#endif
+#if APP_ASRC_ANTIALIAS_32K_TO_11K025
+    /*
+     * 32 -> 11.025 kHz as /2 then 1:1, reaching 16 kHz.
+     *
+     * ONE NEW COEFFICIENT SET, and it is the pre-stage: the 1:1 partner at 16 kHz is
+     * s_lp1_16k_to_11k025_coeff, which already ships as the second stage of the 48 -> 11.025 kHz
+     * composed row.  The generator finds that partner by (stage rate, final Fs_out) and gates the
+     * WHOLE chain against it, so the pre-stage's stopband is the partner-relaxed 9453.9 Hz rather
+     * than a stand-alone /2's 8000 Hz.  Host chain figure: -108.53 dBc worst in-band alias, Q31,
+     * passband error 0.0003 dB.
+     * [internal] study_remaining_rate_pairs_20260920.md, Phase 1.
+     *
+     * low_rate_hz is 11025 -- the rate this row PROTECTS -- so the `fe=` tag reads ":11k025", the
+     * same name the 1:1 arm already uses for that rate.  Unlike the 22.05 -> 8 kHz row there is no
+     * tension here between the coefficients' names and the chain's: the partner IS named for
+     * 11.025 kHz, because that is the rate it was generated for.
+     *
+     * Asymmetric like every composed row: 11.025 -> 32 kHz is UP-conversion and needs no
+     * anti-alias stage, so only the leg whose ENGINE INPUT is 32 kHz gets one.
+     */
+    if( ( a_rate_hz == 32000u ) && ( b_rate_hz == 11025u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 2u; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 11025u; plan->in_rate_hz = 32000u;
+        return;
+    }
+    if( ( a_rate_hz == 11025u ) && ( b_rate_hz == 32000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 2u;
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 11025u; plan->in_rate_hz = 32000u;
+        return;
+    }
+#endif
+#if APP_ASRC_ANTIALIAS_44K1_TO_12K
+    /*
+     * 44.1 -> 12 kHz as /2 then 1:1, reaching 22.05 kHz.  Rear step 1.8375.
+     *
+     * BOTH SETS ARE NEW: nothing in the image protects 12 kHz from a 22.05 kHz stage rate.  The /3
+     * shape (to 14.7 kHz) was generated too and is 2 % more CPU, 1.5x the arena and 1.6x the ROM for
+     * 8 dB of spectral margin this pair does not need -- /2 holds -109.54 dBc, 9.5 dB inside the
+     * product gate.  [internal] study_remaining_rate_pairs_20260920.md, Phase 2.
+     */
+    if( ( a_rate_hz == 44100u ) && ( b_rate_hz == 12000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 2u; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 12000u; plan->in_rate_hz = 44100u;
+        return;
+    }
+    if( ( a_rate_hz == 12000u ) && ( b_rate_hz == 44100u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 2u;
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 12000u; plan->in_rate_hz = 44100u;
+        return;
+    }
+#endif
+#if APP_ASRC_ANTIALIAS_44K1_TO_8K
+    /*
+     * 44.1 -> 8 kHz as /4 then 1:1, reaching 11.025 kHz.  Rear step 1.378125.
+     *
+     * THE ONLY ROW IN THIS FILE WHOSE PAIR WAS REFUSED BY THE FILL LAW rather than by the anti-alias
+     * policy: direct step 5.5125 needs set_required 116 against TARGET_MAX 104.  What this row does
+     * is LOWER THE STEP -- the law is untouched.  /4 was chosen over /3 because it leaves step
+     * 1.378125 (predicted hr floor +19) where /3 leaves 1.8375 (+12), i.e. more margin on the axis
+     * that was doing the refusing, and 13.01 dB of spectral margin against /3's 9.50 dB.
+     *
+     * d0 = 4 IS NOT A NEW KERNEL: dec_q31_stage_set() takes the decimation as a runtime uint8_t and
+     * every buffer bound in the arm is derived from it.
+     *   [internal] study_remaining_rate_pairs_20260920.md, Phase 3.
+     */
+    if( ( a_rate_hz == 44100u ) && ( b_rate_hz == 8000u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 4u; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 8000u; plan->in_rate_hz = 44100u;
+        return;
+    }
+    if( ( a_rate_hz == 8000u ) && ( b_rate_hz == 44100u ) )
+    {
+        plan->num_ab = 1u; plan->num_ba = 1u;
+        plan->den_ab = 1u; plan->den_ba = 4u;
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;
+        plan->low_rate_hz = 8000u; plan->in_rate_hz = 44100u;
+        return;
+    }
+#endif
+#endif
 #if APP_ASRC_FULL_IIR_48_TO_32
     /* TRIAL Full-IIR, and only for the one pair it was qualified for.  The stage does not
      * resample -- it is a 48 kHz LPF, so the RATIO the plan describes is 1/1 and the generic
@@ -1137,11 +1628,89 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
     {
         plan->num_ab = 1u; plan->num_ba = 1u;
         plan->den_ab = PRESTAGE_DEN; plan->den_ba = 1u;
+        plan->kind_ab = ASRC_FRONTEND_FIXED_RATIO;
         plan->low_rate_hz = 32000u; plan->in_rate_hz = 96000u;
         return;
     }
 #endif
 #endif
+#if APP_ASRC_UNIVERSAL_PROFILE
+    /*
+     * THE UNIVERSAL PROFILE'S ROWS, expanded from the one list (ASRC_UNIVERSAL_*_ROWS in
+     * asrc_decimator_48_to_8.h).  Each row overrides the 48/96 kHz table further down for exactly
+     * its pair, in both directions, and nothing else moves.
+     *
+     * FIFTEEN ROWS EXIST AS DATA; AN IMAGE CARRIES THE ONES ITS LEGS CAN REACH.  The list is
+     * joined from a 48 kHz half and a 96 kHz half, so a build without a 96 kHz leg expands SEVEN
+     * of them here -- measured, not assumed: APP_BUILD_ASRC_CODEC_BIDIR does not define
+     * ENA_96K_RATE, so it is a seven-row image and its planner offers seven pairs.  Anything that
+     * counts on fifteen (a parity denominator, a coefficient count, an image-size explanation)
+     * has to ask which image.  The count _Static_asserts in asrc_decimator_q31.inc name both
+     * cases.
+     *
+     * WHY HERE AND NOT FIRST.  Above this point are the runtime A/B overrides -- the Full-IIR
+     * trial mode, which the operator switches on to MEASURE one pair against the profile.  A
+     * profile is a build-time default; an explicit runtime mode is an instrument.  Putting the
+     * profile first would make its own control experiment unbuildable, which is the same mistake
+     * the L=256 pin's escape hatch exists to avoid.  Below this point is the shipped table, which
+     * is what the profile overrides, so this is the only position that leaves both usable.
+     *
+     * WHY THE 1:1 ROWS PUBLISH num == den == 1 AND THAT IS NOT A HOLE.  asrc_direct_route_is_allowed()
+     * reads `num != 1 || den != 1` as "a filtered row is its own pair" and therefore exempt from the
+     * A1 unsafe-direct-route list.  A Universal 1:1 row IS filtered but publishes 1/1, so it does
+     * NOT get that exemption -- it is checked against the list like a bare direct route.  Checked,
+     * not assumed: none of the four 1:1 pairs (48 -> 22.05 / 24 / 32, 96 -> 48 kHz) is on that list,
+     * and the two pairs that ARE and appear in this profile (48 -> 11.025 and 96 -> 22.05 kHz) are
+     * composed rows with den 3, so they are exempt by the ratio. So no row is refused today.  ★ A
+     * 1:1 row added to the list later for a pair that IS on the unsafe list would be refused with a
+     * message about the direct path, naming a path it is not on.  That is the trap this comment
+     * exists for; the fix when it happens is to give that predicate the KIND, not to widen the list.
+     *
+     * The tag, the coefficients, the ratio and the per-row sizing asserts all come out of the same
+     * list -- see the note above it for why that matters here specifically.
+     */
+#define PATH_UNIVERSAL_1TO1_PLAN( FS_IN, FS_OUT, TAPS, COEFF, TAG )                \
+    if( ( a_rate_hz == (FS_IN) ) && ( b_rate_hz == (FS_OUT) ) )                     \
+    {                                                                              \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                      \
+        plan->den_ab = 1u; plan->den_ba = 1u;                                       \
+        plan->kind_ab = ASRC_FRONTEND_FILTER_1TO1;                                  \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                    \
+        return;                                                                    \
+    }                                                                              \
+    if( ( a_rate_hz == (FS_OUT) ) && ( b_rate_hz == (FS_IN) ) )                      \
+    {                                                                              \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                      \
+        plan->den_ab = 1u; plan->den_ba = 1u;                                       \
+        plan->kind_ba = ASRC_FRONTEND_FILTER_1TO1;                                  \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                    \
+        return;                                                                    \
+    }
+    ASRC_UNIVERSAL_1TO1_ROWS( PATH_UNIVERSAL_1TO1_PLAN )
+#undef PATH_UNIVERSAL_1TO1_PLAN
+    /* The composed rows.  Only the leg whose ENGINE INPUT is the high rate gets the stage -- the
+     * other direction is up-conversion and needs no anti-alias stage at all -- which is the same
+     * rule the shipped table uses and the reason den is 1 on the idle leg. */
+#define PATH_UNIVERSAL_COMPOSED_PLAN( FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG ) \
+    if( ( a_rate_hz == (FS_IN) ) && ( b_rate_hz == (FS_OUT) ) )                     \
+    {                                                                              \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                      \
+        plan->den_ab = (DEN); plan->den_ba = 1u;                                    \
+        plan->kind_ab = ASRC_FRONTEND_FIXED_THEN_1TO1;                              \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                    \
+        return;                                                                    \
+    }                                                                              \
+    if( ( a_rate_hz == (FS_OUT) ) && ( b_rate_hz == (FS_IN) ) )                      \
+    {                                                                              \
+        plan->num_ab = 1u; plan->num_ba = 1u;                                      \
+        plan->den_ab = 1u; plan->den_ba = (DEN);                                    \
+        plan->kind_ba = ASRC_FRONTEND_FIXED_THEN_1TO1;                              \
+        plan->low_rate_hz = (FS_OUT); plan->in_rate_hz = (FS_IN);                    \
+        return;                                                                    \
+    }
+    ASRC_UNIVERSAL_COMPOSED_ROWS( PATH_UNIVERSAL_COMPOSED_PLAN )
+#undef PATH_UNIVERSAL_COMPOSED_PLAN
+#endif /* APP_ASRC_UNIVERSAL_PROFILE */
 #if APP_ASRC_48K_TO_8_INTEGRATION
     /* One-way 48 -> 8 kHz preset: the chain is fixed at build time, so the pair does not
      * select anything.  Answer with the preset rather than falling through the runtime
@@ -1149,6 +1718,7 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
     (void)a_rate_hz; (void)b_rate_hz;
     plan->num_ab = 1u; plan->num_ba = 1u;
     plan->den_ab = 6u; plan->den_ba = 1u;
+    plan->kind_ab = ASRC_FRONTEND_FIXED_RATIO;
     plan->low_rate_hz = 8000u; plan->in_rate_hz = 48000u;
     return;
 #else
@@ -1222,9 +1792,16 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
         // written: "22.05 and 24 kHz are deliberately ABSENT here: their R+jitter from 96 kHz is 85 and
         // 80, both already inside the cap, so they resample directly and pay nothing for a stage they
         // do not need."  R+jitter against ASRC_FILL_TARGET_MAX is the HARD bound and still fits.  What
-        // changed is the SOFT bound: ASRC_FILL_SLACK_REQUIRED (2026-08-24, 100-pair hardware sweep) needs
-        // 8 frames of slack above R, and at step 4.3537 the setpoint clamps to R + ASRC_FILL_JITTER = 4,
-        // so audio_app_asrc_rate_pair_is_supported() REFUSES 96 k -> 22.05 kHz outright.  A /2 + /2 puts
+        // changed is the SOFT bound -- twice.  From 2026-08-24 to 2026-09-12 it was
+        // ASRC_FILL_SLACK_REQUIRED = 8 frames above R with the setpoint pinned at R + ASRC_FILL_JITTER
+        // = 4 at step 4.3537, which made audio_app_asrc_rate_pair_is_supported() REFUSE
+        // 96 k -> 22.05 kHz outright.  Since 2026-09-12 the setpoint RISES with R (asrc_fill_law:
+        // set = R_safe + one producer block + 1 = 99, reserve 17, inside the 104 cap), so the direct
+        // path is no longer refused for STARVE.  The pair is still refused, by the A1 qualification
+        // fence, which is a statement about what this image is qualified for and not about the ring
+        // -- so this row's technical reason is now band limiting alone, which is what the widened
+        // coefficients below were always about, and the row is what the pair actually runs on.
+        // A /2 + /2 puts
         // the resampler at step 1.0884 (R 32, set 64, slack 32) and it is accepted.  The pre-stage
         // coefficients were widened 21 -> 27 taps for this row -- the old four-rate set reads only
         // -58.09 dB at 22.05 kHz's 36975 Hz fold edge, so the row without them would have swapped a
@@ -1392,6 +1969,17 @@ void asrc_audio_path_frontend_plan( uint32_t a_rate_hz, uint32_t b_rate_hz,
     plan->den_ba      = den_ba;
     plan->low_rate_hz = low_rate_hz;
     plan->in_rate_hz  = in_rate_hz;
+    /* Every row of the table above is a RATE CHANGE, so for these the kind really is derivable
+     * from the ratio -- and it is derived here, once, rather than written into forty ternary
+     * arms where one could be forgotten.  The 1:1 kind is NOT reachable from here by
+     * construction: it has no ratio to derive from, which is exactly why it is set at the
+     * override above instead. */
+    plan->kind_ab = ( den_ab == 1u ) ? ASRC_FRONTEND_NONE
+                  : ( num_ab == 1u ) ? ASRC_FRONTEND_FIXED_RATIO
+                                     : ASRC_FRONTEND_RATIONAL;
+    plan->kind_ba = ( den_ba == 1u ) ? ASRC_FRONTEND_NONE
+                  : ( num_ba == 1u ) ? ASRC_FRONTEND_FIXED_RATIO
+                                     : ASRC_FRONTEND_RATIONAL;
 #endif
 }
 
@@ -1418,6 +2006,16 @@ void asrc_audio_path_reset( void )
     // re-inits the front end, so the check cannot leak state into the audio path.
 #if APP_ASRC_FRONTEND_SELFTEST
     static uint8_t s_path_dec_selftested = 0u;
+#if APP_TRAP_DIAG_FRAME
+    /* Diagnostic image only: after two traps since power-on, skip these checks so the board
+     * gets past boot (and the launch guard is cleared) instead of looping into BL LOOP. */
+    if( !s_path_dec_selftested && ( app_traps_count() >= 2u ) )
+    {
+        s_path_dec_selftested = 1u;
+        printf( " DIAG: front-end selftests skipped (traps since power-on %lu)\n",
+                (unsigned long)app_traps_count() );
+    }
+#endif
     if( !s_path_dec_selftested )
     {
         s_path_dec_selftested = 1u;
@@ -1485,8 +2083,91 @@ void asrc_audio_path_reset( void )
                     (long)f->got, (long)f->want );
             while( 1 ) { }
         }
+
+        /* ARM CLEARS HISTORY -- as a check rather than as a claim.  The three checks above all
+         * arm before every pass and compare against an oracle whose history starts at zero, so
+         * they already fail if an arm stops clearing (measured: removing the arena memset makes
+         * the divider check fail at `/2 case 1 ... got 1073739520 want 0`).  This one states the
+         * property directly and, unlike them, proves its own detector first -- see the header of
+         * asrc_decimator_q31_arm_clear_selftest().  Cheap, and it closes the case that the other
+         * three would only catch indirectly. */
+        {
+            uint16_t poke_seen = 0u;
+            const bool arm_ok = asrc_decimator_q31_arm_clear_selftest( &poke_seen );
+            printf( " ASRC Q31 arm-clears-history selftest: %s (dirty %lu words cleared, count check ok)\n",
+                    arm_ok ? "pass" : "FAIL", (unsigned long)poke_seen );
+            if( !arm_ok ) { while( 1 ) { } }
+        }
+#endif
+#if APP_ASRC_LPF1TO1_PROTOTYPE && APP_ASRC_MEAS && ( APP_MEAS_DIR == MEAS_DIR_BA )
+        /* Said once, with the checks above, so the boot log shows the 1:1 checks were left out
+         * rather than looking as if they passed. */
+        printf( " ASRC 1:1 LPF + composed front-end selftests: not built (BA MEAS image)\n" );
 #endif
     }
+    /* Not in a BA MEAS image: its buffers (s_lp1_ref / s_lp1_in / s_lp1_out, 2888 B) are boot-only,
+     * and that image carries the B->A instance on top of the capture buffer, leaving the stack at
+     * 540 B free with them.  The AB MEAS image and the product image still run both checks. */
+#if APP_ASRC_LPF1TO1_PROTOTYPE && !( APP_ASRC_MEAS && ( APP_MEAS_DIR == MEAS_DIR_BA ) )
+        /* THE 1:1 STAGE, checked at boot for the same reason the divider chains are: no shipped
+         * chain has ever set decim to 1, so the branches that reduce to a no-op there are
+         * untested code until something executes them.  Impulse, N-in/N-out per block, block
+         * boundary continuity over four blocks, near-full-scale saturation, all ASRC_CH channels
+         * carrying different audio.  Runs before the chain is selected below, so it cannot leak
+         * state into the audio path -- the selection re-inits the front end. */
+        /*
+         * ONCE, and this guard is not a tidiness measure -- it is a correctness one, learned on
+         * hardware.  Without it the check re-ran on every rate change and FAILED on the second
+         * one: it drives the REAL front end (and therefore the real s_q31_hist arena) while a
+         * path that has already been armed can still be feeding it, so the two disagree about
+         * whose samples are in the ring.  The divider checks above are one-shot for the same
+         * reason, stated there as "the answer cannot change at runtime".
+         *
+         * Own flag rather than sharing s_path_dec_selftested, so that this block can be moved or
+         * removed without changing when the divider checks run.
+         */
+        static uint8_t s_path_lp1_selftested = 0u;
+        if( s_path_lp1_selftested == 0u )
+        {
+        s_path_lp1_selftested = 1u;
+        uint32_t lp1_ties = 0u;
+        const bool lp1_ok =
+            asrc_decimator_q31_lpf1to1_selftest( 16000u, 32000u, &lp1_ties );
+        printf( " ASRC 1:1 LPF selftest (32->16k): %s (rounding ties %lu)\n",
+                lp1_ok ? "pass" : "FAIL", (unsigned long)lp1_ties );
+        if( !lp1_ok )
+        {
+            const asrc_decimator_q31_fail_t* f = asrc_decimator_q31_selftest_fail();
+            printf( "  %s: /%lu case %lu blk %lu out %lu ch %lu got %ld want %ld\n",
+                    f->what, (unsigned long)f->den, (unsigned long)f->kase,
+                    (unsigned long)f->block, (unsigned long)f->index,
+                    (unsigned long)f->channel, (long)f->got, (long)f->want );
+            while( 1 ) { }
+        }
+
+        /* THE COMPOSED CHAIN, in the same one-shot window and for one more reason on top of
+         * the 1:1 stage's: this is the first front end in the tree whose two stages were
+         * designed against each other, so a mis-paired coefficient set -- the /2 row with the
+         * wrong 1:1 behind it -- or two rings overlapping in the shared arena would still
+         * produce plausible audio.  The oracle is the divider selftest's, which walks
+         * s_q31.stages and therefore follows whatever was armed. */
+        uint32_t c44_ties = 0u;
+        const bool c44_ok =
+            asrc_decimator_q31_dec_then_lpf1to1_selftest( 16000u, 44100u, 2u, &c44_ties );
+        printf( " ASRC composed front-end selftest (44.1k /2+1:1 -> 16k): %s (rounding ties %lu)\n",
+                c44_ok ? "pass" : "FAIL", (unsigned long)c44_ties );
+        if( !c44_ok )
+        {
+            const asrc_decimator_q31_fail_t* f = asrc_decimator_q31_selftest_fail();
+            printf( "  %s: chain %lu case %lu live %lu blk %lu out %lu ch %lu got %ld want %ld\n",
+                    f->what, (unsigned long)f->den, (unsigned long)f->kase,
+                    (unsigned long)f->live_ch, (unsigned long)f->block,
+                    (unsigned long)f->index, (unsigned long)f->channel,
+                    (long)f->got, (long)f->want );
+            while( 1 ) { }
+        }
+        }
+#endif
 #endif /* APP_ASRC_FRONTEND_SELFTEST -- silent when absent, on purpose: printing
         * nothing is the honest report, and the check runs in the AK512 image. */
     // Retire the old front end BEFORE publishing a new denominator: the owning block ISR
@@ -1500,6 +2181,8 @@ void asrc_audio_path_reset( void )
     const uint32_t den_ba = 1u;
     const uint32_t low_rate_hz = 8000u;   // fixed by the preset; /6 has a single coefficient set
     const uint32_t in_rate_hz = 48000u;   // this preset's leg A is 48 kHz, so no pre-stage
+    const asrc_frontend_kind_t kind_ab = ASRC_FRONTEND_FIXED_RATIO;
+    const asrc_frontend_kind_t kind_ba = ASRC_FRONTEND_NONE;
 #else
     // The codec rate has already been committed before transport invokes this
     // reset hook.  A failed rate change restores the old codec rate and invokes
@@ -1516,6 +2199,8 @@ void asrc_audio_path_reset( void )
     const uint32_t den_ba      = plan.den_ba;
     const uint32_t low_rate_hz = plan.low_rate_hz;
     const uint32_t in_rate_hz  = plan.in_rate_hz;
+    const asrc_frontend_kind_t kind_ab = plan.kind_ab;
+    const asrc_frontend_kind_t kind_ba = plan.kind_ba;
 #endif
     // Numerators BEFORE denominators: the rate plan reads num/den as a pair in main-loop
     // context, and publishing the numerator first means a plan sampled between the two stores
@@ -1525,15 +2210,47 @@ void asrc_audio_path_reset( void )
     s_path_frontend_num_ba = (uint8_t)num_ba;
     s_path_frontend_den_ab = (uint8_t)den_ab;
     s_path_frontend_den_ba = (uint8_t)den_ba;
+
+    /* PRESENCE, and the run counters, are published from the KIND -- see the declarations.  The
+     * counters restart here because a rate change is a new chain: a count carried over would
+     * make the 'exactly one direction' check read as satisfied by the previous pair. */
+    s_path_frontend_runs_ab = 0u;
+    s_path_frontend_runs_ba = 0u;
+    s_path_frontend_present_ab = 0u;
+    s_path_frontend_present_ba = 0u;
 #if APP_USE_96K_RATE
     // Resolve the chain shape here, once, so the block ISR does not have to: 0 = no pre-stage.
+    //
+    // THE LEG RATE ALONE STOPPED ANSWERING THIS (2026-09-16).  It answered while every 96 kHz row
+    // reached its second stage through the /2 pre-stage, so "in_rate is 96 kHz" and "there is a
+    // pre-stage" were the same fact.  The Universal profile breaks that: its 96 kHz rows are
+    // SELF-CONTAINED Q31 chains -- a 1:1 band-limit at 96 kHz, or one /2 or /3 stage of its own
+    // followed by a 1:1 -- with no 96 -> 48 kHz pre-stage anywhere in them.  Asking the leg rate
+    // there yields den_ab / 2, i.e. 1 for a /2 or /3 row, which names a pre-stage the chain does
+    // not have.  So ask the KIND, which is the field that knows the chain shape, and keep the leg
+    // rate only for the rows that genuinely compose behind the pre-stage.
+    //
+    // Harmless in the Q31 build either way -- path_decimator_process() casts second_den to void
+    // there, because the Q31 front end resolved the whole cascade in init() -- and the Universal
+    // profile is Q31-only.  Written correctly regardless: a published value that says the wrong
+    // thing about the live chain is read by the next person as if it said the right one.
+    const bool second_den_is_composed_behind_prestage =
+        ( in_rate_hz == 96000u )
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+        && ( kind_ab != ASRC_FRONTEND_FILTER_1TO1 ) && ( kind_ba != ASRC_FRONTEND_FILTER_1TO1 )
+        && ( kind_ab != ASRC_FRONTEND_FIXED_THEN_1TO1 ) && ( kind_ba != ASRC_FRONTEND_FIXED_THEN_1TO1 )
+#endif
+        ;
     s_path_frontend_second_den =
-        ( in_rate_hz == 96000u ) ? (uint8_t)( den_ab / PRESTAGE_DEN ) : 0u;
+        second_den_is_composed_behind_prestage ? (uint8_t)( den_ab / PRESTAGE_DEN ) : 0u;
 #endif
     /* Refuse a plan that would need TWO front ends -- see s_path_frontend_dual_den_unsupported.
      * Checked before active_den/active_num, because those two lines are exactly where a second
      * decimated direction would be silently dropped. */
-    if( ( den_ab != 1u ) && ( den_ba != 1u ) )
+    /* Generalised from `den_ab != 1 && den_ba != 1` on 2026-09-14: a 1:1 stage leaves BOTH
+     * denominators at 1, so the ratio test could not see two of them.  The KINDS can, and this
+     * is the single place the 'one shared decimator' invariant is enforced. */
+    if( ( kind_ab != ASRC_FRONTEND_NONE ) && ( kind_ba != ASRC_FRONTEND_NONE ) )
     {
         s_path_frontend_dual_den_unsupported = 1u;
         s_path_decimator_ready               = 0u;
@@ -1544,13 +2261,22 @@ void asrc_audio_path_reset( void )
     }
     s_path_frontend_dual_den_unsupported = 0u;
 
-    const uint32_t active_den = ( den_ab != 1u ) ? den_ab : den_ba;
-    const uint32_t active_num = ( den_ab != 1u ) ? num_ab : num_ba;
+    /* WHICH LEG carries the stage, and WHETHER there is one, are now two questions.
+     *
+     * `den != 1` answered both while every stage was also a rate change.  A 1:1 stage has
+     * den == 1 on the leg it runs on, so the presence test has to come from the KIND, and the
+     * leg selection from whichever kind is not NONE.  num/den are still read as the RATIO --
+     * unchanged, and for a 1:1 stage they are honestly 1/1. */
+    const asrc_frontend_kind_t active_kind =
+        ( kind_ab != ASRC_FRONTEND_NONE ) ? kind_ab : kind_ba;
+    const bool frontend_present = ( active_kind != ASRC_FRONTEND_NONE );
+    const uint32_t active_den = ( kind_ab != ASRC_FRONTEND_NONE ) ? den_ab : den_ba;
+    const uint32_t active_num = ( kind_ab != ASRC_FRONTEND_NONE ) ? num_ab : num_ba;
     /* Say it out loud when a needed front end is refused for its width.  The pair gate already
      * turns this pair away at `*ar`, so reaching here means the pair was committed some other way
      * (a boot-time rate, a rollback); without this line the disqualification would present as
      * blocks being dropped, which reads like a transport fault instead of a stated refusal. */
-    if( ( active_den != 1u ) && !PATH_FRONTEND_SERVES_LOGICAL_WIDTH )
+    if( frontend_present && !PATH_FRONTEND_SERVES_LOGICAL_WIDTH )
     {
         printf( " ASRC front end: /%lu needed, but this build's implementation carries %lu of %lu"
                 " channels -- DISQUALIFIED, front end NOT armed (no override exists)"
@@ -1558,9 +2284,52 @@ void asrc_audio_path_reset( void )
                 (unsigned long)active_den,
                 (unsigned long)PATH_FRONTEND_CH, (unsigned long)ASRC_CH );
     }
-    s_path_decimator_ready =
-        ( ( active_den != 1u ) &&
-          path_decimator_init( active_num, active_den, low_rate_hz, in_rate_hz ) ) ? 1u : 0u;
+    const bool path_frontend_armed =
+        ( frontend_present &&
+          path_decimator_init( active_kind, active_num, active_den, low_rate_hz,
+                              in_rate_hz ) );
+#if PATH_FRONTEND_Q31
+    /* THE ARM INVARIANT, SAMPLED IN THE ONLY WINDOW WHERE IT MEANS ANYTHING.
+     *
+     * Both `ready` and the two presence flags are still 0 here (they were cleared above, before
+     * the new denominator was published), so the block ISR is on the direct path and cannot
+     * reach the front end.  That is what makes this number the arm's own state.
+     *
+     * It has to be read BEFORE publishing, not after: leg A KEEPS STREAMING across an *ar rate
+     * change -- it carries the AB push and the whole BA pull -- so a scan placed after presence
+     * was published races it and reports the new chain's legitimate first blocks as stale
+     * history.  Measured, not feared: that placement read `armchk=47` on a 32 -> 16 kHz
+     * re-commit (2026-09-14) while the arm was in fact clean.
+     *
+     * Printed below rather than here, because printf is milliseconds and this window is the one
+     * place where the audio path is between two states. */
+    const uint16_t path_arm_dirty =
+        path_frontend_armed ? asrc_decimator_q31_history_nonzero_words() : 0u;
+#endif
+    s_path_decimator_ready = path_frontend_armed ? 1u : 0u;
+    /* AFTER the arming attempt, and from its RESULT: a kind published because the plan asked
+     * for it would name a stage that failed to init, which is precisely the case the telemetry
+     * has to show as absent. */
+    s_path_frontend_kind_armed =
+        ( s_path_decimator_ready != 0u ) ? active_kind : ASRC_FRONTEND_NONE;
+
+    /* Presence follows the ARMING RESULT, not the plan: a leg told to run a stage that failed to
+     * init must keep dropping into the direct path rather than calling a front end that is not
+     * there.  Published before `ready` below is set, and the ISR needs both. */
+    if( s_path_decimator_ready != 0u )
+    {
+        s_path_frontend_present_ab = ( kind_ab != ASRC_FRONTEND_NONE ) ? 1u : 0u;
+        s_path_frontend_present_ba = ( kind_ba != ASRC_FRONTEND_NONE ) ? 1u : 0u;
+#if PATH_FRONTEND_Q31
+        /* THE INVARIANT, ON THIS PATH, AT THIS MOMENT.  The boot checks arm by calling init()
+         * directly; a rate change arms through here, and this is the one line that says the
+         * arena was empty when the chain went live.  Printed on every arm rather than only on
+         * violation: a rate change is a rare, human-initiated event, and "nothing printed" is
+         * indistinguishable from "the check was compiled out" in a captured log. */
+        printf( " ASRC front end: armed, armchk=%lu non-zero history words at publish\n",
+                (unsigned long)path_arm_dirty );
+#endif
+    }
 #endif
 
 #if APP_ASRC_FULL_IIR_48_TO_32
@@ -1607,6 +2376,48 @@ void asrc_audio_path_reset( void )
         }
     }
 #endif
+
+#if APP_ASRC_THIRDBAND_96_TO_32
+    /* The ONE place the 96 -> 32 kHz third band's sixteen sections of recursive state are
+     * cleared and its coefficients loaded.  Same reasoning as the Full-IIR block above and
+     * the same window -- transport stopped, codec rates committed, between mute and unmute --
+     * and there is deliberately no other path to it: a per-block reset would zero the
+     * filter's memory every 16 frames, and writing it while the block ISR reads it is the
+     * other way to get sixteen channels of plausible-looking noise.
+     *
+     * It also has to run AFTER path_decimator_init() above, which is what resolves whether
+     * the live chain is the composed 96 -> 32 kHz one this stage replaces -- and which
+     * memsets the shared arena on its way through, so the composed chain is whole again
+     * whenever the third band is not armed.
+     *
+     * Retire before arming, in that order and for the front end's reason: the block ISR
+     * gates on `armed`, so between the two writes it takes the composed chain rather than a
+     * half-initialised third band. */
+    asrc_thirdband_96_to_32_arm( false );
+    asrc_thirdband_96_to_32_arm( true );
+    if( asrc_thirdband_96_to_32_armed() )
+    {
+        uint32_t crc = 0u;
+        uint16_t sections = 0u;
+        int16_t  hshift = 0;
+        int32_t  alias_milli = 0;
+        asrc_thirdband_96_to_32_identity( &crc, &sections, &hshift, &alias_milli );
+        /* Name the FILTER, not just the ratio: `fe=2/6:audio` and this are the same rate and
+         * different filters, and the whole point of the A/B is that a log line has to tell
+         * them apart. */
+        s_path_frontend_tag = ":tb";
+        printf( " ASRC 96->32 front end: THIRD-BAND (%u allpass sections, headroom %d bit,"
+                " 0-15kHz alias %ldmdBc, 15-16kHz relaxed) crc=%08lX" ASRC_PRIO_EOL,
+                (unsigned)sections, (int)hshift, (long)alias_milli, (unsigned long)crc );
+    }
+    else if( asrc_thirdband_96_to_32_mode() == ASRC_THIRDBAND_MODE_ON )
+    {
+        /* Selected but not applicable: say so rather than let the chain look like it took
+         * the third band.  The mode is global; this stage replaces one chain only. */
+        printf( " ASRC 96->32 front end: third-band selected but the live chain is not the"
+                " composed 96->32 kHz one -- not applied" ASRC_PRIO_EOL );
+    }
+#endif
 }
 
 uint32_t asrc_audio_path_ab_fixed_rate_num( void )
@@ -1642,6 +2453,106 @@ uint32_t asrc_audio_path_ba_fixed_rate_den( void )
     return ( s_path_frontend_den_ba != 0u ) ? s_path_frontend_den_ba : 1u;
 #else
     return APP_ASRC_BA_FIXED_RATE_DEN;
+#endif
+}
+
+bool asrc_audio_path_engine_nominal( bool ab, uint32_t* fs_in_hz, uint32_t* num,
+                                     uint32_t* den, uint32_t* fs_out_hz )
+{
+    /*
+     * Same source as the rate-monotonic priority decision below: the CONFIGURED codec rate for each
+     * leg.  Cached scalars (wm8904_get_rate_hz is an array read), so this is safe to call from the
+     * ratio-lock path.
+     *
+     * THE 0 CHECK IS DEFENCE, NOT DETECTION.  wm8904's cache is seeded to 48000 and written only by
+     * its own configure path, so "not brought up yet" arrives here as a plausible 48000 rather than
+     * as a 0 -- this function cannot tell the difference.  The caller therefore cross-checks the
+     * nominal step against the measured lock ratio and falls back when they disagree; see
+     * asrc_set_fill_target() in audio_app_asrc.c.  Do not add a default here.
+     */
+    const uint32_t a_rate_hz = wm8904_get_rate_hz( I2C_INST_A );
+    const uint32_t b_rate_hz = wm8904_get_rate_hz( I2C_INST_B );
+
+    if( ( fs_in_hz == NULL ) || ( num == NULL ) || ( den == NULL ) || ( fs_out_hz == NULL ) )
+    {
+        return false;
+    }
+    if( ( a_rate_hz == 0u ) || ( b_rate_hz == 0u ) ) { return false; }
+
+    if( ab )
+    {
+        *fs_in_hz  = a_rate_hz;
+        *fs_out_hz = b_rate_hz;
+        *num       = asrc_audio_path_ab_fixed_rate_num();
+        *den       = asrc_audio_path_ab_fixed_rate_den();
+    }
+    else
+    {
+        *fs_in_hz  = b_rate_hz;
+        *fs_out_hz = a_rate_hz;
+        *num       = asrc_audio_path_ba_fixed_rate_num();
+        *den       = asrc_audio_path_ba_fixed_rate_den();
+    }
+    return ( *num != 0u ) && ( *den != 0u );
+}
+
+uint32_t asrc_audio_path_frontend_runs_ab( void )
+{
+#if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
+    return s_path_frontend_runs_ab;
+#else
+    /* No front end is compiled into this profile, so no block can have gone through one and 0 is
+     * the true count -- the same answer, and the same shape of answer, as the neighbouring
+     * accessors give.  The counters themselves live inside that gate (they are incremented where
+     * the filtering happens), so without this arm the file does not compile at all: found
+     * 2026-09-15 building the AK128 bi-codec profile, which resolves both switches to 0. */
+    return 0u;
+#endif
+}
+
+uint32_t asrc_audio_path_frontend_runs_ba( void )
+{
+#if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
+    return s_path_frontend_runs_ba;
+#else
+    return 0u;
+#endif
+}
+
+uint32_t asrc_audio_path_frontend_stage_frames( uint8_t stage )
+{
+#if PATH_FRONTEND_Q31 && APP_ASRC_LPF1TO1_PROTOTYPE
+    return asrc_decimator_q31_stage_output_frames( stage );
+#else
+    /* No per-stage instrument in this build: 0 for every stage, which the caller prints as
+     * "a stage never ran".  It only asks on the composed kind, which cannot be armed here. */
+    (void)stage;
+    return 0u;
+#endif
+}
+
+asrc_frontend_kind_t asrc_audio_path_frontend_kind_dir( bool ab )
+{
+#if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
+    /* No new state is needed, and deliberately so.  At most one direction ever owns the stage
+     * (enforced where the plan is armed -- the BOTH-directions plan is refused there), so the
+     * single armed kind IS that direction's kind; the per-direction PRESENCE flags already
+     * follow the arming result, so ANDing the two is exact.  A second copy of the kind would be
+     * a second thing to keep in step with the arm. */
+    const uint8_t present = ab ? s_path_frontend_present_ab : s_path_frontend_present_ba;
+    return ( present != 0u ) ? s_path_frontend_kind_armed : ASRC_FRONTEND_NONE;
+#else
+    (void)ab;
+    return ASRC_FRONTEND_NONE;
+#endif
+}
+
+asrc_frontend_kind_t asrc_audio_path_frontend_kind( void )
+{
+#if APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_RUNTIME_48K_TO_8
+    return s_path_frontend_kind_armed;
+#else
+    return ASRC_FRONTEND_NONE;
 #endif
 }
 
@@ -1946,10 +2857,21 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
         path_decimator_process_profiled( s_path_frontend_den_ab, s_path_frontend_second_den,
                                 src, &pushed, &produced ) )
     {
+        /* PROVEN, not asserted: this is where a block really went through the front end.
+         * See the counter's declaration -- `fe=` naming the armed chain is not this. */
+        ++s_path_frontend_runs_ab;
         push_ab_frames_profiled( pushed, produced, PATH_DECIMATED_STRIDE );
     }
     for( uint32_t i = 0u; i < (uint32_t)APP_SLOTS_PER_FS * (uint32_t)APP_BLOCK_FRAMES; i++ ) { dst[i] = 0; }
 #elif APP_ASRC_RUNTIME_48K_TO_8
+#ifndef APP_ASRC_HAS_AB_ENGINE
+#error "APP_ASRC_HAS_AB_ENGINE must come from asrc_app_config.h (an undefined macro would read as 0 here)."
+#endif
+#if !APP_ASRC_HAS_AB_ENGINE
+    /* BA MEAS image without the A->B engine (P2, asrc_app_config.h): leg A neither front-end-
+     * filters nor pushes into A->B.  It only pulls B->A below.  Parity note: leg A's callback is
+     * therefore shorter here than in the product, and leg A's callback is what defers leg B. */
+#else
 #if APP_ASRC_MEAS && (APP_MEAS_DIR == MEAS_DIR_AB)
     /* MEASUREMENT A->B, with the runtime front end compiled in.
      *
@@ -1968,7 +2890,7 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
 #else
     const int32_t* const a_src = src;
 #endif
-    if( s_path_frontend_den_ab != 1u )
+    if( s_path_frontend_present_ab != 0u )
     {
         size_t produced = 0u;
         const int32_t* pushed = NULL;
@@ -1977,6 +2899,9 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
             path_decimator_process_profiled( s_path_frontend_den_ab, s_path_frontend_second_den,
                                     a_src, &pushed, &produced ) )
         {
+            /* PROVEN, not asserted: this is where a block really went through the front end.
+             * See the counter's declaration -- `fe=` naming the armed chain is not this. */
+            ++s_path_frontend_runs_ab;
 #if APP_ASRC_FULL_IIR_48_TO_32
             /* 96 -> 32 kHz in Full-IIR mode: the front end here is the /2 pre-stage ALONE, so
              * its output is a 48 kHz stream and the stage belongs between it and the ring --
@@ -2010,6 +2935,7 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
     {
         path_push_ab( a_src );
     }
+#endif /* APP_ASRC_HAS_AB_ENGINE */
 #if APP_B_ROUTE_USES_BA
 #if APP_ASRC_LEG_PROFILE
     const uint32_t prof_pull = nora_high_res_timer_get_count();
@@ -2101,6 +3027,20 @@ void asrc_audio_path_leg_a_callback( const int32_t* src, int32_t* dst, void* use
 
 void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* user )
 {
+#if APP_ASRC_MEAS && (APP_MEAS_DIR == MEAS_DIR_BA)
+    /* B1 (2026-09-30, measurement only): in a BA MEAS image leg B's callback is the B->A PRODUCER,
+     * and nothing else in this image samples leg B's deferral (s_defer_b is the A->B pull's
+     * tracker, and there is no A->B pull here).  Sample it FIRST, before any push, so `?af`'s
+     * ` *MEAS legb_defer: calls= last= max=` line reports how late the producer publication
+     * (asrc_note_producer's now_tick) runs after leg B's own CCP2 grid.  The tracker keeps
+     * last/max.  2026-10-01: the hypothesis held on HW, so this ONE measurement per callback is
+     * also handed to the B->A producer below, which stamps its publication that much earlier
+     * (hardware instant; *af08 gates it).  Do not call the tracker a second time per callback. */
+    audio_app_asrc_p0_ba_prod_defer_note( asrc_clock_control_legb_defer_ticks() );
+#endif
+#if APP_ASRC_MEAS && ASRC_SAMPLE_Q31
+    s_p0k_legb_isr_tick = nora_high_res_timer_get_count();   /* P0 kick log: pull-start latency */
+#endif
     s_audio_isr_started = 1u;   /* see the declaration: makes boot-time selftests provable */
     (void)user;
     if( ( src == NULL ) || ( dst == NULL ) )
@@ -2141,7 +3081,7 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
     // for a -1 dBFS tone with a -13 dBc second harmonic.  The shipping BIDIR image was never
     // affected -- it takes the arm below, which decimates -- which is why the same rate pair and
     // direction ran with drop=0 in the section 7 hardware cases.
-    if( s_path_frontend_den_ba != 1u )
+    if( s_path_frontend_present_ba != 0u )
     {
         size_t produced = 0u;
         const int32_t* pushed = NULL;
@@ -2150,7 +3090,9 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
             path_decimator_process( s_path_frontend_den_ba, s_path_frontend_second_den,
                                     s_meas_in_b, &pushed, &produced ) )
         {
-            audio_app_asrc_push_ba_frames( pushed, produced, PATH_DECIMATED_STRIDE );
+            /* PROVEN, not asserted: see the counter's declaration. */
+            ++s_path_frontend_runs_ba;
+            push_ba_frames_profiled( pushed, produced, PATH_DECIMATED_STRIDE );
         }
     }
     else
@@ -2177,7 +3119,7 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
     // Mirror of the leg-A branch above: when leg B is the 48 kHz side and leg A runs low, the
     // B->A direction is the down-sampling one and needs the same anti-alias front end.  Only
     // one of the two denominators can be != 1, so only one leg ever takes this path.
-    if( s_path_frontend_den_ba != 1u )
+    if( s_path_frontend_present_ba != 0u )
     {
         size_t produced = 0u;
         const int32_t* pushed = NULL;
@@ -2186,7 +3128,9 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
             path_decimator_process( s_path_frontend_den_ba, s_path_frontend_second_den,
                                     src, &pushed, &produced ) )
         {
-            audio_app_asrc_push_ba_frames( pushed, produced, PATH_DECIMATED_STRIDE );
+            /* PROVEN, not asserted: see the counter's declaration. */
+            ++s_path_frontend_runs_ba;
+            push_ba_frames_profiled( pushed, produced, PATH_DECIMATED_STRIDE );
         }
     }
     else
@@ -2206,6 +3150,14 @@ void asrc_audio_path_leg_b_callback( const int32_t* src, int32_t* dst, void* use
 #if APP_ASRC_LEG_PROFILE
     const asrc_leg_b_mark_t m_led0 = leg_b_mark();
     leg_b_part_add( &s_leg_b_cur.pull, m_pull0, m_led0 );
+#endif
+#if APP_ASRC_THIRDBAND_96_TO_32
+    /* The far end of the digital chain, in the same window the stage tap is filling -- see
+     * asrc_thirdband_96_to_32_tap_legb().  Placed AFTER the pull mark on purpose: it is an
+     * instrument, so its cost belongs in `led` rather than in the `pull` figure that gets
+     * read as resampler cost.  No-op unless `*av05` armed it. */
+    asrc_thirdband_96_to_32_tap_legb( dst, (uint32_t)APP_BLOCK_FRAMES,
+                                      (uint32_t)APP_SLOTS_PER_FS );
 #endif
     path_meter_submit( dst, 1u );
 #if APP_ASRC_LEG_PROFILE

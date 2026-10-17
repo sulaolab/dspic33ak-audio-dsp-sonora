@@ -99,6 +99,12 @@ typedef struct {
     nora_pwm_generator_id_t trigger_master;   /* used iff trigger_follows */
 
     bool is_module_master;   /* PGxCON.MSTEN */
+    bool start_disabled;     /* leave ON=0 for a coordinated consumer start */
+
+    /* H/L pairs (PG5-8) only: both pins are overridden low before the
+     * generator turns on, so no PWM edge reaches them until the consumer
+     * releases them with nora_pwm_generator_override(). */
+    bool start_overridden;
 } nora_pwm_generator_cfg_t;
 
 /*
@@ -114,7 +120,7 @@ bool nora_pwm_module_init(nora_pwm_mclk_source_t source);
 /*
  * Configure and enable one PG generator: dead time, PPS pin routing (via
  * nora_pinmux_route_output(), skipped for a 0 rp), output mode/enables,
- * trigger source, MSTEN, then ON. Returns false (writes nothing further) if:
+ * trigger source, MSTEN, then ON unless start_disabled. Returns false if:
  *   - nora_pwm_module_init() has not run yet,
  *   - id names a generator this device does not have (AK128 has no PG5-8),
  *   - a requested pin route fails,
@@ -130,5 +136,26 @@ void nora_pwm_generator_set_duty(nora_pwm_generator_id_t id, uint32_t duty);
 /* True if this device defines the generator (independent of whether it has
  * been initialized yet). */
 bool nora_pwm_generator_is_present(nora_pwm_generator_id_t id);
+
+/* PG5/PG6 pair control for the audio consumer. Override is immediate when
+ * synchronous=false; synchronous=true applies at the local PWM boundary.
+ * Both outputs of one generator change in one register write. */
+bool nora_pwm_generator_pair_override(nora_pwm_generator_id_t id,
+                                     bool enable, bool high, bool synchronous);
+bool nora_pwm_generator_enable(nora_pwm_generator_id_t id, bool enable);
+/* Compatibility wrappers for existing PG5 consumers. */
+bool nora_pwm_audio_pair_override(bool enable, bool high, bool synchronous);
+bool nora_pwm_audio_pair_enable(bool enable);
+/* Output override of a complementary H/L generator (PG5-8): enable=true
+ * forces both pins to `high`, enable=false returns them to the PWM. Applied
+ * at the generator's next SOC when synchronous, otherwise immediately; both
+ * pins change in one register write. False for a generator that is not an
+ * initialized H/L pair. */
+bool nora_pwm_generator_override(nora_pwm_generator_id_t id, bool enable,
+                                 bool high, bool synchronous);
+
+/* Stop or restart an initialized H/L generator (PGxCON.ON) without
+ * reprogramming it. False for a generator that is not an initialized pair. */
+bool nora_pwm_generator_run(nora_pwm_generator_id_t id, bool on);
 
 #endif /* NORA_PWM_H */

@@ -36,6 +36,13 @@ bool audio_transport_board_config_pins( nora_spi_i2s_tdm_clock_role_t role );
 // Returns true (no failure path today); takes role for symmetry/future use.
 bool audio_transport_board_clc_passthrough( nora_spi_i2s_tdm_clock_role_t role );
 
+// Count 0<->1 transitions on WM8904-B's MCLK pin (MikroBUS-B pin 3) over
+// AUDIO_TRANSPORT_BOARD_PIN3_PROBE_SAMPLES reads, with the pin as a pulled-down input.
+// Call only BEFORE the first clc_passthrough() (CLC3 then owns the pin). Returns false
+// where the board has no such pin to check (AK128) -- the caller then skips the check.
+#define AUDIO_TRANSPORT_BOARD_PIN3_PROBE_SAMPLES   (1024u)
+bool audio_transport_board_codec_b_pin3_probe( uint32_t *transitions );
+
 // USB audio clock detection (gated by the resolved board input fact internally).
 // _init arms the RB15 change-notification detect (no-op + true when disabled);
 // _ready reports clock presence (always true when USB audio input is disabled).

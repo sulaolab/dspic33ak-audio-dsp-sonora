@@ -31,6 +31,9 @@ typedef struct
     audio_transport_prepare_t          prepare;
     audio_transport_reset_t            reset_stream_state;
     audio_transport_clock_progress_t   clock_progress;
+    /* Optional terminal *ts hook, after producer/TDM shutdown. Not called by
+     * normal clock recovery or same-rate restart. NULL when no aux output. */
+    audio_transport_reset_t            stop_aux_output;
     void*                              user;
 } audio_transport_client_t;
 

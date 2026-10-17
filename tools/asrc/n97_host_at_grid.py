@@ -23,7 +23,7 @@ IN_HZ, OUT_HZ = 48000.0, 32000.0
 p0, p1, crc = g.read_inc_rows(g.INC)
 proto = g.prototype_from_rows(p0, p1)
 rear = g.rear_prototype()
-print("host model: %s CRC32 0x%08X  (front end L=2/M=3 N=97, rear fc=0.465x32k)"
+print("host model: %s CRC32 0x%08X  (front end L=2/M=3 N=97, rear fc=0.464x32k)"
       % (g.INC.name, crc))
 
 PASSBAND = [1000, 5000, 10000, 12000, 13000, 13500, 14000, 15000, 15500, 16000]

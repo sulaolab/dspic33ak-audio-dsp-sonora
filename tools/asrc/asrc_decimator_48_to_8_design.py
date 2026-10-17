@@ -66,8 +66,8 @@ STAGE2_TAPS = 147
 # 161 taps rather than the 157 that the transition width alone would suggest.  At 157 the stage's
 # OWN stopband is only -92.3 dB: a Kaiser beta=11 design reaches its -108 dB asymptote only once
 # the tap count covers the transition, and 5900 -> 8000 Hz at 48 kHz needs about 159.  The
-# cascade at 157 taps still measured -108.3 dB, because the resampler's fc = 0.465*16000 =
-# 7440 Hz happens to cover exactly the stage's weak spot just above 8000 Hz (content at 8100 Hz
+# cascade at 157 taps still measured -108.3 dB, because the resampler's then-current
+# fc = 0.465*16000 = 7440 Hz covered exactly the stage's weak spot just above 8000 Hz (content at 8100 Hz
 # folds to 7900 Hz, where the resampler is already rolling off).  That is a real and stable
 # effect -- but the whole point of a single-stage front end here is that nothing downstream can
 # be relied on, so leaning on it to clear the gate would contradict the structure.  161 taps
@@ -99,7 +99,7 @@ MIDRATE_TAPS = 161
 # essentially NOTHING. The reason is where aliases arrive: the worst ones land at
 # multiples of the intermediate rate (12.1 kHz folds to 100 Hz), and at those fold
 # centres the resampler sees a LOW frequency and passes it at full level. Its
-# fc = 0.465*12000 = 5580 Hz never gets to act on them. So stage 2 is
+# current fc = 0.464*12000 = 5568 Hz never gets to act on them. So stage 2 is
 # still mandatory, and because its input rate doubles (16 -> 24 kHz) its relative
 # transition halves and it needs MORE taps than the /3 chain's stage 2, not fewer.
 # All of the saving comes from stage 1: 27 taps at 24 kHz replaces 69 at 16 kHz.

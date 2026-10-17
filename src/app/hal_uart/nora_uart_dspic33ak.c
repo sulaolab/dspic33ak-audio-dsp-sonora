@@ -513,9 +513,42 @@ nora_uart_status_t nora_uart_rx_status_get(
         status->tx_collision_count      = isr_status.tx_collision_count;
         status->rx_ring_overflow_count  = isr_status.rx_ring_overflow_count;
         status->rx_max_drain_count      = isr_status.rx_max_drain_count;
+        status->rx_integrity_fault_count = isr_status.rx_integrity_fault_count;
     }
 
     return NORA_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* nora_uart_rx_ring_overflow_count                                           */
+/* -------------------------------------------------------------------------- */
+uint32_t nora_uart_rx_ring_overflow_count(
+    nora_uart_instance_t inst)
+{
+    if (uart_check_initialized(inst) != NORA_UART_OK) {
+        return 0u;
+    }
+    if (g_rx_mode[inst] != NORA_UART_RX_MODE_ISR_RING) {
+        return 0u;   /* polling backend keeps no ring, so nothing can overflow */
+    }
+
+    return nora_uart_dspic33ak_rx_isr_ring_overflow_count(inst);
+}
+
+/* -------------------------------------------------------------------------- */
+/* nora_uart_rx_integrity_fault_count                                         */
+/* -------------------------------------------------------------------------- */
+uint32_t nora_uart_rx_integrity_fault_count(
+    nora_uart_instance_t inst)
+{
+    if (uart_check_initialized(inst) != NORA_UART_OK) {
+        return 0u;
+    }
+    if (g_rx_mode[inst] != NORA_UART_RX_MODE_ISR_RING) {
+        return 0u;   /* polling backend keeps no counters */
+    }
+
+    return nora_uart_dspic33ak_rx_isr_integrity_fault_count(inst);
 }
 
 /* -------------------------------------------------------------------------- */

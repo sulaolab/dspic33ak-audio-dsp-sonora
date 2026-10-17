@@ -2274,4 +2274,1154 @@ void asrc_full_iir_precheck_bench_run( uint32_t trials )
 
 #endif /* ASRC_H2_KERNEL_BENCH_AVAILABLE */
 
+// ================================================================================================
+// "*an" -- THIRD-BAND (3-path polyphase allpass) 96 -> 32 kHz DECIMATOR KERNEL COST
+//
+// Host feasibility ([internal] report_96to32_thirdband_stage0_host_gate_2026-09-10.md) put the
+// filter at
+// K = 16 first-order allpass sections for -110.33 dBc worst alias into 0-15 kHz, i.e. 16
+// multiplies per 32 kHz output per channel against the shipping front end's 110.  That is a
+// MULTIPLY count.  The Full-IIR trial already showed a kernel with FEWER multiplies losing on
+// hardware, so the multiply ratio is not the answer -- this probe measures the real thing.
+//
+// WHAT IS INSIDE THE MEASURED WINDOW (deliberately, per owner instruction 2026-09-09):
+//   16ch channel-major layout, state load, coefficient load, the allpass arithmetic, state
+//   store, the 3-branch commutator input fetch, the branch sum, the output store, and every
+//   loop / address update the C form needs.  NOT an extracted MAC instruction count.
+//
+// WHAT IS OUTSIDE: the ring, the M30 resampler, gather/scatter from TDM.  Those are measured
+// separately and added -- new_front_end_measured + existing_M30_measured -- exactly so this
+// number cannot absorb someone else's cost and hide it.
+//
+// TWO NUMBERS, BOTH PRINTED.  The SLOPE between 8 and 16 sections cancels the per-frame fixed
+// work (branch fetch, sum, output store, call, timer read) and is the marginal cost of one
+// section.  The ABSOLUTE per-output cost at 16 sections includes that fixed work and is the
+// figure the CPU budget takes.  Reporting only the slope would flatter the structure; only the
+// absolute would hide where the cost sits.
+//
+// SELF-CALIBRATION.  Every cycles figure here depends on FIRB_CYC_PER_TICK, and getting that
+// constant wrong halves or doubles the verdict (it has flipped a conclusion before).  So the
+// probe re-derives it from hardware in the same run: fir_ring_q31 costs `taps + 9`
+// instructions for `taps` MACs, so its measured slope MUST come out at 1.000 cycles/MAC.  If
+// the printed calibration is not ~1.0, every other line in this block is suspect and the run
+// says so instead of being quietly wrong.
+//
+// The allpass coefficients are the host design's (K=16, split 6/5/5).  They are here so the
+// arithmetic is the real one -- same magnitudes, same pole radii -- not to qualify a response;
+// the response was qualified on host and is not re-measured on hardware by this probe.
+// ================================================================================================
+
+#define FIRN_CH              16u     /* the shipping channel count; the interleave IS the point */
+#define FIRN_SEC_HI          16u     /* K = 16: the -110.33 dBc design                          */
+#define FIRN_SEC_LO           8u     /* second point for the slope                              */
+#define FIRN_FRAMES          16u     /* 32 kHz output frames per measured block (one TDM block) */
+#define FIRN_DEFAULT_TRIALS  2000u
+
+/* State as [section][channel][{x1, y1}].  Section-major with the channels contiguous is the
+ * layout the kernel wants: the inner loop walks 16 independent chains, so the serial dependency
+ * inside one channel's allpass is covered by the other 15 and the addressing is sequential.
+ * Q31 and float32 never run at the same time (both foreground, one after the other), so they
+ * share the storage -- X and Y data space are both full in this profile and a second 2 KiB
+ * array does not link.  Re-initialised before every timed run. */
+static union
+{
+    int32_t q[FIRN_SEC_HI][FIRN_CH][2];
+    float   f[FIRN_SEC_HI][FIRN_CH][2];
+} firn_state;
+
+static union { int32_t q[3][FIRN_CH];    float f[3][FIRN_CH];    } firn_in;    /* commutator      */
+static union { int32_t q[FIRN_CH];       float f[FIRN_CH];       } firn_out;
+static union { int32_t q[FIRN_SEC_HI];   float f[FIRN_SEC_HI];   } firn_coeff;
+static int32_t firn_sink;
+
+/* K=16 host design, split (6,5,5), worst alias -110.33 dBc.  a in (0,1), max radius 0.985785. */
+static const float firn_a_ref[FIRN_SEC_HI] = {
+    0.011490812985f, 0.447101337588f, 0.874610039108f, 0.985785414145f, 0.167166189967f,
+    0.698656770620f,                                              /* A0: 6 sections */
+    0.255731339137f, 0.765400415593f, 0.918382305447f, 0.040009283243f, 0.538698856130f,
+                                                                  /* A1: 5 sections */
+    0.350601409952f, 0.823087316318f, 0.959753700903f, 0.623425043330f, 0.094518171863f
+                                                                  /* A2: 5 sections */
+};
+
+static void firn_split( uint32_t sections, uint32_t nb[3] )
+{
+    nb[0] = ( sections + 2u ) / 3u;
+    nb[1] = ( sections + 1u ) / 3u;
+    nb[2] = sections - nb[0] - nb[1];
+}
+
+/* HEADROOM is handled by input scaling, not by per-sample shifts.  The host study measured the
+ * 1-multiplier allpass internal node at 2.09x the input amplitude, so the Q31 form needs ~1.1
+ * guard bits.  The shipping path already folds a constant gain into coefficients at zero
+ * instruction cost (the -1.500 dB headroom fold in the Full-IIR work), so the realistic kernel
+ * pays nothing per sample for this and the probe must not either -- adding two shifts per
+ * section here would measure a choice nobody would make. */
+static void firn_prepare( uint32_t sections, int use_float )
+{
+    uint32_t s = 0u;
+    (void)sections;
+    for( s = 0u; s < FIRN_SEC_HI; s++ )
+    {
+        if( use_float ) { firn_coeff.f[s] = firn_a_ref[s]; }
+        else            { firn_coeff.q[s] = (int32_t)( firn_a_ref[s] * 2147483648.0f ); }
+    }
+    for( s = 0u; s < FIRN_SEC_HI; s++ )
+    {
+        for( uint32_t c = 0u; c < FIRN_CH; c++ )
+        {
+            if( use_float ) { firn_state.f[s][c][0] = 0.0f; firn_state.f[s][c][1] = 0.0f; }
+            else            { firn_state.q[s][c][0] = 0;    firn_state.q[s][c][1] = 0;    }
+        }
+    }
+    for( uint32_t c = 0u; c < FIRN_CH; c++ ) { firn_out.q[c] = 0; }
+    for( uint32_t b = 0u; b < 3u; b++ )
+    {
+        for( uint32_t c = 0u; c < FIRN_CH; c++ )
+        {
+            /* 0.25 full scale: 6 dB of headroom for the 2.09x internal node, deterministic and
+             * different per branch/channel so nothing cancels by accident. */
+            const float v = 0.25f * ( ( ( (int32_t)( ( b * 37u ) + ( c * 11u ) ) % 19 ) - 9 ) / 9.0f );
+            if( use_float ) { firn_in.f[b][c] = v; }
+            else            { firn_in.q[b][c] = (int32_t)( v * 2147483648.0f ); }
+        }
+    }
+}
+
+// ---- the kernels under test ---------------------------------------------------------------------
+// Q31: y = a*(x - y1) + x1, one multiply and two adds per section, states x1/y1 in Q31.
+static void firn_kernel_q31( uint32_t sections, uint32_t frames )
+{
+    uint32_t nb[3];
+    firn_split( sections, nb );
+
+    for( uint32_t f = 0u; f < frames; f++ )
+    {
+        int32_t  acc[FIRN_CH];
+        uint32_t s = 0u;
+
+        for( uint32_t b = 0u; b < 3u; b++ )
+        {
+            int32_t sig[FIRN_CH];
+            for( uint32_t c = 0u; c < FIRN_CH; c++ ) { sig[c] = firn_in.q[b][c]; }
+
+            for( uint32_t k = 0u; k < nb[b]; k++, s++ )
+            {
+                const int32_t a = firn_coeff.q[s];
+                for( uint32_t c = 0u; c < FIRN_CH; c++ )
+                {
+                    const int32_t x  = sig[c];
+                    const int32_t y1 = firn_state.q[s][c][1];
+                    const int32_t w  = x - y1;
+                    const int32_t y  = (int32_t)( ( (int64_t)a * (int64_t)w ) >> 31 )
+                                       + firn_state.q[s][c][0];
+                    firn_state.q[s][c][0] = x;
+                    firn_state.q[s][c][1] = y;
+                    sig[c]                = y;
+                }
+            }
+            for( uint32_t c = 0u; c < FIRN_CH; c++ )
+            { acc[c] = ( b == 0u ) ? sig[c] : ( acc[c] + sig[c] ); }
+        }
+        /* The 1/3 is folded into the downstream resampler's coefficients in the real chain, so
+         * it costs no instruction here and none is charged. */
+        for( uint32_t c = 0u; c < FIRN_CH; c++ ) { firn_out.q[c] = acc[c]; }
+    }
+}
+
+static void firn_kernel_f32( uint32_t sections, uint32_t frames )
+{
+    uint32_t nb[3];
+    firn_split( sections, nb );
+
+    for( uint32_t f = 0u; f < frames; f++ )
+    {
+        float    acc[FIRN_CH];
+        uint32_t s = 0u;
+
+        for( uint32_t b = 0u; b < 3u; b++ )
+        {
+            float sig[FIRN_CH];
+            for( uint32_t c = 0u; c < FIRN_CH; c++ ) { sig[c] = firn_in.f[b][c]; }
+
+            for( uint32_t k = 0u; k < nb[b]; k++, s++ )
+            {
+                const float a = firn_coeff.f[s];
+                for( uint32_t c = 0u; c < FIRN_CH; c++ )
+                {
+                    const float x  = sig[c];
+                    const float y1 = firn_state.f[s][c][1];
+                    const float y  = ( a * ( x - y1 ) ) + firn_state.f[s][c][0];
+                    firn_state.f[s][c][0] = x;
+                    firn_state.f[s][c][1] = y;
+                    sig[c]                = y;
+                }
+            }
+            for( uint32_t c = 0u; c < FIRN_CH; c++ )
+            { acc[c] = ( b == 0u ) ? sig[c] : ( acc[c] + sig[c] ); }
+        }
+        for( uint32_t c = 0u; c < FIRN_CH; c++ ) { firn_out.f[c] = acc[c]; }
+    }
+}
+
+// ---- correctness, so the probe cannot time a wrong answer ----------------------------------------
+// One channel, one frame, double reference over the same coefficients and the same cascade order.
+/* Defined with part 2 below, and used by BOTH parts so there is exactly one double model of this
+ * cascade in the file.  It was duplicated here at first; two copies of a reference is a way to have
+ * one arm silently held to a different filter from another. */
+static double firn_ref_ch0( uint32_t sections );
+
+static void firn_check( uint32_t sections, float* q31_err, float* f32_err )
+{
+    /* PREPARE FIRST, then build the reference from the SAME inputs.  Reading firn_in
+     * before firn_prepare() filled it made the reference garbage -- this project places
+     * plenty of statics in .nbss (no startup clear), so "it is a static, it is zero" does
+     * not hold here.  The first run of this probe reported f32 err = Q31 err = 1.9e16,
+     * identical for both formats, which is the signature of a broken SHARED reference
+     * rather than two broken kernels. */
+    firn_prepare( sections, 1 );
+
+    const double ref_acc = firn_ref_ch0( sections );
+
+    firn_prepare( sections, 1 );          /* re-zero the state the reference just modelled */
+    firn_kernel_f32( sections, 1u );
+    *f32_err = (float)( (double)firn_out.f[0] - ref_acc );
+
+    firn_prepare( sections, 0 );
+    firn_kernel_q31( sections, 1u );
+    *q31_err = (float)( ( (double)firn_out.q[0] / 2147483648.0 ) - ref_acc );
+}
+
+// ---- statistics ---------------------------------------------------------------------------------
+typedef struct
+{
+    uint32_t min_t;
+    uint32_t max_t;
+    uint64_t sum_t;
+    uint32_t n;
+} firn_stats_t;
+
+/* Interrupts off inside the window: this is a KERNEL floor, not a system measurement, and the
+ * TDM ISRs at ~75% duty would otherwise be what min/mean/max describes.  The window is one
+ * 16-frame block, so it is bounded well inside a TDM period.  min is the uncontended floor;
+ * mean/max show DMA bus stealing, which cannot be masked. */
+#define FIRN_MEASURE( stmt, st )                                                      \
+    do {                                                                              \
+        ( st ).min_t = 0xFFFFFFFFu; ( st ).max_t = 0u; ( st ).sum_t = 0u; ( st ).n = 0u; \
+        for( uint32_t firn_i = 0u; firn_i < trials; firn_i++ )                        \
+        {                                                                             \
+            __builtin_disable_interrupts();                                           \
+            const uint32_t firn_t0 = nora_high_res_timer_get_count();                 \
+            stmt;                                                                     \
+            const uint32_t firn_d = nora_high_res_timer_get_count() - firn_t0;         \
+            __builtin_enable_interrupts();                                            \
+            if( firn_d < ( st ).min_t ) { ( st ).min_t = firn_d; }                     \
+            if( firn_d > ( st ).max_t ) { ( st ).max_t = firn_d; }                     \
+            ( st ).sum_t += firn_d;                                                   \
+            ( st ).n++;                                                               \
+        }                                                                             \
+    } while( 0 )
+
+static uint32_t firn_mean( const firn_stats_t* s )
+{
+    return ( s->n == 0u ) ? 0u : (uint32_t)( s->sum_t / s->n );
+}
+
+/* x1000 to keep two decimals without floating point in the report path. */
+static uint32_t firn_per_x1000( uint32_t ticks, uint32_t units )
+{
+    if( units == 0u ) { return 0u; }
+    return (uint32_t)( ( (uint64_t)ticks * FIRB_CYC_PER_TICK * 1000u ) / units );
+}
+
+static void firn_print_x1000( const char* label, uint32_t v_x1000, const char* unit )
+{
+    printf( "      %-28s %lu.%03lu %s\n", label, (unsigned long)( v_x1000 / 1000u ),
+            (unsigned long)( v_x1000 % 1000u ), unit );
+}
+
+// ================================================================================================
+// "*an" PART 2 -- the three kernels the 2026-09-09 owner revision asks for.
+//
+//   A  hand-written Q31 asm, 1 multiply / 2 state words per section
+//   B  hand-written Q31 asm, 2 multiplies / 1 state word per section
+//   C  the SHIPPING 96 -> 32 kHz front end, in the SAME measured window
+//
+// WHY PART 2 EXISTS AT ALL.  Part 1 (above) measured the C form and lost: 18.641
+// cycles/section in Q31, 11.323 in float32, against a shipping front end priced at 110.0
+// multiplies x 1.012 measured cycles/MAC = 111.3 cycles per 32 kHz output per channel.  Two
+// things were wrong with stopping there, and the owner named both:
+//
+//   1. THE COMPARISON WAS C AGAINST ASSEMBLER.  111.3 comes from fir_ring_q31, a hand-written
+//      REPEAT + MAC.l loop sitting on the ISA floor.  Part 1's kernels are plain C, and the Q31
+//      arm in particular never reached the accumulator at all -- `(int32_t)(((int64_t)a*w)>>31)`
+//      compiles to a 64-bit multiply and a shift sequence, which is why Q31 measured SLOWER than
+//      float32 there.
+//   2. THE COMPARISON WAS NOT APPLE-TO-APPLE.  111.3 is a MULTIPLY price for the FIR arithmetic
+//      only.  It excludes the 41-tap stage's ring push, the intermediate 48 kHz buffer, the 2/3
+//      phase schedule and the s24-left scatter -- all of which the shipping chain really pays and
+//      none of which the third-band structure needs.  Part 1's 205.6/324.0, by contrast, already
+//      included its commutator, branch sum and output store.  So the sign of the comparison was
+//      not actually known.
+//
+// Hence kernel C: the shipping chain, driven by this same harness, over this same 16-output
+// window, with its ring push and its intermediate buffer inside the timer.  It is the number the
+// verdict is taken against, and it is the only figure here that can be compared to A and B
+// without an argument about what is in whose window.
+//
+// ★ THE FINDING THAT CAME OUT OF WRITING THE ASSEMBLER, and it reframes the study: dsPIC33A has
+// MIXED register x memory MAC forms.  `mac.l [w11], w4, A` and `msc.l [w11], [w9], A` are each ONE
+// 4-byte instruction (assembled and disassembled to check, not assumed).  So a memory operand of a
+// multiply costs no separate load.  Part 1 concluded that an allpass pays "four memory accesses per
+// multiply against the FIR's two" and called that the structural floor.  On this ISA those four
+// accesses are only TWO instructions -- the two stores -- because both loads ride inside the
+// accumulator ops.  That is why kernel B, the deliberate counter-bet that halves the memory traffic
+// by doubling the multiplies, is SLOWER than A in static instruction count (7.0 against 6.0 per
+// section per channel) rather than faster: B saves one store and pays one extra sacr.l and one
+// extra lac.l for it.  B is measured anyway, because instruction count is not cycle count when the
+// load/store unit is the contended resource -- which was the whole hypothesis.
+// ================================================================================================
+
+// ---- the assembler kernels (asrc_thirdband_kernel_dspic33ak.s) ---------------------------------
+// state:  Y space.  A is [ch][section][{x1,y1}] (8 B/section); B is [ch][section] (4 B/section).
+// coeff:  X space, `sections` Q31 entries.  X-vs-Y is not a preference -- two MAC operands in ONE
+//         space serialise and the instruction silently costs an extra cycle (DS70005591C 4.3.17,
+//         measured elsewhere in this tree as 1.012 -> 2.000 cycles/MAC).  Checked below.
+// io:     in[3][FIRN_CH] followed by out[FIRN_CH], one contiguous buffer -- the kernels address all
+//         six commutator reads and both output writes off one register by displacement.
+extern void asrc_tb_a_q31_k16( int32_t* state, const int32_t* coeff, int32_t* io, uint32_t frames );
+extern void asrc_tb_a_q31_k8 ( int32_t* state, const int32_t* coeff, int32_t* io, uint32_t frames );
+extern void asrc_tb_b_q31_k16( int32_t* state, const int32_t* coeff, int32_t* io, uint32_t frames );
+extern void asrc_tb_b_q31_k8 ( int32_t* state, const int32_t* coeff, int32_t* io, uint32_t frames );
+
+// ---- the shipping FIR kernel, declared here for the same reason asrc_decimator_q31.inc gives ----
+extern int32_t* fir_ring_q31_ymod_yonly_block( const int32_t* coeff, const int32_t* hist,
+                                               uint32_t taps, int32_t* out, uint32_t outputs,
+                                               uint32_t decim_bytes, const int32_t* ring,
+                                               uint32_t ring_bytes );
+
+// ---- the shipping coefficients, not a transcription of them -------------------------------------
+// Included rather than copied so the baseline runs the REAL filter: 41 taps for 96 -> 48 kHz and
+// the two L=2 phase rows of the 97-tap 48 -> 32 kHz prototype.  The 96 -> 48 header also carries
+// the two WIDE variants (113 and 169 taps) that serve rows where the pre-stage is the whole chain;
+// this bench composes a second stage behind it and so uses the SHARED set, exactly as
+// asrc_decimator_q31_init() does for a 96 -> 32 kHz row.  The wide sets are therefore unused here,
+// which is what the diagnostic pragma is for -- suppressed narrowly, over the includes only, so a
+// genuinely dead static anywhere else in this file still warns.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-const-variable"
+#include "asrc_decimator_96_to_48_coeffs.inc"
+#include "asrc_decimator_48_to_32_coeffs.inc"
+#pragma GCC diagnostic pop
+
+// ---- where part 2's operands live ---------------------------------------------------------------
+// SAME arrangement, and the same reasons, as the FIRB arena above: a declared object in Y breaks
+// the serial-update layout gate either way it is placed, so the Y-side operands are addressed
+// directly inside the region the linker already gave the stack, below the reset-diagnostic block.
+// Nothing is added to the image layout.
+//
+// The asm arms and the baseline OVERLAP deliberately.  They are separate arms of one console
+// command, run strictly one after another, and each re-initialises every byte it reads before it
+// reads it.  X and Y are both full in this profile (part 1's notes record that a second 2 KiB array
+// does not link), so overlapping is not a shortcut here -- it is the only way both fit.
+// * PART 2 HAS ITS OWN ARENA BASE, AND THE REASON IS A REAL HAZARD IN THIS PROFILE.
+// FIRB_Y_ARENA is 0x11000, and in APP_BUILD_ASRC_CODEC_MEAS_HEADROOM_M30 the application's .bss
+// ends at 0x11038 and SPLIM is 0x13DC0 -- i.e. THE STACK IS the region 0x11038..0x13E00, and
+// FIRB_RING_POOL at 0x11000 sits exactly where the live stack is.  Part 1's arms never noticed
+// because they use declared statics, not the arena.  Part 2's first attempt (2026-09-09 19:08) took
+// the arena from offset 0 and died with a BUS ERROR at PC=840BE4, SP=0x117D8 -- the measurement
+// overwrote its own return addresses.  The bench's existing headroom check did not catch it because
+// `FIRB_Y_ARENA - (uintptr_t)&sp_probe` UNDERFLOWS when the stack is above the arena base, and it
+// printed 4294966712 B of "headroom".
+//
+// So part 2 works DOWNWARD from the top of the region instead, leaving the whole low end to the
+// stack, and it verifies that with a CANARY rather than an estimate (firn_p2_canary_* below).  The
+// part 1 constants are left exactly as they are: moving FIRB_Y_ARENA would relocate every other
+// arm's operands, and in this tree a placement change moves even an untouched stage by several
+// microseconds -- their published numbers would stop being comparable.  The hazard is reported.
+#define FIRN_P2_END      0x13E00u                       /* .resident_far_sentinel starts here     */
+#define FIRN_P2_BYTES    0x2580u                        /* 9600 B; the map is below               */
+#define FIRN_P2_ARENA    ( FIRN_P2_END - FIRN_P2_BYTES ) /* 0x11880                                */
+#define FIRN_P2_AT(off)  ( (int32_t*)( FIRN_P2_ARENA + (off) ) )
+
+#define FIRN_ASM_STATE   FIRN_P2_AT( 0x0000u )   /* 2048 B: A's [16ch][16sec][{x1,y1}]            */
+#define FIRN_ASM_IO      FIRN_P2_AT( 0x0800u )   /*  256 B: in[3][16] then out[16]                */
+
+#define FIRC_NCH      16u      /* the shipping channel count, as in part 1                       */
+#define FIRC_T1       41u      /* 96 -> 48 kHz, ASRC_DECIMATOR_96_TO_48_COEFF_TAPS               */
+#define FIRC_D1        2u
+#define FIRC_R1LEN    56u      /* = span+1: 41 taps + 7 hops of 2, the shipping batch of 8       */
+#define FIRC_BLK      16u      /* 96 kHz frames per shipping block (DEC_Q31_R23_MAX_IN)          */
+#define FIRC_B1        8u      /* 48 kHz frames one block yields (DEC_Q31_MAX_MID)               */
+#define FIRC_T_P0     49u      /* ASRC_DECIMATOR_48_TO_32_PHASE0_COEFF_TAPS                      */
+#define FIRC_T_P1     48u      /* ASRC_DECIMATOR_48_TO_32_PHASE1_COEFF_TAPS                      */
+#define FIRC_D2        3u      /* ASRC_DECIMATOR_48_TO_32_M                                      */
+#define FIRC_R2LEN    64u      /* DEC_Q31_R23_RING -- one block plus the longest row's window    */
+#define FIRC_BLOCKS    3u      /* 48 in -> 24 mid -> 16 out: part 1's window, exactly            */
+#define FIRC_OUTS      6u      /* out32 BUFFER depth: outputs one shipping block yields at most */
+/* ...and the number of 32 kHz outputs the whole measured window produces, which is what the
+ * per-output figures divide by.  3 blocks of 8 intermediate frames at 2/3 = 6+5+5.  Keeping these
+ * two apart is not pedantry: they were the same symbol until 2026-09-09, and shrinking the buffer to
+ * fit the arena then multiplied every baseline figure by 2.667 without changing a unit label. */
+#define FIRC_WINDOW_OUTS  16u
+_Static_assert( FIRC_WINDOW_OUTS == FIRN_FRAMES,
+                "the baseline window must be the same 16 outputs part 1 and the asm arms measure" );
+
+/* The map.  The two RINGS are the only objects here that MUST be in Y -- they are the FIR kernel's
+ * Y-modulo `hist` operand, read opposite coefficients in X.  The rest are reached by plain mov.l and
+ * could live anywhere; they are here because nowhere else is free (X is full and .bss ends at
+ * 0x11038).  The asm arms' state and io overlay R1: they never run at the same time as the baseline,
+ * and every arm re-initialises each byte it reads before reading it. */
+#define FIRC_R1       FIRN_P2_AT( 0x0000u )   /* 16 x 56 x 4 = 3584 B  Y, stage-1 modulo ring      */
+#define FIRC_R2       FIRN_P2_AT( 0x0E00u )   /* 16 x 64 x 4 = 4096 B  Y, the 2/3 rows' ring       */
+#define FIRC_MID      FIRN_P2_AT( 0x1E00u )   /*  8 x 16 x 4 =  512 B  intermediate 48 kHz block   */
+#define FIRC_IN96     FIRN_P2_AT( 0x2000u )   /* 16 x 16 x 4 = 1024 B  the 96 kHz input block      */
+#define FIRC_OUT32    FIRN_P2_AT( 0x2400u )   /*  6 x 16 x 4 =  384 B  ONE block's 32 kHz outputs  */
+/* The reference's arrays, overlaying R1: firc_check() runs after the chain has produced its outputs
+ * and reads only FIRC_IN96 and FIRC_OUT32, so R1 is dead by then.  They are here rather than on the
+ * stack because in this profile the STACK is the scarce thing, not the arena.
+ *
+ * * THE BASE GOES THROUGH A VOLATILE, AND THAT IS A TOOLCHAIN WORKAROUND, NOT A STYLE CHOICE.
+ * Every other pointer here is a folded absolute address and compiles fine.  A FLOATING-POINT store
+ * to one does not: `yr[i] = 0.0` made xc-dsc v3.31.01 emit
+ *     unrecognizable insn: (set (mem:SF (const_int 72384 [0x11ac0])) (reg:SF 3626))
+ * and then `internal compiler error: in extract_insn, at recog.c:2339` during the vregs pass.
+ * Reading the base from a volatile keeps the address out of the instruction, which the backend can
+ * encode, at the cost of one load per array. */
+static volatile uintptr_t firn_p2_fp_base = FIRN_P2_ARENA;
+
+#define FIRC_REF_X    ( (double*)( firn_p2_fp_base + 0x0000u ) )   /* 48 doubles */
+#define FIRC_REF_U    ( (double*)( firn_p2_fp_base + 0x0180u ) )   /* 24 doubles */
+#define FIRC_REF_Y    ( (double*)( firn_p2_fp_base + 0x0240u ) )   /*  6 doubles */
+
+_Static_assert( FIRN_P2_ARENA >= 0xC000u, "part 2's arena is not in Y data space" );
+_Static_assert( ( FIRN_P2_ARENA + FIRN_P2_BYTES ) <= 0x13E00u,
+                "part 2's arena runs into the reset-diagnostic block" );
+_Static_assert( ( FIRN_P2_ARENA % 8u ) == 0u, "the double reference arrays need 8-byte alignment" );
+
+/* THE CANARY.  Everything above is an argument that the stack cannot reach 0x11880 while a
+ * measurement is running; this is the check that the argument held.  256 bytes immediately below the
+ * arena are stamped before the runs and verified after, so a stack that grew into them is reported
+ * as a broken measurement instead of becoming a plausible number -- which is the failure mode this
+ * arena arrangement has, and the one that already cost a build once. */
+#define FIRN_P2_CANARY_BYTES  256u
+#define FIRN_P2_CANARY   ( (int32_t*)( FIRN_P2_ARENA - FIRN_P2_CANARY_BYTES ) )
+#define FIRN_P2_CANARY_W  ( FIRN_P2_CANARY_BYTES / 4u )
+
+static void firn_p2_canary_set( void )
+{
+    for( uint32_t i = 0u; i < FIRN_P2_CANARY_W; i++ )
+    { FIRN_P2_CANARY[i] = (int32_t)( 0xC0DE0000u + i ); }
+}
+
+static uint32_t firn_p2_canary_worst( void )
+{
+    /* Returns how many bytes of the canary the stack reached, 0 if none.  Counted from the TOP of
+     * the canary (nearest the arena) so the number is "how close the stack came to the data". */
+    uint32_t reached = 0u;
+    for( uint32_t i = 0u; i < FIRN_P2_CANARY_W; i++ )
+    {
+        if( FIRN_P2_CANARY[i] != (int32_t)( 0xC0DE0000u + i ) )
+        { reached = ( FIRN_P2_CANARY_W - i ) * 4u; }
+    }
+    return reached;
+}
+_Static_assert( FIRN_CH == FIRC_NCH, "the asm kernels are assembled for FIRN_CH channels" );
+_Static_assert( FIRN_SEC_HI == 16u, "the asm entry points are the K=16 / K=8 pair" );
+_Static_assert( FIRN_SEC_LO == 8u,  "the asm entry points are the K=16 / K=8 pair" );
+_Static_assert( FIRC_R1LEN >= ( FIRC_T1 + ( ( FIRC_B1 - 1u ) * FIRC_D1 ) ),
+                "stage 1's ring cannot hold the window its batch reads" );
+_Static_assert( FIRC_BLOCKS * FIRC_BLK == 48u, "the window is 48 input frames at 96 kHz" );
+
+// Coefficients, all in X, laid into firb_coeff[] AFTER the calibration has finished with it (the
+// calibration uses [0..189]).  A separate space(xmemory) array would be cleaner and does not link:
+// X is full, and asking for another 616 B moves that much application data into Y instead.
+#define FIRN_XC_ALLPASS    0u    /* 16 allpass a, Q31            */
+#define FIRC_XC_S1        16u    /* 41 taps, 96 -> 48 kHz        */
+#define FIRC_XC_P0        57u    /* 49 taps, phase 0             */
+#define FIRC_XC_P1       106u    /* 48 taps, phase 1  -> 154     */
+_Static_assert( ( FIRC_XC_P1 + FIRC_T_P1 ) <= 256u, "part 2's coefficients do not fit firb_coeff" );
+
+/* Same conversion the shipping front end uses (dec_q31_from_float): round-half-away-from-zero with
+ * explicit saturation.  Copied rather than shared because that one is static inside the .inc; a
+ * different rounding here would make the baseline a different filter from the shipping one. */
+static int32_t firc_q31( float c )
+{
+    const float v = c * 2147483648.0f;
+    if( v >=  2147483647.0f ) { return (int32_t)0x7FFFFFFF; }
+    if( v <= -2147483648.0f ) { return (int32_t)0x80000000; }
+    return (int32_t)( ( v >= 0.0f ) ? ( v + 0.5f ) : ( v - 0.5f ) );
+}
+
+static void firn_load_x_coeff( void )
+{
+    for( uint32_t s = 0u; s < FIRN_SEC_HI; s++ )
+    { firb_coeff[FIRN_XC_ALLPASS + s] = firc_q31( firn_a_ref[s] ); }
+    for( uint32_t k = 0u; k < FIRC_T1;   k++ )
+    { firb_coeff[FIRC_XC_S1 + k] = firc_q31( s_96_to_48_coeff[k] ); }
+    for( uint32_t k = 0u; k < FIRC_T_P0; k++ )
+    { firb_coeff[FIRC_XC_P0 + k] = firc_q31( s_48_to_32_phase0_coeff[k] ); }
+    for( uint32_t k = 0u; k < FIRC_T_P1; k++ )
+    { firb_coeff[FIRC_XC_P1 + k] = firc_q31( s_48_to_32_phase1_coeff[k] ); }
+}
+
+// ---- the asm arms' state and input -------------------------------------------------------------
+// `shift` exists for kernel B and is a FINDING, not a convenience.  B's single-state form carries
+// its internal node through 1/(1 + a z^-1), whose peak magnitude is 1/(1-a).  The K=16 design's
+// deepest pole is a = 0.985785, so that node has 70.4x = +37 dB of gain at Nyquist -- against the
+// 2.09x = +6.4 dB the host study measured for A's node.  B therefore needs about seven guard bits
+// where A needs two, and at Q31 it simply cannot carry a 0.25 FS input: it saturates, and the
+// correctness gate would (correctly) refuse to time it.  So B is driven 8 bits down and judged on
+// RELATIVE error.  Cycles are unaffected -- sacr.l saturates in constant time -- but a shipping
+// version of B would have to widen the state, which is a second, independent reason it loses.
+static void firn_asm_prepare( uint32_t shift )
+{
+    int32_t* st = FIRN_ASM_STATE;
+    int32_t* io = FIRN_ASM_IO;
+    for( uint32_t i = 0u; i < ( FIRN_CH * FIRN_SEC_HI * 2u ); i++ ) { st[i] = 0; }
+    for( uint32_t b = 0u; b < 3u; b++ )
+    {
+        for( uint32_t c = 0u; c < FIRN_CH; c++ )
+        { io[( b * FIRN_CH ) + c] = firn_in.q[b][c] >> shift; }
+    }
+    for( uint32_t c = 0u; c < FIRN_CH; c++ ) { io[( 3u * FIRN_CH ) + c] = 0; }
+}
+
+/* The double reference for one channel, one frame, of the same cascade -- extracted from
+ * firn_check() so the asm arms are held to the SAME model the C arms were, rather than to the C
+ * arms' output.  Requires firn_prepare(sections, 1) to have filled firn_in.f first. */
+static double firn_ref_ch0( uint32_t sections )
+{
+    uint32_t nb[3];
+    firn_split( sections, nb );
+
+    double ref_state[FIRN_SEC_HI][2];
+    for( uint32_t i = 0u; i < FIRN_SEC_HI; i++ ) { ref_state[i][0] = 0.0; ref_state[i][1] = 0.0; }
+
+    double   acc = 0.0;
+    uint32_t s   = 0u;
+    for( uint32_t b = 0u; b < 3u; b++ )
+    {
+        double sig = (double)firn_in.f[b][0];
+        for( uint32_t k = 0u; k < nb[b]; k++, s++ )
+        {
+            const double a  = (double)firn_a_ref[s];
+            const double x  = sig;
+            const double y1 = ref_state[s][1];
+            const double y  = ( a * ( x - y1 ) ) + ref_state[s][0];
+            ref_state[s][0] = x;
+            ref_state[s][1] = y;
+            sig             = y;
+        }
+        acc += sig;
+    }
+    return acc;
+}
+
+// ---- kernel C: the shipping chain, replayed ----------------------------------------------------
+// This is the shipping structure, not an approximation of it: dec_q31_hist_push()'s channel-outer
+// constant-stride push, dec_q31_stage_run()'s one-kernel-call-per-channel batch of 8, and
+// dec_q31_r23_run()'s two phase rows with their d/parity schedule and interleaved output slots.
+// The geometry is fixed at compile time here because this bench serves ONE rate pair, where the
+// shipping code serves every one; nothing else differs, and the coefficients are the same objects.
+//
+// It cannot call asrc_decimator_q31_process_s24_left() directly, which would have been better: the
+// 96 -> 48 kHz pre-stage is compiled only under APP_USE_96K_RATE, and the MEAS_HEADROOM_M30 preset
+// this bench must run in (part 1: the BIDIR preset has no data space for the bench) does not set
+// it.  Building the bench into a 96 kHz preset instead would change ASRC_CH to 8 and move every
+// placement, which is exactly the "an untouched stage moves several us on a Y-placement change"
+// trap this tree recorded on 2026-09-06.
+static uint16_t firc_wr1;
+static uint16_t firc_wr2;
+static int8_t   firc_d;
+static uint8_t  firc_par;
+
+static void firc_push( int32_t* base, uint16_t R, uint16_t* wr,
+                       const int32_t* in, uint32_t n, uint32_t in_stride )
+{
+    const uint16_t w0 = *wr;
+    int32_t*       b  = base;
+    for( uint32_t c = 0u; c < FIRC_NCH; c++ )
+    {
+        const int32_t* src = in + c;
+        int32_t*       dst = b + w0;
+        int32_t* const end = b + R;
+        for( uint32_t k = 0u; k < n; k++ )
+        {
+            *dst = *src;
+            src += in_stride;
+            ++dst;
+            if( dst == end ) { dst = b; }
+        }
+        b += R;
+    }
+    *wr = (uint16_t)( ( (uint32_t)w0 + n ) % (uint32_t)R );
+}
+
+static void firc_stage1_block( void )
+{
+    firc_push( FIRC_R1, FIRC_R1LEN, &firc_wr1, FIRC_IN96, FIRC_BLK, FIRC_NCH );
+
+    const uint16_t span = (uint16_t)( FIRC_T1 + ( ( FIRC_B1 - 1u ) * FIRC_D1 ) );
+    const uint16_t w0   = (uint16_t)( ( (uint32_t)firc_wr1 + FIRC_R1LEN - span ) % FIRC_R1LEN );
+    int32_t*       ring = FIRC_R1;
+    int32_t*       dst  = FIRC_MID;
+
+    for( uint32_t c = 0u; c < FIRC_NCH; c++ )
+    {
+        int32_t tmp[FIRC_B1];
+        (void)fir_ring_q31_ymod_yonly_block( &firb_coeff[FIRC_XC_S1], ring + w0, FIRC_T1,
+                                             tmp, FIRC_B1, FIRC_D1 * 4u,
+                                             ring, FIRC_R1LEN * 4u );
+        /* Never masked: the phase rows are downstream and must get full-precision Q31. */
+        int32_t* o = dst;
+        for( uint32_t k = 0u; k < FIRC_B1; k++ ) { *o = tmp[k]; o += FIRC_NCH; }
+        ring += FIRC_R1LEN;
+        ++dst;
+    }
+}
+
+static uint32_t firc_r23_block( int32_t* out )
+{
+    firc_push( FIRC_R2, FIRC_R2LEN, &firc_wr2, FIRC_MID, FIRC_B1, FIRC_NCH );
+
+    /* The 2/3 schedule, verbatim from dec_q31_r23_run(): an output is due exactly while the
+     * deficit is <= -1, and the two rows advance it by 1 and 2 respectively. */
+    int16_t        d        = (int16_t)( (int16_t)firc_d - (int16_t)FIRC_B1 );
+    const uint8_t  p0      = firc_par;
+    uint8_t        p       = p0;
+    uint16_t       rows[2] = { 0u, 0u };
+    int16_t        first[2] = { 0, 0 };
+    uint32_t       produced = 0u;
+
+    while( d <= -1 )
+    {
+        if( rows[p] == 0u ) { first[p] = d; }
+        rows[p]++;
+        ++produced;
+        d = (int16_t)( d + ( ( p == 0u ) ? 1 : 2 ) );
+        p ^= 1u;
+    }
+    firc_d   = (int8_t)d;
+    firc_par = p;
+
+    for( uint32_t r = 0u; r < 2u; r++ )
+    {
+        if( rows[r] == 0u ) { continue; }
+        const uint32_t taps  = ( r == 0u ) ? FIRC_T_P0 : FIRC_T_P1;
+        const uint32_t coff  = ( r == 0u ) ? FIRC_XC_P0 : FIRC_XC_P1;
+        const uint16_t back  = (uint16_t)( (uint16_t)( -first[r] ) + (uint16_t)( taps - 1u ) );
+        const uint16_t start = (uint16_t)( ( (uint32_t)firc_wr2 + FIRC_R2LEN - back ) % FIRC_R2LEN );
+        const uint32_t slot0 = (uint32_t)( ( r ^ p0 ) & 1u );
+        int32_t*       ring  = FIRC_R2;
+        int32_t*       dst   = &out[slot0 * FIRC_NCH];
+
+        for( uint32_t c = 0u; c < FIRC_NCH; c++ )
+        {
+            int32_t tmp[6];
+            (void)fir_ring_q31_ymod_yonly_block( &firb_coeff[coff], ring + start, taps,
+                                                 tmp, (uint32_t)rows[r], FIRC_D2 * 4u,
+                                                 ring, FIRC_R2LEN * 4u );
+            int32_t* o = dst;
+            for( uint32_t j = 0u; j < (uint32_t)rows[r]; j++ )
+            {
+                *o = (int32_t)( (uint32_t)tmp[j] & 0xFFFFFF00u );   /* dec_q31_to_s24_left */
+                o += FIRC_NCH * 2u;
+            }
+            ring += FIRC_R2LEN;
+            ++dst;
+        }
+    }
+    return produced;
+}
+
+/* The timed statement.  Three shipping blocks, because ONE block yields 5 or 6 outputs depending on
+ * the 2/3 phase and three of them yield exactly 16 -- the same window part 1 measured.  Resetting
+ * the phase makes every trial byte-identical work; the ring write pointers are deliberately NOT
+ * reset, since where the AGU wraps changes nothing about what it costs. */
+static void firc_baseline_run( void )
+{
+    uint32_t produced = 0u;
+    firc_d   = 0;
+    firc_par = 0u;
+    for( uint32_t b = 0u; b < FIRC_BLOCKS; b++ )
+    {
+        firc_stage1_block();
+        /* Every block writes the SAME six output slots.  out32 is one block wide because the arena
+         * is 9600 B and this is the object that could give a kilobyte back; the reference therefore
+         * checks the LAST block, which is a steady-state one (both rings full).  The work timed is
+         * unchanged -- same kernel calls, same scatter, same stride. */
+        produced += firc_r23_block( FIRC_OUT32 );
+    }
+    firn_sink += (int32_t)produced;
+}
+
+static void firc_fill_input( void )
+{
+    for( uint32_t f = 0u; f < FIRC_BLK; f++ )
+    {
+        for( uint32_t c = 0u; c < FIRC_NCH; c++ )
+        {
+            /* 0.25 full scale, deterministic, different per frame and channel so nothing cancels
+             * by accident -- the same shape and level part 1's commutator input uses. */
+            const float v = 0.25f *
+                ( ( (float)( ( (int32_t)( ( f * 23u ) + ( c * 7u ) ) % 19 ) - 9 ) ) / 9.0f );
+            FIRC_IN96[( f * FIRC_NCH ) + c] = (int32_t)( v * 2147483648.0f );
+        }
+    }
+    for( uint32_t i = 0u; i < ( FIRC_OUTS * FIRC_NCH ); i++ ) { FIRC_OUT32[i] = 0; }
+    for( uint32_t i = 0u; i < ( FIRC_NCH * FIRC_R1LEN ); i++ ) { FIRC_R1[i] = 0; }
+    for( uint32_t i = 0u; i < ( FIRC_NCH * FIRC_R2LEN ); i++ ) { FIRC_R2[i] = 0; }
+    for( uint32_t i = 0u; i < ( FIRC_B1 * FIRC_NCH ); i++ )    { FIRC_MID[i] = 0; }
+    firc_wr1 = 0u;
+    firc_wr2 = 0u;
+    firc_d   = 0;
+    firc_par = 0u;
+}
+
+/* Channel 0 of the baseline against a double model of the same two-stage cascade.
+ *
+ * The model is LINEAR -- plain arrays indexed by global sample number, no ring, no modulo -- and it
+ * recovers the alignment from the SAME schedule variables the runner uses rather than from a
+ * hand-derived offset.  The rule, which is worth stating because it is the one thing a replay of a
+ * ring-based kernel can get quietly wrong: after a push the window's NEWEST sample sits at global
+ * index (total pushed) + first[row], and the window reaches taps-1 further back.  Stage 1's batch of
+ * 8 is the same statement with first = -(span - (taps-1)) = -14 ... 0 in steps of 2.
+ *
+ * What this catches is plumbing: a window off by one sample, a phase row reading the other row's
+ * slots, a channel stride wrong, a stage running at the wrong rate.  It is not a filter
+ * qualification -- the response was qualified on host and the kernel on hardware years of commits
+ * ago; it is here so the bench cannot report the cycle cost of a wrong chain. */
+static void firc_check( float* err_out, uint32_t* checked_out )
+{
+    /* In the arena, not on the stack and not static: .bss cannot take 624 B in this profile, and
+     * the stack is what part 2 is short of (see the canary).  They overlay R1, which is dead once
+     * the chain has run. */
+    double* const xr = FIRC_REF_X;
+    double* const ur = FIRC_REF_U;
+    double* const yr = FIRC_REF_Y;
+
+    for( uint32_t n = 0u; n < ( FIRC_BLOCKS * FIRC_BLK ); n++ )
+    { xr[n] = (double)FIRC_IN96[( ( n % FIRC_BLK ) * FIRC_NCH ) + 0u] / 2147483648.0; }
+    for( uint32_t i = 0u; i < FIRC_OUTS; i++ ) { yr[i] = 0.0; }
+
+    /* stage 1: u[J] newest sample is global 2J+1, window 41 taps back from there */
+    for( uint32_t j = 0u; j < ( FIRC_BLOCKS * FIRC_B1 ); j++ )
+    {
+        double acc = 0.0;
+        for( uint32_t k = 0u; k < FIRC_T1; k++ )
+        {
+            const int32_t n = (int32_t)( 2u * j ) + 1 - (int32_t)( FIRC_T1 - 1u ) + (int32_t)k;
+            if( n >= 0 ) { acc += (double)s_96_to_48_coeff[k] * xr[n]; }
+        }
+        ur[j] = acc;
+    }
+
+    /* stage 2: the same d/parity walk, one block at a time */
+    int16_t  d    = 0;
+    uint8_t  p    = 0u;
+    uint32_t made = 0u;          /* of the LAST block: how many of the six slots it wrote */
+    for( uint32_t b = 0u; b < FIRC_BLOCKS; b++ )
+    {
+        const uint32_t g       = ( b + 1u ) * FIRC_B1;      /* 48 kHz samples pushed so far */
+        const uint8_t  p0      = p;
+        uint16_t       rows[2] = { 0u, 0u };
+        int16_t        first[2] = { 0, 0 };
+
+        made = 0u;
+        d = (int16_t)( d - (int16_t)FIRC_B1 );
+        while( d <= -1 )
+        {
+            if( rows[p] == 0u ) { first[p] = d; }
+            rows[p]++;
+            ++made;
+            d = (int16_t)( d + ( ( p == 0u ) ? 1 : 2 ) );
+            p ^= 1u;
+        }
+
+        for( uint32_t r = 0u; r < 2u; r++ )
+        {
+            const uint32_t taps = ( r == 0u ) ? FIRC_T_P0 : FIRC_T_P1;
+            const float*   h    = ( r == 0u ) ? s_48_to_32_phase0_coeff : s_48_to_32_phase1_coeff;
+            const uint32_t slot0 = (uint32_t)( ( r ^ p0 ) & 1u );
+            for( uint32_t i = 0u; i < (uint32_t)rows[r]; i++ )
+            {
+                const int32_t newest = (int32_t)g + (int32_t)first[r] + (int32_t)( FIRC_D2 * i );
+                double        acc    = 0.0;
+                for( uint32_t k = 0u; k < taps; k++ )
+                {
+                    const int32_t m = newest - (int32_t)( taps - 1u ) + (int32_t)k;
+                    if( m >= 0 ) { acc += (double)h[k] * ur[m]; }
+                }
+                /* Every block writes the same six slots, exactly as the runner does now, so this
+                 * naturally ends up holding the LAST block's outputs -- which is what out32 holds. */
+                const uint32_t slot = slot0 + ( 2u * i );
+                if( slot < FIRC_OUTS ) { yr[slot] = acc; }
+            }
+        }
+    }
+
+    float worst = 0.0f;
+    for( uint32_t i = 0u; i < made; i++ )
+    {
+        const double got = (double)FIRC_OUT32[( i * FIRC_NCH ) + 0u] / 2147483648.0;
+        float        e   = (float)( got - yr[i] );
+        if( e < 0.0f ) { e = -e; }
+        if( e > worst ) { worst = e; }
+    }
+    *err_out     = worst;
+    *checked_out = made;
+}
+
+// ================================================================================================
+// Part 2 lives in its OWN function, and not for tidiness: with it inlined into
+// asrc_thirdband_kernel_bench_run() the compiler stopped being able to allocate registers --
+// `internal compiler error: in extract_insn, at recog.c:2339` during the vregs pass, on a function
+// that had grown past 24 KB of code.  Splitting it is the fix, and it also means part 1's numbers
+// come from a function whose code generation did not change.
+//
+// `ovh_min` is part 1's measured timer-pair floor, passed in rather than re-measured so both parts
+// subtract exactly the same overhead.
+// ================================================================================================
+static void firn_part2( uint32_t trials, uint32_t ovh_min )
+{
+    // =============================================================================================
+    // PART 2 -- A / B / baseline, the three kernels of the owner's 2026-09-09 revision.
+    //
+    // ★ THE JUDGEMENT IS THE ABSOLUTE, NOT THE SLOPE.  Part 1's own numbers are why: the C form's
+    // fixed cost per output was 24.4 cycles (float32) and 25.8 (Q31), i.e. about six operations of
+    // loop and commutator management at roughly 4 cycles each.  A break-even taken on slope alone
+    // silently assumed that cost was immovable.  It is not -- the asm kernels below carry the frame
+    // loop, the commutator, the branch sum and the output store themselves -- so there are TWO
+    // levers and only the absolute figure sees both.  The slope is still printed, as a diagnostic
+    // for where the cost sits.
+    // =============================================================================================
+    firn_load_x_coeff();
+
+    {
+        const uintptr_t xc = (uintptr_t)&firb_coeff[FIRN_XC_ALLPASS];
+        const uintptr_t ys = (uintptr_t)FIRN_ASM_STATE;
+        const bool      ok = ( xc < 0xC000u ) && ( ys >= 0xC000u );
+        printf( "    part 2 placement: coeff X=0x%05lX  state Y=0x%05lX  ->  %s\n",
+                (unsigned long)xc, (unsigned long)ys,
+                ok ? "split, MAC prefetch parallel"
+                   : "*** SAME SPACE: every MAC below costs an extra cycle, distrust part 2 ***" );
+    }
+
+    /* Part 2's arena sits at the TOP of the stack's region, so the question is not "is there room"
+     * but "did the stack stay out of it".  That is answered by a canary, checked after the runs --
+     * the SIGNED headroom is printed too, because the unsigned form of exactly this subtraction is
+     * what hid the collision that crashed the first attempt. */
+    {
+        uint32_t sp_probe = 0u;
+        const int32_t room = (int32_t)( (int32_t)FIRN_P2_ARENA - (int32_t)(uintptr_t)&sp_probe );
+        printf( "    part 2 arena 0x%05lX..0x%05lX, stack near 0x%05lX (%ld B below the arena)\n",
+                (unsigned long)FIRN_P2_ARENA, (unsigned long)FIRN_P2_END,
+                (unsigned long)(uintptr_t)&sp_probe, (long)room );
+        if( room < 1024 )
+        {
+            printf( "    PART 2 REFUSING to run: the stack is within 1024 B of the arena (%ld).\n",
+                    (long)room );
+            return;
+        }
+        firn_p2_canary_set();
+    }
+
+    /* ---- correctness of both asm kernels, against the SAME double model part 1 used ---- */
+    firn_prepare( FIRN_SEC_HI, 1 );
+    const double firn_ref_hi = firn_ref_ch0( FIRN_SEC_HI );
+    firn_prepare( FIRN_SEC_HI, 0 );
+
+    float a_err = 0.0f;
+    float b_rel = 0.0f;
+    {
+        firn_asm_prepare( 0u );
+        asrc_tb_a_q31_k16( FIRN_ASM_STATE, &firb_coeff[FIRN_XC_ALLPASS], FIRN_ASM_IO, 1u );
+        a_err = (float)( ( (double)FIRN_ASM_IO[3u * FIRN_CH] / 2147483648.0 ) - firn_ref_hi );
+
+        /* B is driven 8 bits down.  Not a convenience: its single-state form carries the internal
+         * node through 1/(1 + a z^-1), peak magnitude 1/(1-a) = 70.4 at the K=16 design's deepest
+         * pole (a = 0.985785), against 2.09 for A's node.  At 0.25 FS it saturates, so the honest
+         * comparison is at a level it can carry, judged on RELATIVE error.  Cycles are unaffected
+         * -- sacr.l saturates in constant time -- but the guard-bit requirement is a real, separate
+         * disqualification for a Q31 shipping version and is reported as one. */
+        firn_asm_prepare( 8u );
+        asrc_tb_b_q31_k16( FIRN_ASM_STATE, &firb_coeff[FIRN_XC_ALLPASS], FIRN_ASM_IO, 1u );
+        const double want = firn_ref_hi / 256.0;
+        const double got  = (double)FIRN_ASM_IO[3u * FIRN_CH] / 2147483648.0;
+        const double mag  = ( want >= 0.0 ) ? want : -want;
+        b_rel = (float)( ( got - want ) / ( ( mag > 1e-9 ) ? mag : 1e-9 ) );
+    }
+    /* ---- the baseline: fill, run once, check the chain before timing it ---- */
+    firc_fill_input();
+    firc_baseline_run();
+    float    c_err     = 0.0f;
+    uint32_t c_checked = 0u;
+    firc_check( &c_err, &c_checked );
+    /* Read before any printf: see the note above the canary macros. */
+    const uint32_t canary_check = firn_p2_canary_worst();
+
+    printf( "    asm correctness vs double reference, ch0 1 frame: A abs err=%e   B rel err=%e\n",
+            (double)a_err, (double)b_rel );
+    printf( "    baseline correctness vs double cascade, ch0, last block's %lu outputs: worst err=%e\n",
+            (unsigned long)c_checked, (double)c_err );
+
+    if( ( a_err > 1e-4f ) || ( a_err < -1e-4f ) ||
+        ( b_rel > 1e-3f ) || ( b_rel < -1e-3f ) ||
+        ( c_err > 1e-4f ) || ( c_err < -1e-4f ) )
+    {
+        printf( "    PART 2 NOT TIMED: a kernel does not reproduce its cascade, so any cycle count\n" );
+        printf( "    would be the cost of a wrong answer.\n" );
+        return;
+    }
+
+    /* ---- timing.  Same macro, same window, same trials as part 1. ---- */
+    firn_stats_t a_lo, a_hi, b_lo, b_hi, c_all, c_s1;
+
+    /* Re-stamped so the timed windows are bracketed on their own: the printfs above are the deepest
+     * calls in this function and their stack use is harmless, because nothing in the arena is live
+     * across them (every arm re-initialises what it reads). */
+    firn_p2_canary_set();
+
+    firn_asm_prepare( 0u );
+    FIRN_MEASURE( asrc_tb_a_q31_k8(  FIRN_ASM_STATE, &firb_coeff[FIRN_XC_ALLPASS],
+                                     FIRN_ASM_IO, FIRN_FRAMES ), a_lo );
+    firn_asm_prepare( 0u );
+    FIRN_MEASURE( asrc_tb_a_q31_k16( FIRN_ASM_STATE, &firb_coeff[FIRN_XC_ALLPASS],
+                                     FIRN_ASM_IO, FIRN_FRAMES ), a_hi );
+    firn_asm_prepare( 8u );
+    FIRN_MEASURE( asrc_tb_b_q31_k8(  FIRN_ASM_STATE, &firb_coeff[FIRN_XC_ALLPASS],
+                                     FIRN_ASM_IO, FIRN_FRAMES ), b_lo );
+    firn_asm_prepare( 8u );
+    FIRN_MEASURE( asrc_tb_b_q31_k16( FIRN_ASM_STATE, &firb_coeff[FIRN_XC_ALLPASS],
+                                     FIRN_ASM_IO, FIRN_FRAMES ), b_hi );
+
+    firc_fill_input();
+    FIRN_MEASURE( firc_baseline_run(), c_all );
+    /* Stage 1 alone, so the baseline's own split is visible rather than inferred: the 2/3 phase
+     * rows are then (all - stage1) and the reader can see which half the shipping chain spends in.
+     * Diagnostic only; the verdict is taken on the whole chain. */
+    firc_fill_input();
+    FIRN_MEASURE( { firc_stage1_block(); firc_stage1_block(); firc_stage1_block(); }, c_s1 );
+
+    const uint32_t canary_timed = firn_p2_canary_worst();
+
+    /* ---- report ---- */
+    static const char* const p2_names[2] = { "A  asm Q31 1-mult / 2-state",
+                                             "B  asm Q31 2-mult / 1-state" };
+    const firn_stats_t* p2_lo[2] = { &a_lo, &b_lo };
+    const firn_stats_t* p2_hi[2] = { &a_hi, &b_hi };
+    uint32_t            p2_abs[2] = { 0u, 0u };
+
+    for( uint32_t v = 0u; v < 2u; v++ )
+    {
+        const firn_stats_t* lo = p2_lo[v];
+        const firn_stats_t* hi = p2_hi[v];
+        const uint32_t lo_min  = ( lo->min_t > ovh_min ) ? ( lo->min_t - ovh_min ) : 0u;
+        const uint32_t hi_min  = ( hi->min_t > ovh_min ) ? ( hi->min_t - ovh_min ) : 0u;
+        const uint32_t hi_mean = ( firn_mean( hi ) > ovh_min )
+                                 ? ( firn_mean( hi ) - ovh_min ) : 0u;
+        const uint32_t hi_max  = ( hi->max_t > ovh_min ) ? ( hi->max_t - ovh_min ) : 0u;
+
+        printf( "    %s\n", p2_names[v] );
+        printf( "      K=16 block ticks min/mean/max=%lu/%lu/%lu -> cycles %lu/%lu/%lu\n",
+                (unsigned long)hi_min, (unsigned long)hi_mean, (unsigned long)hi_max,
+                (unsigned long)( hi_min * FIRB_CYC_PER_TICK ),
+                (unsigned long)( hi_mean * FIRB_CYC_PER_TICK ),
+                (unsigned long)( hi_max * FIRB_CYC_PER_TICK ) );
+        printf( "      K=8  block ticks min=%lu -> cycles %lu\n",
+                (unsigned long)lo_min, (unsigned long)( lo_min * FIRB_CYC_PER_TICK ) );
+        firn_print_x1000( "cycles/section (slope)",
+                          firn_per_x1000( hi_min - lo_min,
+                                          ( FIRN_SEC_HI - FIRN_SEC_LO ) * FIRN_FRAMES * FIRN_CH ),
+                          "cycles  [diagnostic]" );
+        p2_abs[v] = firn_per_x1000( hi_min, FIRN_FRAMES * FIRN_CH );
+        firn_print_x1000( "cycles/32k output/ch", p2_abs[v], "cycles  <-- THE JUDGEMENT" );
+        {
+            /* absolute minus slope x K: what the frame loop, commutator, branch sum and output
+             * store cost, i.e. the second lever.  Clamped because both terms are measurements and
+             * a K=8 point a hair above half the K=16 point would otherwise wrap the subtraction. */
+            const uint32_t slope = firn_per_x1000( hi_min - lo_min,
+                          ( FIRN_SEC_HI - FIRN_SEC_LO ) * FIRN_FRAMES * FIRN_CH );
+            const uint32_t sxk   = slope * FIRN_SEC_HI;
+            firn_print_x1000( "fixed cost per output",
+                              ( p2_abs[v] > sxk ) ? ( p2_abs[v] - sxk ) : 0u, "cycles" );
+        }
+        firn_print_x1000( "us per 16-frame block",
+                          ( hi_min * FIRB_CYC_PER_TICK * 1000u ) / ( PLL1_CLK_HZ / 1000000UL ),
+                          "us" );
+    }
+
+    {
+        const uint32_t all_min = ( c_all.min_t > ovh_min ) ? ( c_all.min_t - ovh_min ) : 0u;
+        const uint32_t s1_min  = ( c_s1.min_t  > ovh_min ) ? ( c_s1.min_t  - ovh_min ) : 0u;
+        const uint32_t all_mean = ( firn_mean( &c_all ) > ovh_min )
+                                  ? ( firn_mean( &c_all ) - ovh_min ) : 0u;
+        const uint32_t all_max = ( c_all.max_t > ovh_min ) ? ( c_all.max_t - ovh_min ) : 0u;
+        const uint32_t c_abs   = firn_per_x1000( all_min, FIRC_WINDOW_OUTS * FIRC_NCH );
+
+        printf( "    C  SHIPPING 96->32 front end, same window (41-tap /2 -> mid 48k -> 97-tap 2/3)\n" );
+        printf( "      inside: ring push, asm FIR kernel x2 stages, intermediate buffer, phase\n" );
+        printf( "              schedule, s24-left scatter.  outside: M30 resampler, TDM gather.\n" );
+        printf( "      block ticks min/mean/max=%lu/%lu/%lu -> cycles %lu/%lu/%lu\n",
+                (unsigned long)all_min, (unsigned long)all_mean, (unsigned long)all_max,
+                (unsigned long)( all_min * FIRB_CYC_PER_TICK ),
+                (unsigned long)( all_mean * FIRB_CYC_PER_TICK ),
+                (unsigned long)( all_max * FIRB_CYC_PER_TICK ) );
+        firn_print_x1000( "cycles/32k output/ch", c_abs, "cycles  <-- THE BASELINE" );
+        firn_print_x1000( "  of which 96->48 stage",
+                          firn_per_x1000( s1_min, FIRC_WINDOW_OUTS * FIRC_NCH ),
+                          "cycles  [diagnostic]" );
+        firn_print_x1000( "  of which 2/3 rows",
+                          firn_per_x1000( ( all_min > s1_min ) ? ( all_min - s1_min ) : 0u,
+                                          FIRC_WINDOW_OUTS * FIRC_NCH ),
+                          "cycles  [diagnostic]" );
+        firn_print_x1000( "us per 16-frame block",
+                          ( all_min * FIRB_CYC_PER_TICK * 1000u ) / ( PLL1_CLK_HZ / 1000000UL ),
+                          "us" );
+
+        /* ---- the verdict, stated so it cannot be read the wrong way round ---- */
+        printf( "    VERDICT (absolute cycles per 32 kHz output per channel, same window):\n" );
+        for( uint32_t v = 0u; v < 2u; v++ )
+        {
+            const bool     faster = ( p2_abs[v] < c_abs );
+            const uint32_t d      = faster ? ( c_abs - p2_abs[v] ) : ( p2_abs[v] - c_abs );
+            const uint32_t pct    = ( c_abs == 0u ) ? 0u : (uint32_t)( ( (uint64_t)d * 1000u ) / c_abs );
+            printf( "      %.1s: %lu.%03lu vs baseline %lu.%03lu -> %s by %lu.%01lu %% -> %s\n",
+                    p2_names[v],
+                    (unsigned long)( p2_abs[v] / 1000u ), (unsigned long)( p2_abs[v] % 1000u ),
+                    (unsigned long)( c_abs / 1000u ),     (unsigned long)( c_abs % 1000u ),
+                    faster ? "FASTER" : "slower",
+                    (unsigned long)( pct / 10u ), (unsigned long)( pct % 10u ),
+                    faster ? "GO on CPU" : "NO-GO on CPU" );
+        }
+        printf( "      part 1 C forms, same unit: Q31 324.015  float32 205.578  (see the report)\n" );
+        printf( "      M30 resampler is common to both structures and cancels in this comparison.\n" );
+    }
+
+    {
+        const uint32_t reached = ( canary_check > canary_timed ) ? canary_check : canary_timed;
+        if( reached == 0u )
+        {
+            printf( "    stack canary intact: the stack never came within %lu B of part 2's arena,\n"
+                    "    so nothing above overwrote its own operands.\n",
+                    (unsigned long)FIRN_P2_CANARY_BYTES );
+        }
+        else
+        {
+            printf( "    *** STACK CANARY BROKEN: the stack came within %lu B of the arena. Part 2's\n"
+                    "    *** numbers above are NOT trustworthy -- move FIRN_P2_ARENA up or shrink it.\n",
+                    (unsigned long)( FIRN_P2_CANARY_BYTES - reached ) );
+        }
+    }
+}
+
+// ---- the bench ----------------------------------------------------------------------------------
+void asrc_thirdband_kernel_bench_run( uint32_t trials )
+{
+    if( trials == 0u ) { trials = FIRN_DEFAULT_TRIALS; }
+
+    firn_stats_t ovh, q_lo, q_hi, f_lo, f_hi, cal_lo, cal_hi;
+    float        q31_err = 0.0f, f32_err = 0.0f;
+
+    printf( "\n *an third-band 3-path allpass kernel  CPU=%luMHz timer=%luMHz 1 tick=%lu cycles"
+            " trials=%lu\n",
+            (unsigned long)( PLL1_CLK_HZ / 1000000UL ), (unsigned long)( FCY / 1000000UL ),
+            (unsigned long)FIRB_CYC_PER_TICK, (unsigned long)trials );
+    printf( "    geometry: %luch channel-major, K=%lu sections (split 6/5/5), %lu output frames"
+            "/block, 3 branches\n",
+            (unsigned long)FIRN_CH, (unsigned long)FIRN_SEC_HI, (unsigned long)FIRN_FRAMES );
+    printf( "    inside the window: state load/store, coeff load, arithmetic, commutator fetch,"
+            " branch sum, output store, loops\n" );
+    printf( "    outside: ring, M30 resampler, TDM gather/scatter (measured separately and added)\n" );
+
+    /* ---- timer-pair overhead, subtracted from every figure ---- */
+    FIRN_MEASURE( firn_sink += 0, ovh );
+    printf( "    timer pair ticks min/mean/max=%lu/%lu/%lu (subtracted below)\n",
+            (unsigned long)ovh.min_t, (unsigned long)firn_mean( &ovh ),
+            (unsigned long)ovh.max_t );
+
+    /* ---- self-calibration: fir_ring_q31 is taps+9 instructions for taps MACs, so its slope
+     * MUST read 1.000 cycles/MAC.  If it does not, FIRB_CYC_PER_TICK is wrong and so is
+     * everything else printed here. ---- */
+    firb_fill_coeff( FIRB_TAPS_HI );
+    firb_fill_samples( FIRB_HIST_Y, 2u * FIRB_TAPS_HI, 0xA5A5u );
+    FIRN_MEASURE( fir_ring_q31( firb_coeff, FIRB_HIST_Y, FIRB_TAPS_LO, firb_out ), cal_lo );
+    FIRN_MEASURE( fir_ring_q31( firb_coeff, FIRB_HIST_Y, FIRB_TAPS_HI, firb_out ), cal_hi );
+    {
+        const uint32_t cal = firn_per_x1000( cal_hi.min_t - cal_lo.min_t, FIRB_TAPS_SPAN );
+        printf( "    CALIBRATION fir_ring_q31 slope over %lu..%lu taps: ",
+                (unsigned long)FIRB_TAPS_LO, (unsigned long)FIRB_TAPS_HI );
+        printf( "%lu.%03lu cycles/MAC (expect 1.000; %s)\n",
+                (unsigned long)( cal / 1000u ), (unsigned long)( cal % 1000u ),
+                ( ( cal > 900u ) && ( cal < 1150u ) ) ? "tick conversion CONFIRMED"
+                                                      : "*** OUT OF RANGE: distrust every cycles figure below ***" );
+    }
+
+    /* ---- correctness before timing ---- */
+    firn_check( FIRN_SEC_HI, &q31_err, &f32_err );
+    printf( "    correctness vs double reference, ch0 1 frame: f32 err=%e  Q31 err=%e\n",
+            (double)f32_err, (double)q31_err );
+    if( ( f32_err > 1e-4f ) || ( f32_err < -1e-4f ) ||
+        ( q31_err > 1e-4f ) || ( q31_err < -1e-4f ) )
+    {
+        printf( "    NOT TIMED: a kernel does not reproduce the cascade, so any cycle count would\n" );
+        printf( "    be the cost of a wrong answer.\n *an complete\n" );
+        return;
+    }
+
+    /* ---- timing: two section counts per format ---- */
+    firn_prepare( FIRN_SEC_LO, 0 );
+    FIRN_MEASURE( firn_kernel_q31( FIRN_SEC_LO, FIRN_FRAMES ), q_lo );
+    firn_prepare( FIRN_SEC_HI, 0 );
+    FIRN_MEASURE( firn_kernel_q31( FIRN_SEC_HI, FIRN_FRAMES ), q_hi );
+    firn_prepare( FIRN_SEC_LO, 1 );
+    FIRN_MEASURE( firn_kernel_f32( FIRN_SEC_LO, FIRN_FRAMES ), f_lo );
+    firn_prepare( FIRN_SEC_HI, 1 );
+    FIRN_MEASURE( firn_kernel_f32( FIRN_SEC_HI, FIRN_FRAMES ), f_hi );
+
+    /* ---- report ---- */
+    static const char* const names[2] = { "Q31 (primary)", "float32 (comparison)" };
+    const firn_stats_t* lo_all[2] = { &q_lo, &f_lo };
+    const firn_stats_t* hi_all[2] = { &q_hi, &f_hi };
+
+    for( uint32_t v = 0u; v < 2u; v++ )
+    {
+        const firn_stats_t* lo = lo_all[v];
+        const firn_stats_t* hi = hi_all[v];
+        const uint32_t lo_min  = ( lo->min_t > ovh.min_t ) ? ( lo->min_t - ovh.min_t ) : 0u;
+        const uint32_t hi_min  = ( hi->min_t > ovh.min_t ) ? ( hi->min_t - ovh.min_t ) : 0u;
+        const uint32_t hi_mean = ( firn_mean( hi ) > ovh.min_t )
+                                 ? ( firn_mean( hi ) - ovh.min_t ) : 0u;
+        const uint32_t hi_max  = ( hi->max_t > ovh.min_t ) ? ( hi->max_t - ovh.min_t ) : 0u;
+
+        printf( "    %s\n", names[v] );
+        printf( "      K=%lu  block ticks min/mean/max=%lu/%lu/%lu -> cycles %lu/%lu/%lu\n",
+                (unsigned long)FIRN_SEC_HI, (unsigned long)hi_min, (unsigned long)hi_mean,
+                (unsigned long)hi_max, (unsigned long)( hi_min * FIRB_CYC_PER_TICK ),
+                (unsigned long)( hi_mean * FIRB_CYC_PER_TICK ),
+                (unsigned long)( hi_max * FIRB_CYC_PER_TICK ) );
+        printf( "      K=%lu  block ticks min=%lu -> cycles %lu\n",
+                (unsigned long)FIRN_SEC_LO, (unsigned long)lo_min,
+                (unsigned long)( lo_min * FIRB_CYC_PER_TICK ) );
+
+        /* slope: marginal cost of one section for one channel for one output sample */
+        firn_print_x1000( "cycles/section (slope)",
+                          firn_per_x1000( hi_min - lo_min,
+                                          ( FIRN_SEC_HI - FIRN_SEC_LO ) * FIRN_FRAMES * FIRN_CH ),
+                          "cycles" );
+        /* absolute, K=16, includes all per-frame fixed work -- the budget figure */
+        firn_print_x1000( "cycles/32k output/ch (abs)",
+                          firn_per_x1000( hi_min, FIRN_FRAMES * FIRN_CH ), "cycles" );
+        firn_print_x1000( "cycles/16ch output (abs)",
+                          firn_per_x1000( hi_min, FIRN_FRAMES ), "cycles" );
+        firn_print_x1000( "us per 16-frame block",
+                          ( hi_min * FIRB_CYC_PER_TICK * 1000u ) / ( PLL1_CLK_HZ / 1000000UL ),
+                          "us" );
+    }
+
+    firn_part2( trials, ovh.min_t );
+
+    printf( " *an complete sink=%ld\n", (long)firn_sink );
+}
 #endif /* ASRC_FIR_KERNEL_BENCH_AVAILABLE */

@@ -4,7 +4,7 @@
 Answers the question the 12 kHz listening test raised: the D2/D4 work fixed 8 kHz and
 11.025 kHz, but the routing gate in src/app/apps/asrc/asrc_audio_path.c has rows for those two
 rates ONLY, so every other rate runs `fe=direct` -- the resampler alone, whose cutoff is a
-fixed ASRC_POLY_FC = 0.465 of its INPUT rate (22.32 kHz for a 48 kHz input) regardless of how
+fixed ASRC_POLY_FC = 0.464 of its INPUT rate (22.272 kHz for a 48 kHz input) regardless of how
 low the output Nyquist is.  This script prices the whole set on one axis.
 
 Three questions per rate:
@@ -48,7 +48,7 @@ chk = _load("chk", "tools/asrc/asrc_headroom_filter_check.py")
 dsg = _load("dsg", "tools/asrc/asrc_decimator_48_to_8_design.py")
 
 L = chk.L
-SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11, fc = 0.465, the shipping resampler
+SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11.3, fc = 0.464, the shipping resampler
 IN_HZ = 48000.0
 LIMIT = -105.0                       # scan target; the release gate itself is -100 dB
 US_PER_UNIT = 51.5 / 48.0            # measured: /3 = 48.0 cost units = 51.5 us of cbA
@@ -191,7 +191,7 @@ def scan(den, passband, out_nyq):
 
 
 print("=" * 108)
-print("1. WHAT HAPPENS NOW  (fe=direct: resampler only, its cutoff fixed at 0.465*48000 = 22320 Hz)")
+print("1. WHAT HAPPENS NOW  (fe=direct: resampler only, its cutoff fixed at 0.464*48000 = 22272 Hz)")
 print("=" * 108)
 print(f"{'rate':>7} {'Nyquist':>9} {'fold source band':>19} {'lands at':>14} {'worst alias':>12}  audibility")
 for name, fs, _den in RATES:
@@ -237,7 +237,7 @@ print()
 print("=" * 108)
 print("3. 32 kHz / 44.1 kHz: no integer front end.  Two other levers, priced.")
 print("=" * 108)
-print("(a) Scale ASRC_POLY_FC with the ratio -- fc = 0.465 * (target / 48000).  Costs NOTHING:")
+print("(a) Scale ASRC_POLY_FC with the ratio -- fc = 0.464 * (target / 48000).  Costs NOTHING:")
 print("    the phase rows are generated at init, so this is a different constant in the same")
 print("    30-tap loop.  It was rejected for 8 kHz because a 30-tap prototype's transition width")
 print("    is fixed in NORMALIZED terms, so at a deep ratio it lands far inside the band.  At a")

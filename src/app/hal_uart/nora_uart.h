@@ -224,6 +224,16 @@ typedef struct {
     uint32_t rx_stall_recovery_count;
     uint32_t rx_ie_lost_count;
     uint32_t rx_overrun_recovered_count;
+
+    /*
+     * Combined "this byte stream can no longer be fully trusted" counter --
+     * incremented on ring overflow, RX FIFO overflow, a framing error, or a
+     * parity error. See nora_uart_rx_integrity_fault_count() for why a caller
+     * wants this over the four separate counters: a framing or parity error
+     * does not drop a byte, it delivers a WRONG one, so watching only the drop
+     * counters (ring/FIFO overflow) misses it.
+     */
+    uint32_t rx_integrity_fault_count;
 } nora_uart_rx_status_t;
 
 /* ========================================================================== */
@@ -286,6 +296,35 @@ void nora_uart_rx_flush(
 nora_uart_status_t nora_uart_rx_status_get(
     nora_uart_instance_t inst,
     nora_uart_rx_status_t *status);
+
+/*
+ * Ring-overflow counter on its own: "have any received bytes been dropped".
+ *
+ * For a caller polling one number while a bulk transfer is in flight, where
+ * copying the whole counter set every pass is more work than the question
+ * deserves. One 32-bit load.
+ *
+ * Returns 0 in polling mode (no ring, so no ring overflow) and for an
+ * uninitialized or absent instance -- a counter, not a status code, because
+ * every failure means the same thing here: nothing has been dropped.
+ */
+uint32_t nora_uart_rx_ring_overflow_count(
+    nora_uart_instance_t inst);
+
+/*
+ * Combined RX byte-stream integrity fault count on its own -- one 32-bit load,
+ * for a caller that wants "can I still trust every byte since I last checked"
+ * without four separate reads or a masked snapshot of the whole struct.
+ *
+ * A framing/parity error is NOT a dropped byte -- the byte still lands in the
+ * ring, with a value the UART cannot vouch for -- so this catches a class of
+ * silent data corruption that watching only rx_ring_overflow_count misses.
+ *
+ * Returns 0 in polling mode (no ISR ring, so nothing is tracked here) and for
+ * an uninitialized or absent instance.
+ */
+uint32_t nora_uart_rx_integrity_fault_count(
+    nora_uart_instance_t inst);
 
 nora_uart_status_t nora_uart_rx_status_clear(
     nora_uart_instance_t inst);

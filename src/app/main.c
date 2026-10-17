@@ -15,6 +15,9 @@
 #include "board/clock/sonora_clock.h"
 #include "nora_clock.h"
 #include "nora_gpio.h"
+#if PWM_AUDIO_SCOPE_ONLY
+#include "board/audio/mpq6612a_board.h"
+#endif
 #include "nora_pps.h"
 #include "nora_uart.h"
 #include "timer_app.h"
@@ -480,6 +483,10 @@ int main(void)
     app_traps_boot_prepare( nora_reset_snapshot_is_power_on_class() );
 
     init_ports();
+#if PWM_AUDIO_SCOPE_ONLY
+    // Before clock/codec setup; pre-firmware/reset pin levels require a PCB pull-down.
+    nora_gpio_rp_config_digital_output(MPQ6612A_SLEEP_RP, false);
+#endif
 
     resident_de_app_handoff_mark('P');
 
@@ -794,7 +801,9 @@ int main(void)
         dbg_print();
         sonora_app_debug_print();
 #if SONORA_APP_IS_CLASSIC
-        dbg_RGB_pot();
+        // A latched codec-B wiring stop owns the RGB LED (its red/green fault blink, serviced by
+        // audio_transport_dbg_print()); the POT colour would overwrite it on every loop.
+        if( !audio_transport_codec_b_missing_stop_active() ) { dbg_RGB_pot(); }
         POT_Process();
 #endif
     }
@@ -893,20 +902,29 @@ static void boot_banner_hold_if_requested(void)
     {
         return;
     }
+#if !APP_BOOT_BANNER_HOLD_ALWAYS
     // The button is the mode selector: held at power-on => banner-hold mode; not
     // held => fast boot (the early printMenu() already ran once for warm/connected).
+    // APP_BOOT_BANNER_HOLD_ALWAYS removes this gate for a verification image, where
+    // nobody is free to hold a button through repeated power cycles.
     if( !BUTTON_IsPressed( APP_BOOT_BANNER_HOLD_BUTTON ) )
     {
         return;
     }
+#endif
 
     const uint32_t repeats =
         ( (uint32_t)APP_BOOT_BANNER_HOLD_SECONDS * 1000u ) /
         (uint32_t)APP_BOOT_BANNER_HOLD_REPEAT_MS;
 
+#if APP_BOOT_BANNER_HOLD_ALWAYS
+    printf(" [boot-banner hold: every power-on (no button) -- re-printing banner for %u s]\n",
+           (unsigned)APP_BOOT_BANNER_HOLD_SECONDS);
+#else
     printf(" [boot-banner hold: button %u held at power-on -- re-printing banner for %u s]\n",
            (unsigned)APP_BOOT_BANNER_HOLD_BUTTON,
            (unsigned)APP_BOOT_BANNER_HOLD_SECONDS);
+#endif
 
     for( uint32_t i = 0u; i < repeats; ++i )
     {

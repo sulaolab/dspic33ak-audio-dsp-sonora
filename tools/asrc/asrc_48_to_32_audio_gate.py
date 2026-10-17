@@ -57,7 +57,7 @@ chk = _load("chk", "tools/asrc/asrc_headroom_filter_check.py")
 dsg = _load("dsg", "tools/asrc/asrc_decimator_48_to_8_design.py")
 
 L_REAR = chk.L                       # 128 resampler phases
-SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11: 30 taps, fc 0.465 of ITS input rate
+SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11.3: 30 taps, fc 0.464 of ITS input rate
 IN_HZ = 48000.0
 OUT_HZ = 32000.0
 OUT_NYQ = 16000.0

@@ -65,7 +65,11 @@ typedef struct
 extern void   app_gain_init( uint32_t sample_rate_Hz );
 extern void   app_gain_process( float* p_in, float* p_out );
 extern void   app_gain_set( uint8_t vol_step );
+/* Requests are applied at the next audio block boundary. */
 extern void   app_mute_set( bool mute, int rampTime_ms );
+extern bool   app_mute_toggle( int rampTime_ms );
+extern bool   app_mute_requested( void );
+extern void   app_mute_print( void );
 
 extern void   mute_set( audiogain_t* pgain, int mute_on, int rampTime_ms );
 extern void   gain_set( audiogain_t* pgain, uint8_t vol_step, int rampTime_ms );

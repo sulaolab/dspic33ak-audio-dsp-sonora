@@ -78,6 +78,8 @@ static int      s_snap_mode = 0;
 static int32_t  s_snap_req  = 0;
 static float    s_snap_ppm  = 0.0f;
 static uint32_t s_snap_fill = 0u;
+static uint32_t s_snap_fill_pull_start = 0u;
+static uint32_t s_snap_fill_target = 0u;
 static uint32_t s_snap_age_pulls = 0u;                       // R16: freeze-age of the captured window
 static float    s_snap_ff_live = 0.0f, s_snap_ff_frozen = 0.0f;
 
@@ -88,7 +90,10 @@ static int32_t  s_cap[APP_MEAS_CAP_LEN];          // captured output L (24-bit s
 static uint32_t s_cap_idx    = 0u;
 static uint32_t s_discard    = 0u;                // output frames still to skip (start transient)
 static uint8_t  s_capturing  = 0u;
-static uint8_t  s_ready      = 0u;
+static volatile uint8_t s_ready = 0u;
+/* Completion is detected in the audio ISR, but UART output belongs to the
+ * main loop. One bit makes the notification exactly once per *ac arm. */
+static uint8_t  s_capture_reported = 0u;
 
 #if APP_ASRC_48K_TO_8_DECIMATOR
 static const uint16_t s_decim_tone_hz[9] =
@@ -476,6 +481,9 @@ void audio_app_meas_capture( const int32_t* out_block )
 #endif
     if( !s_capturing ) { return; }
     const int32_t* p = out_block;
+#if ASRC_SAMPLE_Q31 && ((APP_MEAS_DIR != MEAS_DIR_BA) || APP_P0K_LOG_BA)
+    const uint32_t cap_idx0 = s_cap_idx;
+#endif
     for( uint16_t n = 0u; n < APP_BLOCK_FRAMES; n++ )
     {
         if( s_discard > 0u ) { s_discard--; p += APP_SLOTS_PER_FS; continue; } // skip start transient
@@ -483,9 +491,16 @@ void audio_app_meas_capture( const int32_t* out_block )
         s_cap[s_cap_idx++] = p[0] >> 8;                // 24-bit L (arithmetic shift keeps sign)
         p += APP_SLOTS_PER_FS;
     }
+#if ASRC_SAMPLE_Q31 && ((APP_MEAS_DIR != MEAS_DIR_BA) || APP_P0K_LOG_BA)
+    /* The pull that produced this block has already been logged, so mark = that pull + 1. */
+    if( cap_idx0 == 0u && s_cap_idx > 0u ) { audio_app_asrc_p0k_capture_first(); }
+#endif
     if( s_cap_idx >= APP_MEAS_CAP_LEN )
     {
         s_capturing = 0u; s_ready = 1u;
+#if ASRC_SAMPLE_Q31 && ((APP_MEAS_DIR != MEAS_DIR_BA) || APP_P0K_LOG_BA)
+        audio_app_asrc_p0k_capture_done();
+#endif
         // Q3: snapshot the perturbation state at CAPTURE-COMPLETE (still perturbed here; the sweep
         // returns to base right after, so the long dump runs at base rate and fill does not drift).
         // Read the engine THIS capture measured. Using the _ab getters unconditionally (as this did
@@ -497,12 +512,16 @@ void audio_app_meas_capture( const int32_t* out_block )
         b.f = audio_app_asrc_get_freeze_base_step_ba();
         a.f = audio_app_asrc_get_freeze_step_ba();
         s_snap_fill      = audio_app_asrc_get_fill_ba();
+        s_snap_fill_pull_start = audio_app_asrc_get_fill_pull_start_ba();
+        s_snap_fill_target = audio_app_asrc_get_fill_target_ba();
         s_snap_ff_live   = audio_app_asrc_get_ratio_live_ba();
         s_snap_ff_frozen = audio_app_asrc_get_ff_frozen_ratio_ba();
 #else
         b.f = audio_app_asrc_get_freeze_base_step_ab();
         a.f = audio_app_asrc_get_freeze_step_ab();
         s_snap_fill      = audio_app_asrc_get_fill_ab();
+        s_snap_fill_pull_start = audio_app_asrc_get_fill_pull_start_ab();
+        s_snap_fill_target = audio_app_asrc_get_fill_target_ab();
         s_snap_ff_live   = audio_app_asrc_get_ratio_live_ab();
         s_snap_ff_frozen = audio_app_asrc_get_ff_frozen_ratio_ab();
 #endif
@@ -531,6 +550,7 @@ void audio_app_meas_capture( const int32_t* out_block )
 
 void audio_app_meas_arm( void )
 {
+    s_capture_reported = 0u;
 #if APP_ASRC_48K_TO_8_DECIMATOR
     (void)asrc_decimator_48_to_8_init( &s_decimator, 2u );
     s_decimator_initialized = 1u;
@@ -551,6 +571,9 @@ void audio_app_meas_arm( void )
     s_cap_idx   = 0u;
     s_ready     = 0u;
     s_discard   = APP_MEAS_DISCARD_FRAMES;              // drop the start transient first
+#if ASRC_SAMPLE_Q31 && ((APP_MEAS_DIR != MEAS_DIR_BA) || APP_P0K_LOG_BA)
+    audio_app_asrc_p0k_capture_arm();
+#endif
     s_capturing = 1u;
     /* Report the ACTUAL tone, derived from the live source rate -- the row's nominal tone_hz was
      * printed here before, which meant a stale or pinned-mismatched row still armed saying
@@ -568,6 +591,23 @@ void audio_app_meas_arm( void )
         meas_warn_if_aliasing( actual, fs_dst );
     }
 #endif
+}
+
+void audio_app_meas_service( void )
+{
+    if( !s_ready || s_capture_reported ) { return; }
+
+#if APP_ASRC_48K_TO_8_DECIMATOR
+    const uint32_t fs_out_hz = 8000u;
+#else
+    uint32_t fs_src_hz = 0u;
+    uint32_t fs_out_hz = 0u;
+    meas_leg_rates( &fs_src_hz, &fs_out_hz );
+    (void)fs_src_hz;
+#endif
+    printf(" *MEAS captured n=%lu fs_out=%lu\n",
+           (unsigned long)APP_MEAS_CAP_LEN, (unsigned long)fs_out_hz );
+    s_capture_reported = 1u;
 }
 
 void audio_app_meas_dump( void )
@@ -610,8 +650,9 @@ void audio_app_meas_dump( void )
            "n=%lu source=table level_dbfs=%d freeze_leg=%s "
            "table_row=%u table_len=%u table_cycles=%u table_nominal_fs_hz=%lu "
            "freeze_base_bits=0x%08lX freeze_applied_bits=0x%08lX "
-           "step_delta_mode=%s step_delta_req=%ld step_delta_ppm_actual=%.4f fill_at_cap=%lu "
-           "q16_age_pulls=%lu q16_ff_live=%.7f q16_ff_frozen=%.7f\n",
+            "step_delta_mode=%s step_delta_req=%ld step_delta_ppm_actual=%.4f fill_at_cap=%lu "
+            "fill_pull_start=%lu fill_target=%lu "
+            "q16_age_pulls=%lu q16_ff_live=%.7f q16_ff_frozen=%.7f\n",
            kname, (unsigned long)tone_actual_hz, (unsigned long)fs_src,
            (unsigned long)fs_src, (unsigned long)fs_dst,
            (unsigned long)APP_MEAS_CAP_LEN, (int)s_tbl->level_dbfs,
@@ -624,8 +665,9 @@ void audio_app_meas_dump( void )
            (unsigned long)s_tbl->nominal_fs_hz,
            (unsigned long)s_snap_base_bits, (unsigned long)s_snap_applied_bits,
            (s_snap_mode==1)?"ULP":(s_snap_mode==2)?"ppm":"base", (long)s_snap_req,
-           (double)s_snap_ppm, (unsigned long)s_snap_fill,
-           (unsigned long)s_snap_age_pulls, (double)s_snap_ff_live, (double)s_snap_ff_frozen );
+            (double)s_snap_ppm, (unsigned long)s_snap_fill,
+            (unsigned long)s_snap_fill_pull_start, (unsigned long)s_snap_fill_target,
+            (unsigned long)s_snap_age_pulls, (double)s_snap_ff_live, (double)s_snap_ff_frozen );
     for( uint32_t i = 0u; i < APP_MEAS_CAP_LEN; i++ )
     {
         printf("%ld\n", (long)s_cap[i] );
@@ -1145,15 +1187,46 @@ void audio_app_meas_set_tone_row( uint8_t row )
     if( row >= (uint8_t)MEAS_TABLE_N_TONES ) { row = MEAS_TONE_ROW_LOW; }
     s_tone_req = MEAS_TONE_REQ_PINNED;
     s_tone_row = row;
+    /* The OTHER order in which a level request stops being honoured: the level was set first and
+     * THIS row carries fewer.  Same note as in audio_app_meas_set_level_idx(), repeated here because
+     * the clamp happens on this call too and the operator's level command was earlier in the
+     * session -- an unexplained -1 dBFS capture is how it would otherwise be noticed. */
+    const uint8_t have = audio_app_meas_table_n_levels( row );
+    if( s_level_idx >= have )
+    {
+        printf(" *MEAS NOTE: row %u carries %u level%s (-1dBFS only, on a fold-image row);"
+               " the pinned level index %u is clamped to 0\n",
+               (unsigned)row, (unsigned)have, ( have == 1u ) ? "" : "s", (unsigned)s_level_idx );
+    }
     meas_reselect();
     meas_print_source( "tone=row" );
 }
 
 // Bench: set the input tone level by INDEX (0=-1, 1=-60, 2=-20, 3=-40, 4=-80, 5=-6 dBFS) -- the
 // *nt2A order. Picks the matching precomputed table (amplitude is baked into the table samples).
+//
+// SOME ROWS CARRY FEWER THAN SIX LEVELS since 2026-09-20.  A fold-image row (the AA_*_FN / _N105 /
+// _N110 / _N095 / _STOP set) is a REJECTION measurement and ships -1 dBFS only, because six levels
+// on those rows cost 223,320 B where one costs 37,220 B.  audio_app_meas_table() clamps such a
+// request to that row's own level 0, and meas_print_source() reads level_dbfs back OUT of the table,
+// so the print is always the level actually served.
+//
+// A SILENT clamp would still be wrong, and this is the failure it prevents: a level sweep scripted
+// over six indices would produce six IDENTICAL captures and read as a flat result rather than as a
+// request the row cannot honour.  So it is said once, here, where the request is made.
 void audio_app_meas_set_level_idx( uint8_t idx )
 {
     if( idx >= (uint8_t)MEAS_TABLE_N_LEVELS ) { idx = 0u; }
+    /* s_tone_row is the row meas_reselect() will resolve to, EXCEPT under HIGH_AUTO, where it is
+     * re-derived from the live leg rate.  Both AUTO rows (HIGH_48, HIGH_96) carry all six levels,
+     * so reading the current row here cannot under-report. */
+    const uint8_t have = audio_app_meas_table_n_levels( s_tone_row );
+    if( idx >= have )
+    {
+        printf(" *MEAS NOTE: row %u carries %u level%s (-1dBFS only, on a fold-image row);"
+               " level index %u is clamped to 0\n",
+               (unsigned)s_tone_row, (unsigned)have, ( have == 1u ) ? "" : "s", (unsigned)idx );
+    }
     s_level_idx = idx;
     meas_reselect();
     meas_print_source( "level" );

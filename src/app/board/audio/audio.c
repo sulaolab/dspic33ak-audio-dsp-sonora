@@ -505,6 +505,42 @@ static bool board_route_mclk( void )
     return true;
 }
 
+// MikroBUS-B pin 3 (RP97/RG0) is WM8904-B's MCLK net, and two things can drive it: CLC3OUT
+// (board_route_mclk, every co-clocked build) and B's own 12.288 MHz XTAL through the board's
+// CODEC-B XTAL-MCLK jumper. Read the pin as an input BEFORE CLC3 is routed and count 0<->1
+// transitions, so a jumper in the wrong state is caught without the two ever contending.
+// Pull-down while sampling, so an undriven pin reads a steady 0 instead of noise.
+// Measured 2026-10-06 (AK512 Classic 1 + B, 1024 samples, direct PORTG read):
+//   jumper FITTED -> 1000 transitions (pull none) / 999 (pull-down), high ~51 %
+//   jumper OPEN   ->    0 transitions in both, high 0
+// Valid only while CLC3OUT does not own RP97 -- the caller probes before the first route.
+bool audio_transport_board_codec_b_pin3_probe( uint32_t *transitions )
+{
+#if (RESOLVED_BOARD_TARGET == RESOLVED_BOARD_TARGET_AK512_VALUE) && RESOLVED_TRANSPORT_LEG_B_PRESENT
+    uint32_t prev;
+    uint32_t cur;
+    uint32_t n = 0u;
+    uint32_t i;
+
+    if( !nora_gpio_rp_config_digital_input( 97u ) ) { return false; }
+    if( !nora_gpio_rp_set_pull( 97u, NORA_GPIO_PULL_DOWN ) ) { return false; }
+    for( i = 0u; i < 2000u; i++ ) { Nop(); }   // let the pull-down settle (~20 us)
+    prev = PORTG & 0x1u;
+    for( i = 0u; i < AUDIO_TRANSPORT_BOARD_PIN3_PROBE_SAMPLES; i++ )
+    {
+        cur = PORTG & 0x1u;
+        n += ( cur ^ prev );
+        prev = cur;
+    }
+    (void)nora_gpio_rp_set_pull( 97u, NORA_GPIO_PULL_NONE );
+    *transitions = n;
+    return true;
+#else
+    (void)transitions;
+    return false;   // AK128: no CLC3 MCLK fan-out on this board, nothing to protect
+#endif
+}
+
 bool audio_transport_board_clc_passthrough( nora_spi_i2s_tdm_clock_role_t role )
 {
     // role selects axis A (BCLK/FS master vs slave) and is consumed by config_pins();

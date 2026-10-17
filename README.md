@@ -23,7 +23,9 @@ cannot drift — the source it builds is hand-written like everything else.)
 **New here? Read [Quick start](#quick-start) and build `Classic 1`.** That is
 the project reference and the one-codec Classic default: one WM8904 on
 MikroBUS-A, one clock domain, and a DSP chain you can hear and switch on and off
-from the console. Everything else in this README is optional depth.
+from the console. AK512 Classic 1 also enables an MPQ6612A PWM output on
+upper XPRO1/J17 by default; see [PWM audio](#pwm-audio) for the optional board
+and how to disable that output.
 
 ## What is in the box
 
@@ -100,7 +102,8 @@ Three facts worth knowing before you debug silence:
     before touching them. Removing them also separates P6 from P67 and P4 from
     P65 as DIM pins, and regroups the platform's I2C features into two buses:
     MikroBUS-A with the I2C-to-USB bridge on one, MikroBUS-B with XPRO1 on the
-    other. This project uses neither XPRO1 nor the I2C-to-USB bridge, so that
+    other. The Classic 1 PWM output uses independent XPRO1 PWM/control nets,
+    not this I2C bus. This project does not use the I2C-to-USB bridge, so that
     regrouping costs it nothing.
 
     With a single WM8904 there is no codec-address collision, so R38/R39 do
@@ -162,26 +165,47 @@ Two notes on the toolchain that save time later:
 .\buildtools\build.ps1              # -Full for a clean rebuild
 ```
 
-**3. Program the board.** Program `resident_bootloader.X`, then
-`dspic33ak_audio_dsp.X`, from MPLAB X over the on-board PKOB4 — in that order.
-**Both halves are required.** They occupy disjoint flash regions on purpose,
-and that separation is what lets a resident bootloader and an application
-coexist; this order is the one verified on hardware. Program only the
-application and the board still boots and plays audio, but there is no serial
-downloader in Flash.
+**Program the board.** The command-line build generates a verified factory
+HEX containing the resident bootloader, application and manifest. Run
+`.\buildtools\flashauto.ps1` to program that ROM image through PKOB4.
+For manual MPLAB X programming, program `resident_bootloader.X`, then
+`dspic33ak_audio_dsp.X`, in that order. Both projects must target the same
+device. Serial-update applications need the resident bootloader to start;
+the application HEX alone is not a complete programmable image.
 See ["IDE-only path"](#ide-only-path-first-boot--learning) below for
 the click-through version, or run `.\buildtools\flashauto.ps1` to do the same
 two-image program-and-reset from the command line.
 
 Then open the PKOB4 CDC port at **230400 8N1**. The banner prints the profile
 and the build, `?` prints the console grammar and module-letter legend, and
-the `Classic 1` chain is running with a co-clocked codec pair: WM8904-A drives
-BCLK/FS and WM8904-B follows it.
+the `Classic 1` chain uses WM8904-A on MikroBUS-A. Dual-codec profiles use a
+co-clocked pair: WM8904-A drives BCLK/FS and WM8904-B follows it.
 
 The selection persists in `buildtools/active_build.json` (untracked), so a bare
 `build.ps1` or `flashauto.ps1` later in the day follows what you chose. Every
 script resolves paths against its own repository, not the current directory, so
 these commands work from anywhere.
+
+### PWM audio
+
+AK512 Classic 1 enables the common PCM-to-PWM HAL and an MPQ6612A board on
+upper XPRO1/J17 through an ATMBUSADAPTER_XPRO adapter. MikroBUS-A remains the
+WM8904 input/output; MikroBUS-B is available for another codec or PWM board.
+The XPRO1 PWM board uses IN1=EXT7, IN2=EXT15, nSLEEP=EXT5, nFAULT=EXT9 and
+VISEN=EXT3. Check the board pin labels and supply before connecting speakers.
+
+The firmware keeps a route asleep when its nFAULT presence check reads Low.
+That includes an absent board or asserted fault; a High result does not prove
+that the power stage supply is present. A missing PWM board reports a PWM
+initialization warning while the WM8904 path remains available.
+
+For a codec-only Classic 1 build, use
+`buildtools/build.ps1 -Define APP_PWM_OUTPUT=0`. To enable both PWM routes,
+use `-Define MPQ6612A_ENABLE_MIKROB=1`: MikroBUS-B carries processed L and
+XPRO1 carries processed R. Each populated route can run independently.
+MikroBUS-B PWM conflicts with WM8904-B, and XPRO1 PWM conflicts with USB
+audio input; incompatible combinations are rejected at compile time.
+AK128, ASRC and other Classic profiles keep PWM audio disabled by default.
 
 ### IDE-only path (first boot / learning)
 
@@ -202,18 +226,10 @@ and flash both halves of a serial-update image:
    design work at all); verified working end to end on AK512/Classic.
 4. Reset the board.
 
-**If you skip the boot image** and program only the application, what you get
-depends on the configuration:
-
-- **A Classic configuration** boots and plays audio, but there is no serial
-  downloader in Flash: the banner reports
-  `Delivery: application ONLY -- resident bootloader ABSENT` and `*fu5A`
-  refuses rather than waiting for a download (observed 2026-09-02). That is the
-  symptom of a skipped step, not a fault.
-- **`dsPIC33AK512_ASRC_SERIAL_UPDATE` does not come up at all.** It places the
-  reset vector inside the first 32 KiB that belongs to the boot image, so its
-  application HEX on its own leaves nothing at the reset target — and the
-  programming operation still reports success.
+**If you skip the boot image**, the current serial-update application is
+incomplete: its reset target belongs to the resident bootloader region.
+Programming the application HEX alone can report success while leaving the
+board unable to start. Use the factory image or program both projects.
 
 This is enough to see the board boot and talk on the console. It is **not**
 how to produce anything you would ship, though: `resident_bootloader.X` is a
@@ -251,18 +267,28 @@ internal ones used for development, comparison and load checks. `-Profile
 
 ### The profiles you are likely to want
 
-Each WM8904 board carries a two-position jumper selecting its MCLK source:
-**XTAL** (the board's own 12.288 MHz crystal drives MCLK — that board is the
-TDM/BCLK master) or **BCLK** (MCLK is derived from elsewhere — that board
-follows). Set both boards' jumpers to match the profile *before* flashing; a
-mismatched jumper is a silent-audio fault, not a build or console error.
+Each WM8904 board carries a jumper selecting its MCLK source: **XTAL** (the
+board's own 12.288 MHz crystal drives MCLK — that board is the TDM/BCLK
+master) or **BCLK** (the board's own BCLK pin is strapped to its MCLK). The
+codec-A board also has **U16 (XTAL OUT)**, which puts A's crystal on the
+MikroBUS `XTAL_OUT` pin. Set both boards' jumpers to match the profile
+*before* flashing; a mismatched jumper is a silent-audio fault, not a build
+error.
+
+In the co-clocked dual-codec Classic profiles WM8904-B takes its MCLK from
+the dsPIC on MikroBUS-B pin 3 (MCLK): A's `XTAL_OUT` when A is the master,
+A's BCLK when the dsPIC is. B's own jumpers are then **all removed** ("none"
+below). On a board revision that wires MikroBUS pin 3 to the codec, fitting
+B's BCLK-MCLK strap shorts B's BCLK to that driven pin and BCLK disappears.
+A missing B MCLK prints a `WM8904-B HAS NO MCLK` banner at boot.
 
 | Profile | Jumper A | Jumper B | What it is |
 | --- | --- | --- | --- |
 | `Classic 1` | XTAL | — (not fitted) | **Start here.** Single codec on MikroBUS-A; WM8904-A drives BCLK/FS. |
-| `Classic 2` | BCLK | BCLK | The same chain with the dsPIC driving BCLK/FS instead — neither codec is its own master. |
-| `Classic DRC` | XTAL | BCLK | Co-clocked dual codec with a DF2T DRC cascade. |
-| `Classic 96k` | XTAL | BCLK | Non-USB 96 kHz, co-clocked dual codec. |
+| `Classic 1` + `APP_REQ_MIKROB_WM8904=1` | XTAL + U16 | none | Classic 1 with WM8904-B co-clocked from A (MCLK = A `XTAL_OUT` on MikroBUS-B pin 3). |
+| `Classic 2` | BCLK | none | The same chain with the dsPIC driving BCLK/FS instead — neither codec is its own master (B's MCLK = A's BCLK on MikroBUS-B pin 3). |
+| `Classic DRC` | XTAL + U16 | none | Co-clocked dual codec with a DF2T DRC cascade. |
+| `Classic 96k` | XTAL + U16 | none | Non-USB 96 kHz, co-clocked dual codec. |
 | `ASRC Codec BI` | XTAL | XTAL | The default, hardware-validated ASRC: WM8904-B is codec master on its own crystal, bidirectional A↔B — the only profile here where both boards run from their own crystals. |
 | `ASRC dsPIC BI` | XTAL | BCLK | The same ASRC with the dsPIC as B's master instead of B's own crystal. |
 
@@ -327,7 +353,7 @@ That is what makes the HALs reusable, and it is checked rather than trusted.
 
 The ASRC path is the load-critical one, and its numbers are hardware
 measurements rather than estimates. The default profile (M30/L128, Kaiser
-β=11, `fc=0.465`) runs 16 independent channel states per direction; a
+β=11.3, `fc=0.464`) runs 16 independent channel states per direction; a
 20-minute soak of the bidirectional 48 kHz case measured 76.6% TDM-active
 occupancy, with the 8 kHz endpoint's worst window at 90.0%, and no misses or
 saturated windows.

@@ -82,6 +82,15 @@ typedef struct
     uint32_t tx_collision_count;
     uint32_t rx_ring_overflow_count;
     uint32_t rx_max_drain_count;
+
+    /*
+     * Combined "this byte stream can no longer be fully trusted" counter.
+     * Incremented once per ISR pass in which ANY of ring overflow, RX FIFO
+     * overflow, a framing error, or a parity error was observed -- see
+     * nora_uart_dspic33ak_rx_isr_integrity_fault_count() below for why a caller
+     * wants this over the four separate counters.
+     */
+    uint32_t rx_integrity_fault_count;
 } nora_uart_dspic33ak_rx_isr_status_t;
 
 /* ========================================================================== */
@@ -133,12 +142,57 @@ nora_uart_status_t nora_uart_dspic33ak_rx_isr_read_byte(
 void nora_uart_dspic33ak_rx_isr_flush(
     nora_uart_instance_t inst);
 
-/* Snapshot the RX ISR ring runtime status counters (atomic vs the ISR). */
+/*
+ * Snapshot the RX ISR ring runtime status counters.
+ *
+ * Per-counter atomic, not set-atomic, and it masks nothing: two counters may be
+ * read microseconds apart. That is deliberate. This used to mask the RX
+ * interrupt to make the whole set one instant, and on a part with an 8-byte RX
+ * FIFO (347 us at 230400 baud) that window is longer than it looks -- a 654 us
+ * audio block ISR preempts it, the FIFO overflows with RX masked, RXFOIF
+ * latches, and reception never comes back because the ISR that clears RXFOIF is
+ * the one that is masked. Nothing links these counters to each other, so the
+ * consistency was worth nothing and the mask cost whole transfers.
+ * Measured on sonora, 2026-09-18.
+ */
 void nora_uart_dspic33ak_rx_isr_status_get(
     nora_uart_instance_t inst,
     nora_uart_dspic33ak_rx_isr_status_t *status);
 
-/* Zero the RX ISR ring runtime status counters (atomic vs the ISR). */
+/*
+ * Ring-overflow counter on its own -- one 32-bit load, for a caller that only
+ * wants to know whether bytes have been dropped and does not want to pay for
+ * the whole struct. Returns 0 for an invalid instance.
+ */
+uint32_t nora_uart_dspic33ak_rx_isr_ring_overflow_count(
+    nora_uart_instance_t inst);
+
+/*
+ * Combined RX byte-stream integrity fault count -- one 32-bit load, for a
+ * caller that wants to know "can I still trust every byte since I last checked"
+ * without four separate reads or a masked snapshot of the whole struct.
+ *
+ * Ring overflow alone under-counts data loss. A framing or parity error does
+ * NOT drop the offending byte: nora_uart_rx_irq_handler() reads RXB and pushes
+ * it to the ring unconditionally, then checks the error flags separately, so a
+ * line-noise byte still lands in the ring -- as a wrong value, not a gap. For
+ * a CSV field, strtod() cannot tell "0.123456" with one corrupted digit from a
+ * clean read; the row count does not move and no marker breaks, so nothing
+ * downstream notices unless it is watching this counter.
+ *
+ * Returns 0 for an invalid instance.
+ */
+uint32_t nora_uart_dspic33ak_rx_isr_integrity_fault_count(
+    nora_uart_instance_t inst);
+
+/*
+ * Zero the RX ISR ring runtime status counters.
+ *
+ * Per-counter atomic, not set-atomic, and it masks nothing (same reasoning as
+ * ..._rx_isr_status_get() above: masking RX to zero a diagnostic counter is what
+ * broke a bulk transfer in the first place). A byte that increments a counter
+ * between two of these stores is not lost -- it just is not zeroed by this call.
+ */
 void nora_uart_dspic33ak_rx_isr_status_clear(
     nora_uart_instance_t inst);
 

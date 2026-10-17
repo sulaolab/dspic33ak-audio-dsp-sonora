@@ -579,6 +579,755 @@ static void dec_q31_stage_set(uint8_t s, uint16_t taps, uint8_t decim,
     dec_q31_load_coeff(coeff_off, coeff, taps);
 }
 
+#if APP_ASRC_THIRDBAND_96_TO_32
+/* "The chain this front end was asked for IS the composed 96 -> 32 kHz one" -- resolved
+ * once here rather than re-tested per block.  Declared above init() because init() fills
+ * it; the third band's own include sits further down, after init(), so that the block path
+ * below can dispatch to it. */
+static uint8_t s_tb32_eligible;
+#endif
+
+/*
+ * THE ARM PROLOGUE -- one definition, so that an entry point cannot be added without it.
+ *
+ * Every front end this file can arm starts from a defined state: the descriptors, wr/phase,
+ * and the WHOLE per-channel history arena, zeroed.  The history matters as much as the
+ * fields do, because the first block after an arm reads a window wider than what has been
+ * pushed into it -- taps - 1 samples of that window are history -- and the third band's
+ * retire path depends on this clear outright, retiring being nothing but arming the composed
+ * chain over the overlay the third band left in the same arena.
+ *
+ * It is here, and NOT inside dec_q31_stage_set(), because it is a property of ARMING A CHAIN
+ * rather than of configuring a stage.  A cascade calls stage_set once per stage over regions
+ * of one arena, and the two phase ROWS of the 2/3 chain share a single ring; per-stage
+ * clearing would re-clear shared regions and make the arm's cost depend on how the stages
+ * were split.  Cost is not the point either way -- this runs at arm time, off the audio path
+ * -- but where the invariant belongs is.
+ */
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+/*
+ * PER-STAGE output frame counters -- the composed chain's version of `fe exec:`.
+ *
+ * `fe exec:` counts blocks the FRONT END ran, which for a single-stage chain is also "the filter
+ * ran".  A composition of two stages can run its first and skip its second in exactly the way
+ * the ISR gate skipped the whole 1:1 stage on 2026-09-14 while `fe=lp1` kept printing, and one
+ * front-end counter cannot tell those apart.  So the evidence is per stage, and it is FRAMES
+ * PRODUCED rather than calls: a /2 first stage and a 1:1 second stage must report the SAME
+ * number, and either reading 0 says which half never ran.
+ *
+ * Under the prototype gate: this is measurement, and measurement is opt-in.  One 32-bit add per
+ * stage per block, off the MAC loop.
+ */
+static uint32_t s_dq31_stage_out[DEC_Q31_MAX_STAGES];
+
+uint32_t asrc_decimator_q31_stage_output_frames(uint8_t stage)
+{
+    return (stage < (uint8_t)DEC_Q31_MAX_STAGES) ? s_dq31_stage_out[stage] : 0u;
+}
+#endif
+
+static void dec_q31_arm_begin(uint8_t channels)
+{
+    memset(&s_q31, 0, sizeof(s_q31));
+    memset(s_q31_hist, 0, sizeof(s_q31_hist));
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+    /* Restart with the chain, for the reason the front-end run counters restart: a count carried
+     * across an arm would let the PREVIOUS chain's stages satisfy a check about this one. */
+    memset(s_dq31_stage_out, 0, sizeof(s_dq31_stage_out));
+#endif
+    s_q31.channels = channels;
+#if APP_ASRC_THIRDBAND_96_TO_32
+    s_tb32_eligible = 0u;
+#endif
+}
+
+/*
+ * THE ARM INVARIANT, MEASURED ON THE PATH THAT ACTUALLY ARMS.
+ *
+ * The boot selftests already prove that a missing clear is DETECTABLE: with the arena memset
+ * above removed, the divider check fails on its first pass (`/2 case 1 live 1 blk 0 out 0 ch 0
+ * got 1073739520 want 0`, measured 2026-09-14).  What they cannot prove is that the RUNTIME
+ * path leaves a zero history, because they call the init entry points directly, whereas a
+ * console `*ar` rate change arms through audio_transport's reset_stream_state() ->
+ * asrc_transport_reset() -> asrc_audio_path_reset() -> path_decimator_init().  This function is
+ * how that path states the invariant as a number instead of an inspection: the caller runs it
+ * where it publishes the chain as ready, which is the moment the claim is about.
+ *
+ * Cost is one pass over the arena (ASRC_DEC_Q31_CH * DEC_Q31_HIST_PER_CH words) at arm time --
+ * transport stopped, codec muted, nothing waiting on it.  Nothing on the audio path calls this.
+ */
+uint16_t asrc_decimator_q31_history_nonzero_words(void)
+{
+    const int32_t* const p = &s_q31_hist[0][0];
+    const uint32_t       n = (uint32_t)(sizeof(s_q31_hist) / sizeof(int32_t));
+    uint16_t             dirty = 0u;
+    for (uint32_t i = 0u; i < n; ++i)
+    {
+        if (p[i] != 0) { ++dirty; }
+    }
+    return dirty;
+}
+
+#if APP_ASRC_FRONTEND_SELFTEST
+/*
+ * THE DETECTOR PROVES ITSELF, then proves the clear -- in four steps, because each of them is a
+ * different way for this check to be worthless: an arena that was already empty (nothing was
+ * cleared), a scan that cannot see a dirty arena, a scan hardwired to 0 (indistinguishable from a
+ * clean arm in a log), and a clear that leaves the poke behind.
+ *
+ * BOOT ONLY, like every other check in this family: it writes the live arena, so running it
+ * while a chain is armed would race the block ISR (the 1:1 check's header records what that
+ * costs).  It leaves the arena zeroed and the descriptors cleared -- the caller's chain
+ * selection re-arms immediately afterwards.
+ */
+static void dec_q31_arm_clear_poke(void)
+{
+    /* Both ENDS of the arena: a scan that walked the first channel only would pass a single
+     * poke at index 0. */
+    s_q31_hist[0][0] = (int32_t)0x7FFFFFFF;
+    s_q31_hist[(uint8_t)ASRC_DEC_Q31_CH - 1u][DEC_Q31_HIST_PER_CH - 1u] = (int32_t)-1;
+}
+
+bool asrc_decimator_q31_arm_clear_selftest(uint16_t* out_seen)
+{
+    /* STEP 1 -- there is something to clear, and the scan sees it.
+     *
+     * The arena is genuinely dirty when this runs: the checks before it drove the real front end,
+     * so a real history is sitting in it (1,023 words, measured 2026-09-14 -- the first version of
+     * this function assumed an empty arena, poked two words, and was told `seen 1025`, which is
+     * the detector catching the test author).  Real leftover history is a better dirty input than
+     * a synthetic poke, so it is used as one; if a future reordering leaves the arena empty here,
+     * poke instead rather than fail, because an ordering change is not a defect in the arm. */
+    uint16_t before = asrc_decimator_q31_history_nonzero_words();
+    if (before == 0u)
+    {
+        dec_q31_arm_clear_poke();
+        before = asrc_decimator_q31_history_nonzero_words();
+        if (before != 2u) { if (out_seen != NULL) { *out_seen = before; } return false; }
+    }
+    if (out_seen != NULL) { *out_seen = before; }
+
+    /* STEP 2 -- an arm clears it.  This is the property the whole exercise is about. */
+    dec_q31_arm_begin((uint8_t)ASRC_DEC_Q31_CH);
+    if (asrc_decimator_q31_history_nonzero_words() != 0u) { return false; }
+
+    /* STEP 3 -- the scan COUNTS, rather than merely returning 0.  Without this step a checker
+     * hardwired to 0 and a clean arm are the same line in a log. */
+    dec_q31_arm_clear_poke();
+    if (asrc_decimator_q31_history_nonzero_words() != 2u) { return false; }
+
+    /* STEP 4 -- and it clears the poke too, so the caller is handed the state it expects. */
+    dec_q31_arm_begin((uint8_t)ASRC_DEC_Q31_CH);
+    return (asrc_decimator_q31_history_nonzero_words() == 0u);
+}
+#endif
+
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+#include "asrc_lpf1to1_coeffs.inc"
+
+/*
+ * A 1:1 STAGE, and why it needs no new kernel.
+ *
+ * `decim` is a plain runtime field of dec_q31_stage_t.  dec_q31_stage_run() uses it as
+ *   need   = decim - phase          -> 1, so the "absorb without producing" branch is dead
+ *   b      = 1 + (avail - need)/decim -> avail, i.e. one output per input frame
+ *   span   = taps + (b-1)*decim
+ *   bmax   = 1 + (ring - taps)/decim
+ * and the assembler kernel receives it only as `decim_bytes` (w5) in
+ *   add.l  w10, w5, w10
+ * followed by the manual ring fold.  decim == 1 is therefore an ordinary value of the same
+ * arithmetic, not a special case: nothing anywhere divides by (decim - 1), tests decim >= 2, or
+ * assumes the phase ever advances.  Phase stays 0 across blocks, which is correct -- a 1:1 stage
+ * has no decimation phase to carry.  Continuity comes from the ring and wr[], exactly as it does
+ * for every other stage.
+ *
+ * WHAT IS NEW is not arithmetic but ROUTING and SIZING: asrc_decimator_q31_init() refuses
+ * den == 1 (rightly -- the pre-stage's shared set alone protects nothing between 24 and 48 kHz),
+ * and the caller's output scratch was sized for the smallest ratio being 1/2.  So this is a
+ * separate entry point rather than a new `den` case: it shares every line of the run path and
+ * none of the divider dispatch.
+ *
+ * `s_q31.num` MUST stay 1.  process() dispatches the rational chain on
+ * `num == ASRC_DECIMATOR_48_TO_32_L`, and with num == 1 and stages == 1 this falls into the
+ * single-stage arm, which is the generic one that already does exactly the right thing --
+ * including `last = true`, so the s24-left mask is applied on the way out.
+ */
+bool asrc_decimator_q31_init_lpf1to1(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                     uint8_t channels)
+{
+    if ((channels == 0u) || (channels > ASRC_DEC_Q31_CH))
+    {
+        return false;
+    }
+
+    uint16_t     taps  = 0u;
+    const float *coeff = NULL;
+
+    /* One coefficient set per (source rate, output rate) pair, selected by BOTH -- the source
+     * rate alone cannot choose, because the stopband edge is Fs_out - Fp and Fp is derived from
+     * Fs_out.  A pair with no set is refused here rather than served by a neighbour's band
+     * edges, which is the failure the /4 :11k vs :12k tag exists to make visible. */
+    if ((in_rate_hz == 32000u) && (out_rate_hz == 16000u))
+    {
+        taps  = ASRC_LP1_32K_TO_16K_TAPS;
+        coeff = s_lp1_32k_to_16k_coeff;
+    }
+    else if ((in_rate_hz == 22050u) && (out_rate_hz == 16000u))
+    {
+        taps  = ASRC_LP1_22K05_TO_16K_TAPS;
+        coeff = s_lp1_22k05_to_16k_coeff;
+    }
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+#define ASRC_ANTIALIAS_DIRECT_1TO1_ARM(FS_IN, FS_OUT, TAPS, COEFF, TAG) \
+    else if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT)))      \
+    {                                                                   \
+        taps  = (TAPS);                                                 \
+        coeff = (COEFF);                                                \
+    }
+    ASRC_ANTIALIAS_DIRECT_1TO1_ROWS(ASRC_ANTIALIAS_DIRECT_1TO1_ARM)
+#undef ASRC_ANTIALIAS_DIRECT_1TO1_ARM
+#endif
+#if APP_ASRC_UNIVERSAL_PROFILE
+    /* THE UNIVERSAL PROFILE'S 1:1-ONLY ROWS, expanded from the one list (see
+     * ASRC_UNIVERSAL_1TO1_ROWS in asrc_decimator_48_to_8.h).  Four rows where the image has a
+     * 96 kHz leg, three where it has not -- the count _Static_asserts below name both.  The pairs
+     * are those whose uniform
+     * fold edge is already above the SOURCE Nyquist's protected band, so nothing has to be
+     * decimated first and the whole front end is one band-limit at the source rate.
+     *
+     * ADDED AS AN ARM OF THIS SAME CHAIN, not as a fourth entry point: the rows differ from the
+     * three above only in which (source, output) pair selects them.  96 kHz is a new SOURCE rate
+     * for a 1:1 stage, and that is a routing fact (see the pre-stage note in
+     * path_decimator_init()), not an arithmetic one -- the ring, the batch and the kernel are
+     * sized from the block and the taps, neither of which knows the rate. */
+#define ASRC_UNIVERSAL_1TO1_ARM(FS_IN, FS_OUT, TAPS, COEFF, TAG)  \
+    else if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT))) \
+    {                                                              \
+        taps  = (TAPS);                                            \
+        coeff = (COEFF);                                           \
+    }
+    ASRC_UNIVERSAL_1TO1_ROWS(ASRC_UNIVERSAL_1TO1_ARM)
+#undef ASRC_UNIVERSAL_1TO1_ARM
+#endif
+    else
+    {
+        return false;
+    }
+
+    /* The ring has to hold the window of the LAST output of a full batch: taps + (b-1)*1.  b is
+     * capped by DEC_Q31_MAX_BATCH, so this is the largest window any call can ask for.  Checked
+     * at runtime as well as by the static asserts below, because the tap counts come from a
+     * generated include and a regenerated table must fail closed, not overrun the arena. */
+    const uint16_t ring = (uint16_t)(taps + (DEC_Q31_MAX_BATCH - 1u));
+    if (ring > DEC_Q31_SECOND_ARENA)
+    {
+        return false;
+    }
+    if (taps > DEC_Q31_COEFF_MAX)
+    {
+        return false;
+    }
+
+    /*
+     * THE SHARED ARM PROLOGUE, and the correction of what this entry point first said about it.
+     *
+     * The first version of this arm hand-rolled a subset: the s_q31 fields it knew about, plus
+     * a loop zeroing [0, ring) of each channel's history.  That is exactly the window the
+     * stage reads, so it was correct -- but correct by inspection, and written on a diagnosis
+     * that was wrong.  The selftest's got = 161359360 against want = 0 was NOT evidence that
+     * "arming does not clear the ring" is a general property of this front end: every other
+     * arm path in the ASRC front end has always cleared its own state -- init() zeroes the
+     * descriptors and the WHOLE arena for every divider, rational and composed chain, the
+     * third band's arm zeroes its overlay, the float front end memsets its state struct, and
+     * asrc_reset() zeroes the rear engine's FIFO.  What was missing was one entry point
+     * standing outside the prologue.  It is now inside it, so a 1:1 chain that later needs a
+     * ring_off other than 0, or a second stage, cannot re-open the hole.
+     *
+     * ring_off 0 is the 48 kHz chains' arena base, free here by construction: a 1:1 chain has
+     * no pre-stage and no second stage, so nothing else is using the arena.
+     */
+    dec_q31_arm_begin(channels);
+    s_q31.num    = 1u;
+    s_q31.den    = 1u;
+    s_q31.stages = 1u;
+    dec_q31_stage_set(0u, taps, 1u, ring, 0u, 0u, coeff);
+    return true;
+}
+
+_Static_assert((ASRC_LP1_32K_TO_16K_TAPS + DEC_Q31_MAX_BATCH - 1u) <= DEC_Q31_SECOND_ARENA,
+               "32 kHz 1:1 LPF ring does not fit the 48 kHz chains' arena");
+_Static_assert((ASRC_LP1_22K05_TO_16K_TAPS + DEC_Q31_MAX_BATCH - 1u) <= DEC_Q31_SECOND_ARENA,
+               "22.05 kHz 1:1 LPF ring does not fit the 48 kHz chains' arena");
+_Static_assert((ASRC_LP1_16K_TO_11K025_TAPS + DEC_Q31_MAX_BATCH - 1u) <= DEC_Q31_SECOND_ARENA,
+               "16 kHz 1:1 LPF ring does not fit the 48 kHz chains' arena");
+_Static_assert(ASRC_LP1_32K_TO_16K_TAPS <= DEC_Q31_COEFF_MAX, "1:1 LPF coefficient arena");
+
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+#define ASRC_ANTIALIAS_DIRECT_1TO1_ASSERT(FS_IN, FS_OUT, TAPS, COEFF, TAG)        \
+    _Static_assert(((TAPS) + DEC_Q31_MAX_BATCH - 1u) <= DEC_Q31_SECOND_ARENA,   \
+                   "direct anti-alias 1:1 row " TAG ": ring does not fit");   \
+    _Static_assert((TAPS) <= DEC_Q31_COEFF_MAX,                                 \
+                   "direct anti-alias 1:1 row " TAG ": coefficient arena");
+ASRC_ANTIALIAS_DIRECT_1TO1_ROWS(ASRC_ANTIALIAS_DIRECT_1TO1_ASSERT)
+#undef ASRC_ANTIALIAS_DIRECT_1TO1_ASSERT
+
+/* The DIRECT5 composed rows: the four inequalities the composed arm applies at runtime, derived from
+ * the block as for the Universal rows -- two of them decimate by 3 (out0 = 6, not 8). */
+#define ASRC_DIRECT5_OUT0(DECIM)  (((uint16_t)APP_BLOCK_FRAMES + ((DECIM) - 1u)) / (DECIM))
+#define ASRC_ANTIALIAS_DIRECT5_COMPOSED_ASSERT(FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG) \
+    _Static_assert((DEN) == (DECIM),                                                          \
+                   "direct composed row " TAG ": published ratio and decimation disagree");   \
+    _Static_assert(ASRC_DIRECT5_OUT0(DECIM) <= DEC_Q31_MAX_MID,                               \
+                   "direct composed row " TAG ": stage-0 output does not fit");               \
+    _Static_assert(ASRC_DIRECT5_OUT0(DECIM) <= DEC_Q31_MAX_BATCH,                             \
+                   "direct composed row " TAG ": stage 0 cannot clear a block in one call");  \
+    _Static_assert(((TAPS0) + ((ASRC_DIRECT5_OUT0(DECIM) - 1u) * (DECIM))                     \
+                    + (TAPS1) + (ASRC_DIRECT5_OUT0(DECIM) - 1u)) <= DEC_Q31_SECOND_ARENA,     \
+                   "direct composed row " TAG ": the two rings do not fit the arena");         \
+    _Static_assert(((TAPS0) + (TAPS1)) <= DEC_Q31_COEFF_MAX,                                  \
+                   "direct composed row " TAG ": coefficient arena");
+ASRC_ANTIALIAS_DIRECT5_COMPOSED_ROWS(ASRC_ANTIALIAS_DIRECT5_COMPOSED_ASSERT)
+#undef ASRC_ANTIALIAS_DIRECT5_COMPOSED_ASSERT
+#undef ASRC_DIRECT5_OUT0
+
+const char* asrc_antialias_direct_1to1_tag(uint32_t out_rate_hz, uint32_t in_rate_hz)
+{
+#define ASRC_ANTIALIAS_DIRECT_1TO1_TAG(FS_IN, FS_OUT, TAPS, COEFF, TAG) \
+    if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT))) { return (TAG); }
+    ASRC_ANTIALIAS_DIRECT_1TO1_ROWS(ASRC_ANTIALIAS_DIRECT_1TO1_TAG)
+#undef ASRC_ANTIALIAS_DIRECT_1TO1_TAG
+    return NULL;
+}
+
+const char* asrc_antialias_direct_composed_tag(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                               uint32_t den)
+{
+#define ASRC_ANTIALIAS_DIRECT5_COMPOSED_TAG(FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG) \
+    if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT)) && (den == (DEN))) { return (TAG); }
+    ASRC_ANTIALIAS_DIRECT5_COMPOSED_ROWS(ASRC_ANTIALIAS_DIRECT5_COMPOSED_TAG)
+#undef ASRC_ANTIALIAS_DIRECT5_COMPOSED_TAG
+    (void)out_rate_hz; (void)in_rate_hz; (void)den;
+    return NULL;
+}
+#endif
+
+#if APP_ASRC_UNIVERSAL_PROFILE
+/* EVERY Universal 1:1 row, at compile time, from the same list the arm above expands.  The
+ * runtime checks in the arm stay -- they are what makes a regenerated table fail CLOSED on a
+ * bench build -- but a row that cannot fit must break the BUILD, and a row ADDED to the list gets
+ * its assert automatically rather than by someone remembering to write one. */
+#define ASRC_UNIVERSAL_1TO1_ASSERT(FS_IN, FS_OUT, TAPS, COEFF, TAG)               \
+    _Static_assert(((TAPS) + DEC_Q31_MAX_BATCH - 1u) <= DEC_Q31_SECOND_ARENA,     \
+                   "Universal 1:1 row " TAG ": ring does not fit the arena");     \
+    _Static_assert((TAPS) <= DEC_Q31_COEFF_MAX,                                   \
+                   "Universal 1:1 row " TAG ": coefficient arena");
+ASRC_UNIVERSAL_1TO1_ROWS(ASRC_UNIVERSAL_1TO1_ASSERT)
+#undef ASRC_UNIVERSAL_1TO1_ASSERT
+
+const char* asrc_universal_1to1_tag(uint32_t out_rate_hz, uint32_t in_rate_hz)
+{
+#define ASRC_UNIVERSAL_1TO1_TAG(FS_IN, FS_OUT, TAPS, COEFF, TAG)  \
+    if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT))) { return (TAG); }
+    ASRC_UNIVERSAL_1TO1_ROWS(ASRC_UNIVERSAL_1TO1_TAG)
+#undef ASRC_UNIVERSAL_1TO1_TAG
+    return NULL;
+}
+#endif /* APP_ASRC_UNIVERSAL_PROFILE */
+
+/*
+ * A COMPOSED chain: an integer decimating stage, then the 1:1 band-limit at the intermediate
+ * rate.  44.1 -> /2 -> 22.05 kHz -> 1:1 -> rear ASRC at step 1.378125.
+ *
+ * WHY THIS IS NOT A NEW KERNEL, A NEW CASCADE, OR EVEN A NEW SHAPE.  The generic integer cascade
+ * in dec_q31_process() already runs N stages, writes the intermediates through dec_q31_mid_buf()
+ * and applies the s24-left mask on the last one; /4, /6 and /12 are exactly this with two
+ * decimating stages.  All that is new is that the LAST stage has decim == 1 -- an ordinary value
+ * of the same arithmetic (see the header of asrc_decimator_q31_init_lpf1to1()).  So this entry
+ * point only SELECTS coefficients and lays out the arena; it adds no branch to the block path.
+ *
+ * WHY IT IS A THIRD ENTRY POINT rather than a `den == 2` case of asrc_decimator_q31_init():
+ * that function's /2 case is the SHIPPED 48 kHz chain, whose set is chosen by a variant enum and
+ * whose ring spends the whole arena.  This chain shares neither: its coefficients are generated
+ * against the composition (asrc_lpf1to1_design.py's PRESTAGES, whose stopband is relaxed by the
+ * stage behind it), and its arena is split in two.  Folding it into the divider dispatch would
+ * make "which /2 is this" a question with three answers.
+ *
+ * SIZING IS DERIVED FROM THE BLOCK, not chosen.  The first stage must clear a whole block in one
+ * kernel call or it pays the ~70-cycle setup per output instead of per block, so it needs
+ * ceil(APP_BLOCK_FRAMES / d) outputs from one call; the second stage then needs that many from
+ * its own.  Both rings follow, and both are checked against the arena at compile time below and
+ * at runtime here -- the tap counts come from a generated include, and a regenerated table must
+ * fail closed rather than overrun the arena.
+ */
+bool asrc_decimator_q31_init_dec_then_lpf1to1(uint32_t out_rate_hz, uint32_t in_rate_hz,
+                                              uint32_t den, uint8_t channels)
+{
+    if ((channels == 0u) || (channels > ASRC_DEC_Q31_CH))
+    {
+        return false;
+    }
+
+    uint16_t     taps0 = 0u, taps1 = 0u;
+    const float *c0 = NULL, *c1 = NULL;
+    uint8_t      d0 = 0u;
+
+    /* One row per composed chain, selected by BOTH rates AND the published ratio: the ratio is
+     * what the rest of the front end and the rear step were computed from, so a mismatch here is
+     * a planner bug and must be refused rather than served by a chain with a different ratio. */
+    if ((in_rate_hz == 44100u) && (out_rate_hz == 16000u) &&
+        (den == ASRC_DEC2_44K1_FOR_16K_DECIM))
+    {
+        d0    = (uint8_t)ASRC_DEC2_44K1_FOR_16K_DECIM;
+        taps0 = ASRC_DEC2_44K1_FOR_16K_TAPS;
+        c0    = s_dec2_44k1_for_16k_coeff;
+        taps1 = ASRC_LP1_22K05_TO_16K_TAPS;
+        c1    = s_lp1_22k05_to_16k_coeff;
+    }
+#if APP_ASRC_ANTIALIAS_22K05_TO_8K
+    /*
+     * 22.05 -> 8 kHz, AND IT NAMES THE ROW ABOVE'S TWO ARRAYS ON PURPOSE.
+     *
+     * This is the one row in this function whose coefficient sets are named for rates that are not
+     * its own, so the reason is here rather than left to be rediscovered as a bug:
+     * 22050/8000 = 44100/16000 = 2.75625 EXACTLY, and the uniform spec derives both band edges
+     * from the output rate alone (passband 0.8125 * FN_out, the 1:1 stage's stopband
+     * Fs_out - passband).  Every stage therefore has the same NORMALISED passband and stopband as
+     * it does in the 44.1 -> 16 kHz row, and a Kaiser design depends on nothing else -- so these
+     * two arrays ARE this pair's correct coefficients, at half the clock.
+     *
+     * Verified rather than argued: re-deriving both stages at the 22.05 kHz clock reproduces both
+     * shipped arrays to 1.0e-10 relative, and the shipped arrays evaluated as a 22.05 -> 8 kHz
+     * chain read -114.38 dBc -- the identical figure already on record for 44.1 -> 16 kHz.
+     * [internal] study_antialias_frontend_feasibility_20260920.md sections 3.1 and 4,
+     * host check [internal tool] antialias_frontend_reuse_check.py.
+     *
+     * WHY NOT A COPY OF THE ARRAYS UNDER 8 kHz NAMES: two arrays with identical contents and
+     * different names is the duplicate that drifts -- a regenerated 44.1 -> 16 kHz set would
+     * silently stop matching this pair.  Sharing them makes that impossible.  The tap-count
+     * macros are shared for the same reason, so the asserts below are the 44.1 kHz row's asserts
+     * over again and cannot disagree with it.
+     */
+    else if ((in_rate_hz == 22050u) && (out_rate_hz == 8000u) &&
+             (den == ASRC_DEC2_44K1_FOR_16K_DECIM))
+    {
+        d0    = (uint8_t)ASRC_DEC2_44K1_FOR_16K_DECIM;
+        taps0 = ASRC_DEC2_44K1_FOR_16K_TAPS;
+        c0    = s_dec2_44k1_for_16k_coeff;
+        taps1 = ASRC_LP1_22K05_TO_16K_TAPS;
+        c1    = s_lp1_22k05_to_16k_coeff;
+    }
+#endif
+#if APP_ASRC_ANTIALIAS_32K_TO_11K025
+    /*
+     * 32 -> 11.025 kHz: a NEW pre-stage with a SHIPPED partner.
+     *
+     * s_dec2_32k_for_11k025_coeff (45 taps) is this pair's own set, generated by
+     * tools/asrc/asrc_lpf1to1_design.py's PRESTAGES row ("dec2_32k_for_11k025", 32000, 2, 11025).
+     * s_lp1_16k_to_11k025_coeff (55 taps) is NOT new -- it already ships as the second stage of the
+     * 48 -> 11.025 kHz composed row, and it is shared rather than copied for the same reason the
+     * 22.05 kHz row shares its two: two arrays with identical contents and different names is the
+     * duplicate that drifts.
+     *
+     * The generator gates the pre-stage against the WHOLE chain including that partner, so the two
+     * are one specification and must be regenerated together -- which is why the pre-stage lives in
+     * asrc_lpf1to1_coeffs.inc beside the partner and not with the /2 sets in
+     * asrc_decimator_48_to_8_design.py.  Chain figure: -108.53 dBc, passband 0.0003 dB, Q31.
+     */
+    else if ((in_rate_hz == 32000u) && (out_rate_hz == 11025u) &&
+             (den == ASRC_DEC2_32K_FOR_11K025_DECIM))
+    {
+        d0    = (uint8_t)ASRC_DEC2_32K_FOR_11K025_DECIM;
+        taps0 = ASRC_DEC2_32K_FOR_11K025_TAPS;
+        c0    = s_dec2_32k_for_11k025_coeff;
+        taps1 = ASRC_LP1_16K_TO_11K025_TAPS;
+        c1    = s_lp1_16k_to_11k025_coeff;
+    }
+#endif
+#if APP_ASRC_ANTIALIAS_44K1_TO_12K
+    /*
+     * 44.1 -> 12 kHz: BOTH sets new (s_dec2_44k1_for_12k_coeff N31, s_lp1_22k05_to_12k_coeff N71),
+     * because nothing in the image protects 12 kHz from a 22.05 kHz stage rate.  The /3 alternative
+     * (dec3_44k1_for_12k + lp1_14k7_to_12k) is generated but not armed -- see the gate's comment for
+     * why /2 was chosen; naming it here would admit two routes for one pair.
+     */
+    else if ((in_rate_hz == 44100u) && (out_rate_hz == 12000u) &&
+             (den == ASRC_DEC2_44K1_FOR_12K_DECIM))
+    {
+        d0    = (uint8_t)ASRC_DEC2_44K1_FOR_12K_DECIM;
+        taps0 = ASRC_DEC2_44K1_FOR_12K_TAPS;
+        c0    = s_dec2_44k1_for_12k_coeff;
+        taps1 = ASRC_LP1_22K05_TO_12K_TAPS;
+        c1    = s_lp1_22k05_to_12k_coeff;
+    }
+#endif
+#if APP_ASRC_ANTIALIAS_44K1_TO_8K
+    /*
+     * 44.1 -> 8 kHz: a /4 pre-stage, the first d0 == 4 row in this function.
+     *
+     * d0 IS A RUNTIME VALUE and every bound below is derived from it -- out0, ring0, the batch test
+     * -- so /4 is an ordinary value of the same arithmetic rather than a new case.  What IS new for a
+     * /4 is that out0 drops to 4 (block 16 / 4), which makes the intermediate buffer test the
+     * LOOSEST of any row here while the pre-stage's own ring is the largest; both are asserted below
+     * rather than reasoned about.
+     *
+     * The /3 alternative (dec3_44k1_for_8k + lp1_14k7_to_8k) is generated and not armed: /4 keeps
+     * more margin on the FILL axis, which is the axis that refused this pair.
+     */
+    else if ((in_rate_hz == 44100u) && (out_rate_hz == 8000u) &&
+             (den == ASRC_DEC4_44K1_FOR_8K_DECIM))
+    {
+        d0    = (uint8_t)ASRC_DEC4_44K1_FOR_8K_DECIM;
+        taps0 = ASRC_DEC4_44K1_FOR_8K_TAPS;
+        c0    = s_dec4_44k1_for_8k_coeff;
+        taps1 = ASRC_LP1_11K025_TO_8K_TAPS;
+        c1    = s_lp1_11k025_to_8k_coeff;
+    }
+#endif
+#if APP_ASRC_UNIVERSAL_PROFILE
+    /* THE UNIVERSAL PROFILE'S 11 COMPOSED ROWS, from the one list.
+     *
+     * ★ SEVEN OF THEM DECIMATE BY 3, WHICH NO SHIPPED ROW DOES.  Every shipped 96 kHz route
+     * reaches its 48 kHz chain through the /2 pre-stage; these drop straight to 32 kHz (or, from a
+     * 48 kHz leg, to 16 kHz) in one /3 stage.  That is NOT a new kernel -- dec_q31_stage_set()
+     * takes the decimation as a runtime value and the block kernel takes it as decim_bytes -- but
+     * it IS a new stage rate for the block ARITHMETIC: out0 = ceil(BLOCK/3) = 6 where every
+     * existing composed row computes 8, and both rings move with it.  So the asserts below
+     * re-derive out0, ring0 and ring1 per row from the same expression the runtime uses, rather
+     * than from a /2 assumption written once.
+     *
+     * The published ratio is checked against the coefficient set's own decimation, not assumed
+     * equal to it -- see the note on the argument list. */
+#define ASRC_UNIVERSAL_COMPOSED_ARM(FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG) \
+    else if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT)) && (den == (DEN)))       \
+    {                                                                                     \
+        d0    = (uint8_t)(DECIM);                                                          \
+        taps0 = (TAPS0);                                                                   \
+        c0    = (C0);                                                                      \
+        taps1 = (TAPS1);                                                                   \
+        c1    = (C1);                                                                      \
+    }
+    ASRC_UNIVERSAL_COMPOSED_ROWS(ASRC_UNIVERSAL_COMPOSED_ARM)
+#undef ASRC_UNIVERSAL_COMPOSED_ARM
+#endif
+#if APP_ASRC_ANTIALIAS_DIRECT_1TO1
+    /* The DIRECT5 composed rows (asrc_decimator_48_to_8.h), same shape and same ratio key as the
+     * Universal ones; the list is empty unless APP_ASRC_ANTIALIAS_DIRECT5. */
+#define ASRC_ANTIALIAS_DIRECT5_COMPOSED_ARM(FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG) \
+    else if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT)) && (den == (DEN)))           \
+    {                                                                                         \
+        d0    = (uint8_t)(DECIM);                                                              \
+        taps0 = (TAPS0);                                                                       \
+        c0    = (C0);                                                                          \
+        taps1 = (TAPS1);                                                                       \
+        c1    = (C1);                                                                          \
+    }
+    ASRC_ANTIALIAS_DIRECT5_COMPOSED_ROWS(ASRC_ANTIALIAS_DIRECT5_COMPOSED_ARM)
+#undef ASRC_ANTIALIAS_DIRECT5_COMPOSED_ARM
+#endif
+    else
+    {
+        return false;
+    }
+
+    const uint16_t out0  = (uint16_t)(((uint16_t)APP_BLOCK_FRAMES + (d0 - 1u)) / d0);
+    const uint16_t ring0 = (uint16_t)(taps0 + ((out0 - 1u) * d0));
+    const uint16_t ring1 = (uint16_t)(taps1 + (out0 - 1u));
+
+    if (out0 > DEC_Q31_MAX_MID)                        { return false; }
+    if (out0 > DEC_Q31_MAX_BATCH)                      { return false; }
+    if ((uint32_t)ring0 + (uint32_t)ring1 > DEC_Q31_SECOND_ARENA) { return false; }
+    if ((uint32_t)taps0 + (uint32_t)taps1 > DEC_Q31_COEFF_MAX)    { return false; }
+
+    dec_q31_arm_begin(channels);
+    s_q31.num    = 1u;
+    s_q31.den    = (uint8_t)den;
+    s_q31.stages = 2u;
+    dec_q31_stage_set(0u, taps0, d0,        ring0, 0u,    0u,    c0);
+    dec_q31_stage_set(1u, taps1, 1u,        ring1, ring0, taps0, c1);
+    return true;
+}
+
+/* The 44.1 kHz row, at compile time.  Written out rather than expressed through the runtime
+ * locals above so that a regenerated table breaks the BUILD, not an arm on the bench. */
+#define DEC_Q31_C44K1_OUT0 (((uint16_t)APP_BLOCK_FRAMES + (ASRC_DEC2_44K1_FOR_16K_DECIM - 1u)) \
+                            / ASRC_DEC2_44K1_FOR_16K_DECIM)
+_Static_assert(DEC_Q31_C44K1_OUT0 <= DEC_Q31_MAX_MID,
+               "44.1 -> 16 kHz: the /2 stage's block output does not fit an intermediate buffer");
+_Static_assert(DEC_Q31_C44K1_OUT0 <= DEC_Q31_MAX_BATCH,
+               "44.1 -> 16 kHz: the /2 stage cannot clear a block in one kernel call");
+_Static_assert((ASRC_DEC2_44K1_FOR_16K_TAPS
+                + ((DEC_Q31_C44K1_OUT0 - 1u) * ASRC_DEC2_44K1_FOR_16K_DECIM)
+                + ASRC_LP1_22K05_TO_16K_TAPS + (DEC_Q31_C44K1_OUT0 - 1u))
+                   <= DEC_Q31_SECOND_ARENA,
+               "44.1 -> 16 kHz composed chain: the two rings do not fit the 48 kHz chains' arena");
+_Static_assert((ASRC_DEC2_44K1_FOR_16K_TAPS + ASRC_LP1_22K05_TO_16K_TAPS) <= DEC_Q31_COEFF_MAX,
+               "44.1 -> 16 kHz composed chain: coefficient arena");
+_Static_assert(DEC_Q31_MAX_STAGES >= 2u, "44.1 -> 16 kHz composed chain needs two stages");
+
+#if APP_ASRC_ANTIALIAS_22K05_TO_8K
+/*
+ * 22.05 -> 8 kHz, at compile time.  The row SHARES the 44.1 kHz row's two coefficient sets and
+ * its decimation, so every quantity above is already the right one and re-checking it here would
+ * be the same four inequalities a second time -- which is why this block asserts the ONE thing
+ * that is genuinely this row's own: that it really is sharing them.
+ *
+ * If a future regeneration gave 22.05 -> 8 kHz its own sets, these would stop being the correct
+ * asserts and the arm would need its own -- so tie the sharing itself to the build.  ASRC_CH and
+ * the arena are unchanged by definition: nothing about this row is larger than the 44.1 kHz row.
+ */
+_Static_assert(ASRC_DEC2_44K1_FOR_16K_DECIM == 2u,
+               "22.05 -> 8 kHz reuses the 44.1 -> 16 kHz chain because the two pairs have the "
+               "same ratio (2.75625) and the uniform spec derives both band edges from the output "
+               "rate alone.  That argument is about a /2 pre-stage; a different decimation here "
+               "means the shared set is no longer this pair's set");
+#endif
+
+#if APP_ASRC_ANTIALIAS_32K_TO_11K025
+/*
+ * 32 -> 11.025 kHz, at compile time.  This row has its OWN pre-stage, so unlike the 22.05 kHz row
+ * it needs the full four inequalities rather than a sharing assert -- re-derived here from
+ * APP_BLOCK_FRAMES and the generated tap counts, exactly as the runtime derives them, so a
+ * regenerated table breaks the BUILD and not an arm on the bench.
+ */
+#define DEC_Q31_C32K11K_OUT0 (((uint16_t)APP_BLOCK_FRAMES + (ASRC_DEC2_32K_FOR_11K025_DECIM - 1u))                               / ASRC_DEC2_32K_FOR_11K025_DECIM)
+_Static_assert(DEC_Q31_C32K11K_OUT0 <= DEC_Q31_MAX_MID,
+               "32 -> 11.025 kHz: the /2 stage's block output does not fit an intermediate buffer");
+_Static_assert(DEC_Q31_C32K11K_OUT0 <= DEC_Q31_MAX_BATCH,
+               "32 -> 11.025 kHz: the /2 stage cannot clear a block in one kernel call");
+_Static_assert((ASRC_DEC2_32K_FOR_11K025_TAPS
+                + ((DEC_Q31_C32K11K_OUT0 - 1u) * ASRC_DEC2_32K_FOR_11K025_DECIM)
+                + ASRC_LP1_16K_TO_11K025_TAPS + (DEC_Q31_C32K11K_OUT0 - 1u))
+                   <= DEC_Q31_SECOND_ARENA,
+               "32 -> 11.025 kHz composed chain: the two rings do not fit the 48 kHz chains' arena");
+_Static_assert((ASRC_DEC2_32K_FOR_11K025_TAPS + ASRC_LP1_16K_TO_11K025_TAPS) <= DEC_Q31_COEFF_MAX,
+               "32 -> 11.025 kHz composed chain: coefficient arena");
+_Static_assert(DEC_Q31_MAX_STAGES >= 2u, "32 -> 11.025 kHz composed chain needs two stages");
+#endif
+
+#if APP_ASRC_ANTIALIAS_44K1_TO_12K
+/* 44.1 -> 12 kHz (/2 to 22.05 kHz), the four inequalities the runtime applies, re-derived here from
+ * APP_BLOCK_FRAMES and the generated tap counts so a regenerated table breaks the BUILD. */
+#define DEC_Q31_C44K12K_OUT0 (((uint16_t)APP_BLOCK_FRAMES + (ASRC_DEC2_44K1_FOR_12K_DECIM - 1u))                               / ASRC_DEC2_44K1_FOR_12K_DECIM)
+_Static_assert(DEC_Q31_C44K12K_OUT0 <= DEC_Q31_MAX_MID,
+               "44.1 -> 12 kHz: the /2 stage's block output does not fit an intermediate buffer");
+_Static_assert(DEC_Q31_C44K12K_OUT0 <= DEC_Q31_MAX_BATCH,
+               "44.1 -> 12 kHz: the /2 stage cannot clear a block in one kernel call");
+_Static_assert((ASRC_DEC2_44K1_FOR_12K_TAPS
+                + ((DEC_Q31_C44K12K_OUT0 - 1u) * ASRC_DEC2_44K1_FOR_12K_DECIM)
+                + ASRC_LP1_22K05_TO_12K_TAPS + (DEC_Q31_C44K12K_OUT0 - 1u))
+                   <= DEC_Q31_SECOND_ARENA,
+               "44.1 -> 12 kHz composed chain: the two rings do not fit the 48 kHz chains' arena");
+_Static_assert((ASRC_DEC2_44K1_FOR_12K_TAPS + ASRC_LP1_22K05_TO_12K_TAPS) <= DEC_Q31_COEFF_MAX,
+               "44.1 -> 12 kHz composed chain: coefficient arena");
+_Static_assert(DEC_Q31_MAX_STAGES >= 2u, "44.1 -> 12 kHz composed chain needs two stages");
+#endif
+
+#if APP_ASRC_ANTIALIAS_44K1_TO_8K
+/* 44.1 -> 8 kHz (/4 to 11.025 kHz).  The SAME four inequalities, and they are worth having here in
+ * particular: this is the first d0 == 4 row, so out0 and ring0 both move away from every value the
+ * other rows exercise -- out0 falls to 4 while the pre-stage ring grows to taps + 3*(out0-1). */
+#define DEC_Q31_C44K8K_OUT0 (((uint16_t)APP_BLOCK_FRAMES + (ASRC_DEC4_44K1_FOR_8K_DECIM - 1u))                              / ASRC_DEC4_44K1_FOR_8K_DECIM)
+_Static_assert(DEC_Q31_C44K8K_OUT0 <= DEC_Q31_MAX_MID,
+               "44.1 -> 8 kHz: the /4 stage's block output does not fit an intermediate buffer");
+_Static_assert(DEC_Q31_C44K8K_OUT0 <= DEC_Q31_MAX_BATCH,
+               "44.1 -> 8 kHz: the /4 stage cannot clear a block in one kernel call");
+_Static_assert((ASRC_DEC4_44K1_FOR_8K_TAPS
+                + ((DEC_Q31_C44K8K_OUT0 - 1u) * ASRC_DEC4_44K1_FOR_8K_DECIM)
+                + ASRC_LP1_11K025_TO_8K_TAPS + (DEC_Q31_C44K8K_OUT0 - 1u))
+                   <= DEC_Q31_SECOND_ARENA,
+               "44.1 -> 8 kHz composed chain: the two rings do not fit the 48 kHz chains' arena");
+_Static_assert((ASRC_DEC4_44K1_FOR_8K_TAPS + ASRC_LP1_11K025_TO_8K_TAPS) <= DEC_Q31_COEFF_MAX,
+               "44.1 -> 8 kHz composed chain: coefficient arena");
+_Static_assert(DEC_Q31_MAX_STAGES >= 2u, "44.1 -> 8 kHz composed chain needs two stages");
+#endif
+
+#if APP_ASRC_UNIVERSAL_PROFILE
+/*
+ * EVERY Universal composed row, at compile time, from the same list the arm expands -- and derived
+ * from the BLOCK, exactly as the runtime derives it, so a changed APP_BLOCK_FRAMES moves both or
+ * neither.  Four inequalities per row, and each one is a different failure:
+ *
+ *   out0 <= DEC_Q31_MAX_MID     the intermediate buffer holds one block of stage-0 output.
+ *                               Overflowing it is a WRONG SIGNAL, not a refusal.
+ *   out0 <= DEC_Q31_MAX_BATCH   stage 0 clears the block in ONE kernel call.  Failing this is
+ *                               only a cost (~70 cycles per output instead of per block), but it
+ *                               is a cost nobody would find by listening.
+ *   ring0 + ring1 <= arena      the two rings are live in the same block and must not overlap.
+ *                               The tightest row is 96 -> 8 kHz at 44 + 156 = 200 of 209.
+ *   taps0 + taps1 <= coeff arena  the X working buffer holds the live chain end to end.
+ *
+ * ★ The /3 rows are what these asserts exist for.  At BLOCK 16 a /3 stage emits 6 frames and a /2
+ * stage 8, so ring0 and ring1 differ between the two shapes by (out0 - 1) * d -- and the widest
+ * 1:1 set in this profile (151 taps, 96 -> 8 kHz) sits behind a /3.  Nothing about that row is
+ * visible in the /2-shaped arithmetic the pre-Universal rows are sized by.
+ */
+#define ASRC_UNIVERSAL_OUT0(DECIM)  (((uint16_t)APP_BLOCK_FRAMES + ((DECIM) - 1u)) / (DECIM))
+#define ASRC_UNIVERSAL_COMPOSED_ASSERT(FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG)  \
+    _Static_assert((DEN) == (DECIM),                                                          \
+                   "Universal composed row " TAG ": the published ratio and the coefficient "  \
+                   "set's own decimation disagree");                                          \
+    _Static_assert(ASRC_UNIVERSAL_OUT0(DECIM) <= DEC_Q31_MAX_MID,                             \
+                   "Universal composed row " TAG ": stage-0 block output does not fit an "      \
+                   "intermediate buffer");                                                    \
+    _Static_assert(ASRC_UNIVERSAL_OUT0(DECIM) <= DEC_Q31_MAX_BATCH,                           \
+                   "Universal composed row " TAG ": stage 0 cannot clear a block in one "       \
+                   "kernel call");                                                            \
+    _Static_assert(((TAPS0) + ((ASRC_UNIVERSAL_OUT0(DECIM) - 1u) * (DECIM))                   \
+                    + (TAPS1) + (ASRC_UNIVERSAL_OUT0(DECIM) - 1u)) <= DEC_Q31_SECOND_ARENA,   \
+                   "Universal composed row " TAG ": the two rings do not fit the arena");      \
+    _Static_assert(((TAPS0) + (TAPS1)) <= DEC_Q31_COEFF_MAX,                                  \
+                   "Universal composed row " TAG ": coefficient arena");
+ASRC_UNIVERSAL_COMPOSED_ROWS(ASRC_UNIVERSAL_COMPOSED_ASSERT)
+#undef ASRC_UNIVERSAL_COMPOSED_ASSERT
+
+/*
+ * HOW MANY ROWS THIS IMAGE ACTUALLY CARRIES, as a number the build checks.
+ *
+ * The two lists are each JOINED from a 48 kHz half and a 96 kHz half (see the header), so a
+ * mistake in the join -- a missing backslash, a half left out of one arm of the #if -- silently
+ * drops rows.  Everything else here would still pass: the per-row asserts only speak about the
+ * rows they are given, the arm compiles, and the profile then quietly serves eleven pairs from
+ * the shipped table while claiming fifteen.  That failure has no symptom in a build log, which
+ * is why the count is an invariant and not a comment.
+ *
+ * Phase H qualified 15 rows.  A build with a 96 kHz leg carries all of them; one without carries
+ * the 7 that a 48 kHz leg can reach, because the other 8 name a source rate the image cannot
+ * produce (see the split's own note).
+ */
+#define ASRC_UNIVERSAL_COUNT_ROW(...) + 1u
+#define ASRC_UNIVERSAL_1TO1_COUNT      (0u ASRC_UNIVERSAL_1TO1_ROWS(ASRC_UNIVERSAL_COUNT_ROW))
+#define ASRC_UNIVERSAL_COMPOSED_COUNT  (0u ASRC_UNIVERSAL_COMPOSED_ROWS(ASRC_UNIVERSAL_COUNT_ROW))
+#if ASRC_DECIMATOR_HAS_96_TO_48
+_Static_assert(ASRC_UNIVERSAL_1TO1_COUNT == 4u,
+               "Universal profile with a 96 kHz leg must carry 4 one-stage rows "
+               "(48->22.05, 48->24, 48->32, 96->48 kHz) -- check the row-list join");
+_Static_assert(ASRC_UNIVERSAL_COMPOSED_COUNT == 11u,
+               "Universal profile with a 96 kHz leg must carry 11 composed rows -- "
+               "check the row-list join");
+#else
+_Static_assert(ASRC_UNIVERSAL_1TO1_COUNT == 3u,
+               "Universal profile without a 96 kHz leg must carry 3 one-stage rows "
+               "(48->22.05, 48->24, 48->32 kHz) -- check the row-list join");
+_Static_assert(ASRC_UNIVERSAL_COMPOSED_COUNT == 4u,
+               "Universal profile without a 96 kHz leg must carry 4 composed rows "
+               "(48->8, 48->11.025, 48->12, 48->16 kHz) -- check the row-list join");
+#endif
+#undef ASRC_UNIVERSAL_COUNT_ROW
+
+const char* asrc_universal_composed_tag(uint32_t out_rate_hz, uint32_t in_rate_hz, uint32_t den)
+{
+#define ASRC_UNIVERSAL_COMPOSED_TAG(FS_IN, FS_OUT, DEN, DECIM, TAPS0, C0, TAPS1, C1, TAG)  \
+    if ((in_rate_hz == (FS_IN)) && (out_rate_hz == (FS_OUT)) && (den == (DEN)))            \
+    {                                                                                      \
+        return (TAG);                                                                      \
+    }
+    ASRC_UNIVERSAL_COMPOSED_ROWS(ASRC_UNIVERSAL_COMPOSED_TAG)
+#undef ASRC_UNIVERSAL_COMPOSED_TAG
+    return NULL;
+}
+#endif /* APP_ASRC_UNIVERSAL_PROFILE */
+#endif /* APP_ASRC_LPF1TO1_PROTOTYPE */
+
 bool asrc_decimator_q31_init(uint32_t num, uint32_t den, uint8_t channels,
                              asrc_decimator_48_to_24_variant_t v24,
                              asrc_decimator_48_to_12_variant_t v12,
@@ -592,11 +1341,27 @@ bool asrc_decimator_q31_init(uint32_t num, uint32_t den, uint8_t channels,
         return false;
     }
 
-    memset(&s_q31, 0, sizeof(s_q31));
-    memset(s_q31_hist, 0, sizeof(s_q31_hist));
-    s_q31.channels = channels;
+    dec_q31_arm_begin(channels);
     s_q31.num      = (uint8_t)num;
     s_q31.den      = (uint8_t)den;
+
+#if APP_ASRC_THIRDBAND_96_TO_32
+    /* The third band REPLACES the composed 96 -> 32 kHz chain and nothing else: /2 then
+     * 2/3.  Resolved here, where the request is still in view, and NOT re-derived at arm
+     * time from s_q31 -- a stage count would have to be interpreted, and this front end
+     * already refuses to dispatch on stage counts for exactly that reason.
+     *
+     * Note where this leaves the ARENA: the arm prologue above has just cleared
+     * s_q31_hist, so whatever the third band had there is gone.  That is deliberate and is what makes the A/B switch a
+     * leg-A restart rather than a flag: the console re-applies the rate, this runs, and the
+     * arm hook then builds whichever front end the mode now names. */
+#if ASRC_DECIMATOR_HAS_96_TO_48
+    s_tb32_eligible = ((num == ASRC_DECIMATOR_48_TO_32_L) &&
+                       (den == ASRC_DECIMATOR_48_TO_32_M) && with_prestage) ? 1u : 0u;
+#else
+    s_tb32_eligible = 0u;
+#endif
+#endif /* APP_ASRC_THIRDBAND_96_TO_32 */
 
     /*
      * THE 96 kHz PRE-STAGE, when the caller asked for a composed chain.
@@ -830,6 +1595,12 @@ bool asrc_decimator_q31_init(uint32_t num, uint32_t den, uint8_t channels,
     }
 }
 
+#if APP_ASRC_THIRDBAND_96_TO_32
+/* The third-band front end.  Placed here -- after init(), before the block path -- because
+ * it calls init() to retire itself and because process_s24_left() below dispatches to it. */
+#include "asrc_thirdband_96_to_32.inc"
+#endif
+
 /*
  * Outputs the 2/3 chain will emit if `in_frames` more inputs arrive, at the
  * current schedule state.  Pure: this is also what output_frames() answers with,
@@ -1010,6 +1781,15 @@ size_t asrc_decimator_q31_output_frames(size_t input_frames)
     {
         return 0u;
     }
+#if APP_ASRC_THIRDBAND_96_TO_32
+    /* Armed means the third band IS the front end, and its ratio is a plain 3:1 with a
+     * 0..2 frame remainder.  Answering with the composed chain's count here would make the
+     * caller's all-or-nothing capacity check disagree with what actually runs. */
+    if (s_tb32_armed != 0u)
+    {
+        return asrc_thirdband_96_to_32_output_frames(input_frames);
+    }
+#endif
     if (s_q31.num == ASRC_DECIMATOR_48_TO_32_L)
     {
         /* Any cascade stage AHEAD of the phase rows runs first, so what the rows
@@ -1146,6 +1926,9 @@ static size_t dec_q31_stage_run(uint8_t s,
         }
         produced += b;
     }
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+    s_dq31_stage_out[s] += (uint32_t)produced;
+#endif
     return produced;
 }
 
@@ -1175,6 +1958,18 @@ static volatile uint32_t s_dq31_r23_last;
  * is the only form that can be added to a caller's other rows without mixing blocks. */
 void asrc_decimator_q31_profile_take_last( uint32_t* pre_ticks, uint32_t* r23_ticks )
 {
+#if APP_ASRC_THIRDBAND_96_TO_32
+    /* ONE telemetry line has to describe whichever front end is live.  When the third band
+     * is armed its two halves take these two fields -- `pre` is everything ahead of the
+     * arithmetic (the channel repeat and the headroom shift), `r23` is the 3:1 kernel --
+     * because reporting 0 here would read as "this chain did not run", which is exactly the
+     * misreading the two fields exist to prevent. */
+    if( s_tb32_armed != 0u )
+    {
+        asrc_thirdband_96_to_32_profile_take_last( pre_ticks, r23_ticks );
+        return;
+    }
+#endif
     if( pre_ticks != NULL ) { *pre_ticks = s_dq31_pre_last; }
     if( r23_ticks != NULL ) { *r23_ticks = s_dq31_r23_last; }
     s_dq31_pre_last = 0u;
@@ -1234,6 +2029,19 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
     const uint8_t in_mask = (input_channels >= s_q31.channels)
                                 ? ASRC_DEC_Q31_FULL_MASK
                                 : (uint8_t)(input_channels - 1u);
+
+#if APP_ASRC_THIRDBAND_96_TO_32
+    /* THE THIRD BAND REPLACES THE WHOLE COMPOSED CHAIN, not a stage of it: one 3:1 stage
+     * instead of /2 then 2/3.  Dispatched before the rational arm below, and only ever
+     * armed for the chain it replaces (see s_tb32_eligible), so no other ratio can reach
+     * it.  The validity and capacity checks above are shared deliberately -- this stage is
+     * a different filter, not a different contract. */
+    if (s_tb32_armed != 0u)
+    {
+        return tb32_process(input, input_frames, input_stride, in_mask,
+                            output, output_stride, output_frames);
+    }
+#endif
 
     /* The rational chain is dispatched before the cascade arms: its last two stage
      * descriptors are phase rows and not cascade stages, so this branch must be
@@ -1359,4 +2167,9 @@ bool asrc_decimator_q31_process_s24_left(const int32_t *input,
 /* The boot bit-exactness check.  Its own file because it is a startup check, not
  * part of the front end -- and so that a build without it carries none of it. */
 #include "asrc_decimator_q31_selftest.inc"
+#if APP_ASRC_LPF1TO1_PROTOTYPE
+/* AFTER the divider selftest, because the 1:1 checks re-use its oracle
+ * (dec_q31_st_ref_stage) rather than carrying a second copy of one. */
+#include "asrc_lpf1to1_selftest.inc"
+#endif
 #endif

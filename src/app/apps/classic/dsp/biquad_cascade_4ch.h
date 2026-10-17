@@ -84,9 +84,11 @@ extern void     biquad_cascade_4ch_process(       biquad_cascade_4ch_t* pbq,
                                                       int                   samples );
 extern void     biquad_cascade_4ch_cmsis_init(void);
 extern void     biquad_cascade_4ch_process_cmsis( const float* in,
-                                                            float* out,
-                                                            int    samples );
+                                                             float* out,
+                                                             int    samples );
 extern float    biquad_cascade_4ch_cmsis_selftest(void);
+/* The live DRC telemetry must identify the actual dispatch branch. */
+extern const char *biquad_cascade_4ch_cmsis_kernel_name(void);
 
 
 
@@ -103,6 +105,9 @@ extern bool     app_biquad_cascade_4ch_load_coeff_from_uart_csv( const float* co
 extern void     app_biquad_cascade_4ch_clear_state(void);
 extern void     app_biquad_cascade_4ch_request_bypass(void);
 extern bool     app_biquad_cascade_4ch_is_bypass_active(void);
+/* Promote a pending bypass only after the authoritative transport predicate
+ * proves no audio ISR can be reading the coefficient table. */
+extern void     app_biquad_cascade_4ch_confirm_bypass_stopped(void);
 extern void     app_biquad_cascade_4ch_request_normal(void);
 
 extern void     app_biquad_cascade_4ch_debug_print_coeff( uint16_t stage_begin,

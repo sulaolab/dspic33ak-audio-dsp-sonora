@@ -33,6 +33,9 @@
 #include "board/devices/wm8904.h"    // P5: codec lifecycle -- direct, down-call
 #include "hal_reset/nora_reset.h"      // core reset cause: cold vs hot codec start at boot
 #include "diagnostics/app_traps.h"     // app_traps_count(): tell a CPU fault from missing wiring
+#if APP_USE_RGB_STATUS_LED
+#include "pwm_led.h"                   // fault blink: the PWM generators own the RGB pins here
+#endif
 #include "timer_app.h"                          // delay_ms
 #include "board/audio/audio.h"   // board pin/clock port table
 #include "board/audio/tdm.h"     // board TDM topology table + per-leg resolver (Step 3)
@@ -81,6 +84,88 @@ static bool s_codec_b_missing_stop_latched;
  * terminal that reconnects after the boot-time banner already scrolled by would otherwise
  * find a silent, healthy-looking console with no way to discover why. */
 static uint32_t s_codec_b_missing_last_prt_ms;
+/* Codec B answered I2C but its write sequencer never ran (E54): no MCLK reached it, so leg B
+ * can never clock and the image would otherwise boot into a half-dead state that LOOKS healthy
+ * (leg A runs, `wm8904 i3 ... OK1`). Measured 2026-10-06 on the BIDIR B-master image with the
+ * codec-B XTAL jumper open: TDM2 blk=0, fsB=0.00 Hz, for as long as it ran. Same terminal stop
+ * and 2 s repeat as s_codec_b_missing_stop_latched, with the clock-specific guidance. Every
+ * logged E54 on leg B (2026-08-19 .. 2026-10-06, 40 boots) came with a dead leg B, so the stop
+ * has no known false positive. */
+static bool s_codec_b_no_mclk_stop_latched;
+/* MikroBUS-B pin 3 (B's MCLK net) is DRIVEN before any CLC3 route although this co-clocked build
+ * is about to drive it from CLC3OUT: the CODEC-B XTAL-MCLK jumper is fitted. Caught by
+ * audio_transport_stop_if_codec_b_pin3_wrong() before the transport (and so CLC3) is started, so
+ * the two drivers never contend. Same stop / 2 s repeat / blink as the two latches above. */
+static bool s_codec_b_pin3_driven_stop_latched;
+
+/* Wiring-fault blink: the RGB status LED alternates red / blue (ASRC) or red / green (Classic)
+ * every 300 ms while either
+ * codec-B wiring stop above is latched, so a board on the bench says "look at me" without a
+ * terminal.  Written straight onto the port registers rather than through hal_gpio / hal_pwm:
+ * ASRC builds compile the RGB LED out (APP_USE_RGB_STATUS_LED 0, pwm_led.c + hal_pwm unlinked,
+ * ~5.8 kB on AK512), and this is a dead-end error path that needs three pins and nothing else.
+ * Pin map = pwm_led_init()'s: blue RP51/RD2, green RP49/RD0, red RP58/RD9 (AK512) or RP35/RC2
+ * (AK128).  None of these bits has an ANSEL bit on either device, so TRIS + LAT is all there is.
+ * When the RGB LED IS compiled in (Classic) the PWM generators own the pins through PPS and a
+ * LAT write would not reach them, so that build blinks through the duty setters instead. */
+#define CODEC_B_FAULT_BLINK_HALF_MS  (300u)
+static bool     s_codec_b_fault_blink_on;
+static bool     s_codec_b_fault_blink_red;
+static uint32_t s_codec_b_fault_blink_last_ms;
+
+/* The second colour names the config, so the board says which jumper rule it expects even
+ * without a terminal: ASRC = red / BLUE, Classic = red / GREEN (owner 2026-10-06). */
+#if SONORA_APP_IS_ASRC
+  #define CODEC_B_FAULT_ALT_IS_BLUE   (1)
+#else
+  #define CODEC_B_FAULT_ALT_IS_BLUE   (0)
+#endif
+
+static void codec_b_fault_blink_show( bool red, bool alt )
+{
+    const bool blue  = alt &&  CODEC_B_FAULT_ALT_IS_BLUE;
+    const bool green = alt && !CODEC_B_FAULT_ALT_IS_BLUE;
+#if APP_USE_RGB_STATUS_LED
+    pwm2_set_duty( green ? 100u : 0u );
+    pwm3_set_duty( red   ? 100u : 0u );
+    pwm1_set_duty( blue  ? 100u : 0u );
+#else
+    _TRISD2 = 0;  _LATD2 = blue  ? 1 : 0;     // blue
+    _TRISD0 = 0;  _LATD0 = green ? 1 : 0;     // green
+#if APP_TARGET == APP_TARGET_AK128
+    _TRISC2 = 0;  _LATC2 = red ? 1 : 0;       // red
+#else
+    _TRISD9 = 0;  _LATD9 = red ? 1 : 0;       // red
+#endif
+#endif // APP_USE_RGB_STATUS_LED
+}
+
+static void codec_b_fault_blink_start( void )
+{
+    s_codec_b_fault_blink_on      = true;
+    s_codec_b_fault_blink_red     = true;
+    s_codec_b_fault_blink_last_ms = GetTicks();
+    codec_b_fault_blink_show( true, false );
+}
+
+static void codec_b_fault_blink_service( void )
+{
+    if( !s_codec_b_fault_blink_on ) { return; }
+    const uint32_t cur = GetTicks();
+    if( (uint32_t)( cur - s_codec_b_fault_blink_last_ms ) >= CODEC_B_FAULT_BLINK_HALF_MS )
+    {
+        s_codec_b_fault_blink_last_ms = cur;
+        s_codec_b_fault_blink_red = !s_codec_b_fault_blink_red;
+        codec_b_fault_blink_show( s_codec_b_fault_blink_red, !s_codec_b_fault_blink_red );
+    }
+}
+
+static void codec_b_fault_blink_stop( void )
+{
+    if( !s_codec_b_fault_blink_on ) { return; }
+    s_codec_b_fault_blink_on = false;
+    codec_b_fault_blink_show( false, false );
+}
 #endif // NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B
 
 /*
@@ -448,6 +533,7 @@ static bool audio_transport_manage_route( audio_transport_route_t route );
 static bool audio_transport_restart_route( audio_transport_route_t route,
                                      audio_transport_transition_reason_t reason );
 static bool audio_transport_restart_route_muted( audio_transport_route_t route );
+static bool audio_transport_stop_route( audio_transport_route_t route );
 
 static void audio_transport_mark_qualified(
     audio_transport_transition_reason_t reason )
@@ -516,6 +602,7 @@ static void audio_transport_report_codec_b_missing( void )
     s_codec_b_missing_stop_latched = true;
     s_codec_b_missing_last_prt_ms = GetTicks();
     audio_transport_print_codec_b_missing_guidance();
+    codec_b_fault_blink_start();
 }
 #elif NORA_TDM_USE_SPI2
 // AK128 J3 bring-up (APP_BUILD_ASRC_AK128_CODEC_BIDIR) is ROM-critical (98% at
@@ -530,6 +617,128 @@ static void audio_transport_report_codec_b_missing( void )
 {
 }
 #endif // NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B
+
+#if NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B
+/*
+ * A WM8904-B with no MCLK still answers I2C and every register write verifies, so
+ * wm8904_init() returns true and the boot continues into silence: B's ADC never drives ADCDAT,
+ * its output never powers up and, when B is the TDM master, it never drives BCLK/FS. The only
+ * trace was "wm8904 E54 i3", so name the cause loudly, and repeat it (see
+ * audio_transport_dbg_print()) -- a one-off banner scrolls away under telemetry that looks fine.
+ *   co-clocked B: MCLK comes from the dsPIC (CLC3OUT -> MikroBUS-B pin 3), see board_route_mclk().
+ *     Measured 2026-10-05: codec-A board's U16 (XTAL OUT) jumper off, CLC3 forwarded a flat line.
+ *   B-codec-master: MCLK comes from B's OWN XTAL through its XTAL jumper; the dsPIC drives nothing.
+ *     Measured 2026-10-06: codec-B XTAL jumper open, TDM2 blk=0 / fsB=0.
+ */
+static void audio_transport_print_codec_b_no_mclk_guidance( void )
+{
+    /* Said in the bench user's terms (owner wording 2026-10-06): which config this image is,
+     * and the jumper positions that config needs.  Pin / RP / CLC detail is in the comment above. */
+    printf("#############################################################\n"
+           "## CODEC-B HAS NO MCLK -- audio STOPPED.\n");
+#if RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE
+    printf("## You are running the ASRC config.\n"
+           "## Check the CODEC-B MCLK jumper: it must be FITTED on XTAL-MCLK.\n");
+#elif RESOLVED_BOARD_AUDIO_INPUT_IS_USB
+    printf("## You are running a USB-input config.\n"
+           "## Check that the USB audio bridge is connected and running.\n"
+           "## Check the CODEC-B MCLK jumpers: they must all be OPEN.\n");
+#elif RESOLVED_TRANSPORT_LEG_A_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_CONTROLLER_VALUE
+    printf("## You are running the Classic config.\n"
+           "## Check the CODEC-B MCLK jumpers: they must all be OPEN.\n");
+#else
+    printf("## You are running the Classic config.\n"
+           "## Check that the CODEC-A XTAL-OUT jumper is FITTED.\n"
+           "## Check the CODEC-B MCLK jumpers: they must all be OPEN.\n");
+#endif
+    printf("## Then power-cycle (or *tr).\n"
+           "#############################################################\n");
+}
+
+// Called after every successful WM8904-B apply.  true = B has no MCLK: the stop is latched,
+// the transport torn down (mute held) and the guidance printed once; the caller returns false.
+static bool audio_transport_stop_if_codec_b_no_mclk( audio_transport_route_t route )
+{
+    if( !wm8904_last_init_had_no_sysclk( I2C_INST_B ) ) { return false; }
+    audio_transport_mark_transition_failed( AUDIO_TRANSPORT_TRANSITION_ERROR_CODEC_APPLY_FAILED );
+    (void)audio_transport_stop_route( route );
+    s_codec_b_no_mclk_stop_latched = true;
+    s_codec_b_missing_last_prt_ms = GetTicks();
+    audio_transport_print_codec_b_no_mclk_guidance();
+    codec_b_fault_blink_start();
+    return true;
+}
+
+static void audio_transport_print_codec_b_pin3_driven_guidance( void )
+{
+    printf("#############################################################\n"
+           "## CODEC-B XTAL-MCLK JUMPER IS FITTED -- audio STOPPED.\n"
+           "## You are running the Classic config.\n"
+           "## Check the CODEC-B MCLK jumpers: they must all be OPEN.\n"
+           "## Then power-cycle (or *tr).\n"
+           "#############################################################\n");
+}
+
+/*
+ * Pin-3 pre-check: is WM8904-B's MCLK pin (MikroBUS-B pin 3) already driven before this image
+ * drives it?  B's own XTAL reaches the pin only through the CODEC-B XTAL-MCLK jumper, so
+ *   co-clocked builds (CLC3OUT drives the pin): driven = jumper FITTED = stop BEFORE CLC3 is
+ *     routed, so the dsPIC and B's XTAL never fight over the net.  E54 cannot catch this one:
+ *     B gets a clock either way (measured 2026-10-06: OK1, all counters clean).
+ *   B-codec-master (ASRC): quiet = jumper OPEN = the same stop E54 gives, but before any codec
+ *     or transport has been touched.
+ * The probe is only meaningful while CLC3OUT has never owned the pin: once routed it stays routed
+ * across a stop, so a co-clocked restart skips the check.  The B-master build never routes it.
+ * Threshold: 1024 samples, FITTED read 999-1000 transitions and OPEN read 0 (pull-down, AK512,
+ * 2026-10-06); 64 sits far from both.
+ */
+#define CODEC_B_PIN3_DRIVEN_MIN_TRANSITIONS  (64u)
+#if RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE != TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE
+static bool s_codec_b_pin3_routed;   // CLC3OUT has been routed onto pin 3 at least once
+#endif
+
+static bool audio_transport_stop_if_codec_b_pin3_wrong( void )
+{
+    uint32_t transitions;
+    bool driven;
+
+#if RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE != TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE
+    if( s_codec_b_pin3_routed ) { return false; }
+#endif
+    if( !audio_transport_board_codec_b_pin3_probe( &transitions ) ) { return false; }
+    driven = ( transitions >= CODEC_B_PIN3_DRIVEN_MIN_TRANSITIONS );
+    printf(" codec-B pin3 pre-check: %lu/%u transitions -> %s\n",
+           (unsigned long)transitions, (unsigned)AUDIO_TRANSPORT_BOARD_PIN3_PROBE_SAMPLES,
+           driven ? "DRIVEN" : "quiet" );
+#if RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE
+    if( driven ) { return false; }
+    s_codec_b_no_mclk_stop_latched = true;
+    audio_transport_mark_transition_failed( AUDIO_TRANSPORT_TRANSITION_ERROR_CODEC_APPLY_FAILED );
+    s_codec_b_missing_last_prt_ms = GetTicks();
+    audio_transport_print_codec_b_no_mclk_guidance();
+#else
+    if( !driven ) { return false; }   // s_codec_b_pin3_routed is set once the transport starts
+    s_codec_b_pin3_driven_stop_latched = true;
+    audio_transport_mark_transition_failed( AUDIO_TRANSPORT_TRANSITION_ERROR_CODEC_APPLY_FAILED );
+    s_codec_b_missing_last_prt_ms = GetTicks();
+    audio_transport_print_codec_b_pin3_driven_guidance();
+#endif
+    codec_b_fault_blink_start();
+    return true;
+}
+#elif NORA_TDM_USE_SPI2
+/* AK128 J3 routes leg B inside J3 with no CLC3 MCLK and is ROM-critical (see the
+ * codec-B-missing stub above): no hint text and no stop there. */
+static bool audio_transport_stop_if_codec_b_no_mclk( audio_transport_route_t route )
+{
+    (void)route;
+    return false;
+}
+static bool audio_transport_stop_if_codec_b_pin3_wrong( void )
+{
+    return false;
+}
+#endif
 
 // Analog mute/unmute both codecs (A, and B if the dual-SPI MikroB topology is used).
 // Brackets the stop side of a stop/restart so a rate-switch/forced-restart doesn't pop.
@@ -633,6 +842,13 @@ bool audio_transport_stop_for_flash( void )
 #else
     stopped = audio_transport_stop_route( AUDIO_TRANSPORT_ROUTE_HAL_DIRECT );
 #endif
+
+    /* The app owns outputs such as PWM. Shut them down even if codec mute
+     * verification or TDM stop failed; an explicit *ts remains terminal. */
+    const audio_transport_client_t* client = audio_transport_client_get();
+    if( client && client->stop_aux_output ) {
+        client->stop_aux_output( client->user );
+    }
 
     s_preflash_stop_confirmed = mute_ok && stopped;
     if( s_preflash_stop_confirmed )
@@ -1656,6 +1872,12 @@ static bool audio_transport_start_route_impl(
     // procedure said to confirm from the banner could not be confirmed there.)
     printf("  WM8904 config path: UNIFIED (rate table + role)\n");
 
+#if NORA_TDM_USE_SPI2
+    // Before ANY codec or transport is touched: a wrong CODEC-B XTAL-MCLK jumper stops here,
+    // ahead of CLC3 driving MikroBUS-B pin 3 (see audio_transport_stop_if_codec_b_pin3_wrong()).
+    if( audio_transport_stop_if_codec_b_pin3_wrong() ) { return false; }
+#endif // NORA_TDM_USE_SPI2
+
     // init CODEC board (master case: codec drives BCLK/FS before the transport starts)
 #if RESOLVED_TRANSPORT_LEG_A_CLOCK_SOURCE != TRANSPORT_CLOCK_SOURCE_CONTROLLER_VALUE
     printf("---------------------------------------------\n");
@@ -1780,6 +2002,10 @@ static bool audio_transport_start_route_impl(
 
     // init and start the TDM transport
     audio_transport_start_transport( route );
+#if NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B && \
+    ( RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE != TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE )
+    s_codec_b_pin3_routed = true;   // CLC3OUT owns pin 3 from here on: no more pin-3 pre-check
+#endif
 
     // Confirm the stream actually started BEFORE touching the codec. The WM8904 slave
     // DC-servo startup needs BCLK/LRCLK present, so configuring it when the stream did
@@ -1866,6 +2092,7 @@ static bool audio_transport_start_route_impl(
         audio_transport_report_codec_b_missing();
         return false;
     }
+    if( audio_transport_stop_if_codec_b_no_mclk( route ) ) { return false; }
   #else
     // B-codec-master: WM8904-B drives BCLK/FS from its SYSCLK = its OWN 12.288 MHz XTAL
     // (board jumper B-XTAL -> B-MCLK; FLL off, SYSCLK_SRC=MCLK, 256fs @48k -- the existing
@@ -1881,6 +2108,7 @@ static bool audio_transport_start_route_impl(
         audio_transport_report_codec_b_missing();
         return false;
     }
+    if( audio_transport_stop_if_codec_b_no_mclk( route ) ) { return false; }
   #endif // leg B nominal rate
 #elif RESOLVED_TRANSPORT_LEG_B_INITIAL_NOMINAL_RATE_HZ == 96000u
     // Classic 96 kHz co-clocked split (A=ADC master, B=DAC slave): unchanged
@@ -1896,6 +2124,7 @@ static bool audio_transport_start_route_impl(
         audio_transport_report_codec_b_missing();
         return false;
     }
+    if( audio_transport_stop_if_codec_b_no_mclk( route ) ) { return false; }
 #else
     if( !wm8904_init( I2C_INST_B, false ) )  // config as TDM slave
     {
@@ -1906,6 +2135,7 @@ static bool audio_transport_start_route_impl(
         audio_transport_report_codec_b_missing();
         return false;
     }
+    if( audio_transport_stop_if_codec_b_no_mclk( route ) ) { return false; }
 #endif // resolved rate and leg-B clock ownership
 
 #if (RESOLVED_TRANSPORT_LEG_B_CLOCK_SOURCE == TRANSPORT_CLOCK_SOURCE_ENDPOINT_VALUE) && \
@@ -2013,6 +2243,9 @@ static bool audio_transport_start_route_impl(
         s_preflash_stop_confirmed = false;
 #if NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B
         s_codec_b_missing_stop_latched = false;   // this start reached here, so B answered
+        s_codec_b_no_mclk_stop_latched = false;   // ... and had its MCLK
+        s_codec_b_pin3_driven_stop_latched = false;   // ... and its jumper passed the pre-check
+        codec_b_fault_blink_stop();
 #endif // NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B
     }
     else
@@ -2042,7 +2275,8 @@ static bool audio_transport_manage_route( audio_transport_route_t route )
     // audio_transport_report_codec_b_missing()) -- stay stopped instead of re-attempting
     // the whole start sequence every tick. An explicit *tr (audio_transport_restart_route)
     // still bypasses this and is free to try again.
-    if( s_codec_b_missing_stop_latched )
+    if( s_codec_b_missing_stop_latched || s_codec_b_no_mclk_stop_latched ||
+        s_codec_b_pin3_driven_stop_latched )
     {
         return false;
     }
@@ -2251,6 +2485,33 @@ static void audio_transport_dbg_print_leg_begin(
      * above warns about (measured: 30.5% -> 62.6% on the demoted leg while the real DSP load moved
      * 0.2 pt). Load is the DSPload line; this line keeps resp and margin in microseconds.
      * [internal] design_brief_2026-08-27_telemetry_derived_thresholds_and_diet.md P1. */
+    /*
+     * WHAT `margin=` IS, AND WHAT IT IS NOT (owner ruling 2026-09-16).
+     *
+     * margin = deadline - resp, where `deadline` is ONE block period (block_frames / fs).  That
+     * makes it a SCHEDULING / LATENCY DIAGNOSTIC -- "did this callback finish within one block of
+     * its own trigger" -- and NOT this transport's Hard-RT deadline margin.
+     *
+     * A NEGATIVE margin HERE IS NOT A DEADLINE VIOLATION.  The buffer is a DMA ping/pong: the RX
+     * block is lost only when the half-complete and the done interrupt collide, i.e. when the
+     * response exceeds TWO block periods.  That event has its own counter --
+     * block_deadline_miss_count in nora_spi_i2s_tdm.h, "the RX-block ISR fell a full block
+     * behind" -- and THAT counter, with starve/drop/bad/udf, is the authority on harm.  Nothing
+     * printed on this line is.
+     *
+     * Measured instance, so this is not a hypothetical: 48 -> 32 kHz, 16 ch, leg B response 566.2
+     * us against T = 500 us gives margin = -66.2 us, while the true deadline is 1000 us (margin
+     * +433.9 us, +43.4 %) and block_deadline_miss_count stayed 0 over 1,195,311 blocks.  The
+     * negative figure is the worst phase alignment of two legal preemptions by the faster leg --
+     * classical rate-monotonic worst-case response, reproduced to within 0.18 % by exact RTA.
+     *
+     * The two numbers are named apart wherever they are computed off-target
+     * (response_margin_1block_us vs hard_deadline_margin_2block_us, see
+     * [internal tool] universal_hard_deadline_table.py).  The WIRE FORMAT of this line is deliberately
+     * unchanged: every capture and every log reader in the tree parses `margin=`, and renaming the
+     * token would make old captures unreadable to buy nothing the comment does not already say.
+     * [internal] study_ak512_universal_phase_i_firmware_realization_2026-09-16.md section I7-1.
+     */
     (void)load_x10;
     printf("TDM%u:resp=%lu.%luus margin=",
            (unsigned)leg->physical_spi_instance,
@@ -2499,7 +2760,8 @@ static void audio_transport_dbg_print_leg_end(
 bool audio_transport_codec_b_missing_stop_active( void )
 {
 #if NORA_TDM_USE_SPI2 && !APP_AK128_J3_TDM_B
-    return s_codec_b_missing_stop_latched;
+    return s_codec_b_missing_stop_latched || s_codec_b_no_mclk_stop_latched ||
+        s_codec_b_pin3_driven_stop_latched;
 #else
     // Single-codec build, or the AK128 J3 bring-up build: the latch this reports
     // does not exist here (never set), so callers with their own periodic
@@ -2522,13 +2784,17 @@ void audio_transport_dbg_print( void )
     // by (the port re-enumerates on reset, same timing gap as a missed startup banner)
     // would otherwise find a silent, healthy-looking console with nothing to explain why
     // there is no audio.
-    if( s_codec_b_missing_stop_latched )
+    if( s_codec_b_missing_stop_latched || s_codec_b_no_mclk_stop_latched ||
+        s_codec_b_pin3_driven_stop_latched )
     {
         const uint32_t cur = GetTicks();
+        codec_b_fault_blink_service();
         if( (uint32_t)( cur - s_codec_b_missing_last_prt_ms ) >= 2000u )
         {
             s_codec_b_missing_last_prt_ms = cur;
-            audio_transport_print_codec_b_missing_guidance();
+            if( s_codec_b_missing_stop_latched )          { audio_transport_print_codec_b_missing_guidance(); }
+            else if( s_codec_b_pin3_driven_stop_latched ) { audio_transport_print_codec_b_pin3_driven_guidance(); }
+            else                                          { audio_transport_print_codec_b_no_mclk_guidance(); }
         }
         return;
     }

@@ -13,8 +13,12 @@
 #define MEAS_TABLE_NOMINAL_FS_HZ   48000
 #define MEAS_TABLE_TONE_LOW_HZ     1000
 #define MEAS_TABLE_TONE_HIGH_HZ    18000
+// MEAS_TABLE_N_LEVELS is the level count of a FULL row, i.e. the console's *at 02 range.
+// Since 2026-09-20 not every row carries all of them: a fold-image row carries -1 dBFS
+// only (see ROW_LEVELS in the generator), and audio_app_meas_table() clamps to that row's
+// own level 0.  Ask audio_app_meas_table_n_levels(row) for the per-row count.
 #define MEAS_TABLE_N_LEVELS        6
-#define MEAS_TABLE_N_TONES         28
+#define MEAS_TABLE_N_TONES         167
 
 // Tone ROW indices.  LOW and HIGH_48 are the historical `tone_high` 0/1.  HIGH_96 exists
 // because the HIGH_48 row lands at 36 kHz on a 96 kHz leg -- above a 48 kHz output's Nyquist,
@@ -26,34 +30,179 @@
 #define MEAS_TONE_ROW_HIGH_96      (2u)
 #define MEAS_TABLE_HIGH96_FS_HZ    96000
 
-// Sweep rows for the 48 -> 32 kHz N=97 audio-mode alias study.  The bench selects one
-// with `*at 04 VV`, VV = the row index below as two hex digits.  Each row is
-// sample-domain exact at 48 kHz; f = 48000 * cycles / len.
-#define MEAS_TONE_ROW_SW_5000    ( 3u)   //  5000 Hz at 48000 Hz   len=48  cycles=5
-#define MEAS_TONE_ROW_SW_10000   ( 4u)   // 10000 Hz at 48000 Hz   len=24  cycles=5
-#define MEAS_TONE_ROW_SW_12000   ( 5u)   // 12000 Hz at 48000 Hz   len=4   cycles=1
-#define MEAS_TONE_ROW_SW_13000   ( 6u)   // 13000 Hz at 48000 Hz   len=48  cycles=13
-#define MEAS_TONE_ROW_SW_13500   ( 7u)   // 13500 Hz at 48000 Hz   len=32  cycles=9
-#define MEAS_TONE_ROW_SW_14000   ( 8u)   // 14000 Hz at 48000 Hz   len=24  cycles=7
-#define MEAS_TONE_ROW_SW_15000   ( 9u)   // 15000 Hz at 48000 Hz   len=16  cycles=5
-#define MEAS_TONE_ROW_SW_15500   (10u)   // 15500 Hz at 48000 Hz   len=96  cycles=31
-#define MEAS_TONE_ROW_SW_16000   (11u)   // 16000 Hz at 48000 Hz   len=3   cycles=1
-#define MEAS_TONE_ROW_SW_16250   (12u)   // 16250 Hz at 48000 Hz   len=192 cycles=65
-#define MEAS_TONE_ROW_SW_16500   (13u)   // 16500 Hz at 48000 Hz   len=32  cycles=11
-#define MEAS_TONE_ROW_SW_16750   (14u)   // 16750 Hz at 48000 Hz   len=192 cycles=67
-#define MEAS_TONE_ROW_SW_17000   (15u)   // 17000 Hz at 48000 Hz   len=48  cycles=17
-#define MEAS_TONE_ROW_SW_17250   (16u)   // 17250 Hz at 48000 Hz   len=64  cycles=23
-#define MEAS_TONE_ROW_SW_17500   (17u)   // 17500 Hz at 48000 Hz   len=96  cycles=35
-#define MEAS_TONE_ROW_SW_17750   (18u)   // 17750 Hz at 48000 Hz   len=192 cycles=71
-#define MEAS_TONE_ROW_SW_18250   (19u)   // 18250 Hz at 48000 Hz   len=192 cycles=73
-#define MEAS_TONE_ROW_SW_18500   (20u)   // 18500 Hz at 48000 Hz   len=96  cycles=37
-#define MEAS_TONE_ROW_SW_18750   (21u)   // 18750 Hz at 48000 Hz   len=64  cycles=25
-#define MEAS_TONE_ROW_SW_19000   (22u)   // 19000 Hz at 48000 Hz   len=48  cycles=19
-#define MEAS_TONE_ROW_SW_20000   (23u)   // 20000 Hz at 48000 Hz   len=12  cycles=5
-#define MEAS_TONE_ROW_SW_21000   (24u)   // 21000 Hz at 48000 Hz   len=16  cycles=7
-#define MEAS_TONE_ROW_SW_22000   (25u)   // 22000 Hz at 48000 Hz   len=24  cycles=11
-#define MEAS_TONE_ROW_SW_23000   (26u)   // 23000 Hz at 48000 Hz   len=48  cycles=23
-#define MEAS_TONE_ROW_SW_23900   (27u)   // 23900 Hz at 48000 Hz   len=480 cycles=239
+// Sweep and pair rows.  The bench selects one with `*at 04 VV`, VV = the row index
+// below as two hex digits.
+//
+// EVERY ROW CARRIES ITS OWN SOURCE RATE, and the `at <n> Hz` in each comment is not
+// decoration: a row is SAMPLE-DOMAIN exact (f = fs_source * cycles / len), so playing
+// it on a leg at a different rate scales the frequency.  The SW_* rows are 48 kHz, the
+// PB44_/AL44_ rows 44.1 kHz, and the AA_* rows 22.05 / 32 / 44.1 kHz per their pair.
+// Pick the row whose source rate matches the LIVE leg; the *ac arm line prints the
+// actual tone either way, so a mismatch shows up there rather than silently.
+#define MEAS_TONE_ROW_SW_5000            ( 3u)   //  5000 Hz at 48000 Hz   len=48  cycles=5
+#define MEAS_TONE_ROW_SW_10000           ( 4u)   // 10000 Hz at 48000 Hz   len=24  cycles=5
+#define MEAS_TONE_ROW_SW_12000           ( 5u)   // 12000 Hz at 48000 Hz   len=4   cycles=1
+#define MEAS_TONE_ROW_SW_13000           ( 6u)   // 13000 Hz at 48000 Hz   len=48  cycles=13
+#define MEAS_TONE_ROW_SW_13500           ( 7u)   // 13500 Hz at 48000 Hz   len=32  cycles=9
+#define MEAS_TONE_ROW_SW_14000           ( 8u)   // 14000 Hz at 48000 Hz   len=24  cycles=7
+#define MEAS_TONE_ROW_SW_15000           ( 9u)   // 15000 Hz at 48000 Hz   len=16  cycles=5
+#define MEAS_TONE_ROW_SW_15500           (10u)   // 15500 Hz at 48000 Hz   len=96  cycles=31
+#define MEAS_TONE_ROW_SW_16000           (11u)   // 16000 Hz at 48000 Hz   len=3   cycles=1
+#define MEAS_TONE_ROW_SW_16250           (12u)   // 16250 Hz at 48000 Hz   len=192 cycles=65
+#define MEAS_TONE_ROW_SW_16500           (13u)   // 16500 Hz at 48000 Hz   len=32  cycles=11
+#define MEAS_TONE_ROW_SW_16750           (14u)   // 16750 Hz at 48000 Hz   len=192 cycles=67
+#define MEAS_TONE_ROW_SW_17000           (15u)   // 17000 Hz at 48000 Hz   len=48  cycles=17
+#define MEAS_TONE_ROW_SW_17250           (16u)   // 17250 Hz at 48000 Hz   len=64  cycles=23
+#define MEAS_TONE_ROW_SW_17500           (17u)   // 17500 Hz at 48000 Hz   len=96  cycles=35
+#define MEAS_TONE_ROW_SW_17750           (18u)   // 17750 Hz at 48000 Hz   len=192 cycles=71
+#define MEAS_TONE_ROW_SW_18250           (19u)   // 18250 Hz at 48000 Hz   len=192 cycles=73
+#define MEAS_TONE_ROW_SW_18500           (20u)   // 18500 Hz at 48000 Hz   len=96  cycles=37
+#define MEAS_TONE_ROW_SW_18750           (21u)   // 18750 Hz at 48000 Hz   len=64  cycles=25
+#define MEAS_TONE_ROW_SW_19000           (22u)   // 19000 Hz at 48000 Hz   len=48  cycles=19
+#define MEAS_TONE_ROW_SW_20000           (23u)   // 20000 Hz at 48000 Hz   len=12  cycles=5
+#define MEAS_TONE_ROW_SW_21000           (24u)   // 21000 Hz at 48000 Hz   len=16  cycles=7
+#define MEAS_TONE_ROW_SW_22000           (25u)   // 22000 Hz at 48000 Hz   len=24  cycles=11
+#define MEAS_TONE_ROW_SW_23000           (26u)   // 23000 Hz at 48000 Hz   len=48  cycles=23
+#define MEAS_TONE_ROW_SW_23900           (27u)   // 23900 Hz at 48000 Hz   len=480 cycles=239
+#define MEAS_TONE_ROW_PB44_980           (28u)   //   980 Hz at 44100 Hz   len=45  cycles=1
+#define MEAS_TONE_ROW_PB44_6468          (29u)   //  6468 Hz at 44100 Hz   len=75  cycles=11
+#define MEAS_TONE_ROW_AL44_9800          (30u)   //  9800 Hz at 44100 Hz   len=9   cycles=2
+#define MEAS_TONE_ROW_AL44_15680         (31u)   // 15680 Hz at 44100 Hz   len=45  cycles=16
+#define MEAS_TONE_ROW_AL44_16800         (32u)   // 16800 Hz at 44100 Hz   len=21  cycles=8
+#define MEAS_TONE_ROW_AL44_18900         (33u)   // 18900 Hz at 44100 Hz   len=7   cycles=3
+#define MEAS_TONE_ROW_AA_22K05_8K_MID    (34u)   //  1050 Hz at 22050 Hz   len=21  cycles=1
+#define MEAS_TONE_ROW_AA_22K05_8K_FP     (35u)   //  3234 Hz at 22050 Hz   len=75  cycles=11
+#define MEAS_TONE_ROW_AA_22K05_8K_N095   (36u)   //  3780 Hz at 22050 Hz   len=35  cycles=6
+#define MEAS_TONE_ROW_AA_22K05_8K_FN     (37u)   //  3969 Hz at 22050 Hz   len=50  cycles=9
+#define MEAS_TONE_ROW_AA_22K05_8K_N105   (38u)   //  4200 Hz at 22050 Hz   len=21  cycles=4
+#define MEAS_TONE_ROW_AA_22K05_8K_N110   (39u)   //  4410 Hz at 22050 Hz   len=5   cycles=1
+#define MEAS_TONE_ROW_AA_22K05_8K_STOP   (40u)   //  4725 Hz at 22050 Hz   len=14  cycles=3
+#define MEAS_TONE_ROW_AA_32K_11K025_MID  (41u)   //  1280 Hz at 32000 Hz   len=25  cycles=1
+#define MEAS_TONE_ROW_AA_32K_11K025_FP   (42u)   //  4450 Hz at 32000 Hz   len=640 cycles=89
+#define MEAS_TONE_ROW_AA_32K_11K025_N095 (43u)   //  5200 Hz at 32000 Hz   len=80  cycles=13
+#define MEAS_TONE_ROW_AA_32K_11K025_FN   (44u)   //  5500 Hz at 32000 Hz   len=64  cycles=11
+#define MEAS_TONE_ROW_AA_32K_11K025_N105 (45u)   //  5760 Hz at 32000 Hz   len=50  cycles=9
+#define MEAS_TONE_ROW_AA_32K_11K025_N110 (46u)   //  6080 Hz at 32000 Hz   len=100 cycles=19
+#define MEAS_TONE_ROW_AA_32K_11K025_STOP (47u)   //  6500 Hz at 32000 Hz   len=64  cycles=13
+#define MEAS_TONE_ROW_AA_44K1_12K_MID    (48u)   //  1575 Hz at 44100 Hz   len=28  cycles=1
+#define MEAS_TONE_ROW_AA_44K1_12K_FP     (49u)   //  4851 Hz at 44100 Hz   len=100 cycles=11
+#define MEAS_TONE_ROW_AA_44K1_12K_N095   (50u)   //  5670 Hz at 44100 Hz   len=70  cycles=9
+#define MEAS_TONE_ROW_AA_44K1_12K_FN     (51u)   //  5950 Hz at 44100 Hz   len=126 cycles=17
+#define MEAS_TONE_ROW_AA_44K1_12K_N105   (52u)   //  6300 Hz at 44100 Hz   len=7   cycles=1
+#define MEAS_TONE_ROW_AA_44K1_12K_N110   (53u)   //  6615 Hz at 44100 Hz   len=20  cycles=3
+#define MEAS_TONE_ROW_AA_44K1_12K_STOP   (54u)   //  7056 Hz at 44100 Hz   len=25  cycles=4
+#define MEAS_TONE_ROW_AA_44K1_8K_MID     (55u)   //  1050 Hz at 44100 Hz   len=42  cycles=1
+#define MEAS_TONE_ROW_AA_44K1_8K_FP      (56u)   //  3234 Hz at 44100 Hz   len=150 cycles=11
+#define MEAS_TONE_ROW_AA_44K1_8K_N095    (57u)   //  3780 Hz at 44100 Hz   len=35  cycles=3
+#define MEAS_TONE_ROW_AA_44K1_8K_FN      (58u)   //  3969 Hz at 44100 Hz   len=100 cycles=9
+#define MEAS_TONE_ROW_AA_44K1_8K_N105    (59u)   //  4200 Hz at 44100 Hz   len=21  cycles=2
+#define MEAS_TONE_ROW_AA_44K1_8K_N110    (60u)   //  4410 Hz at 44100 Hz   len=10  cycles=1
+#define MEAS_TONE_ROW_AA_44K1_8K_STOP    (61u)   //  4725 Hz at 44100 Hz   len=28  cycles=3
+#define MEAS_TONE_ROW_F1K_8K             (62u)   //  1000 Hz at 8000 Hz   len=8   cycles=1
+#define MEAS_TONE_ROW_F1K_11K025         (63u)   //  1008 Hz at 11025 Hz   len=175 cycles=16
+#define MEAS_TONE_ROW_F1K_12K            (64u)   //  1000 Hz at 12000 Hz   len=12  cycles=1
+#define MEAS_TONE_ROW_F1K_16K            (65u)   //  1000 Hz at 16000 Hz   len=16  cycles=1
+#define MEAS_TONE_ROW_F1K_22K05          (66u)   //  1008 Hz at 22050 Hz   len=175 cycles=8
+#define MEAS_TONE_ROW_F1K_24K            (67u)   //  1000 Hz at 24000 Hz   len=24  cycles=1
+#define MEAS_TONE_ROW_F1K_32K            (68u)   //  1000 Hz at 32000 Hz   len=32  cycles=1
+#define MEAS_TONE_ROW_F1K_44K1           (69u)   //  1008 Hz at 44100 Hz   len=175 cycles=4
+#define MEAS_TONE_ROW_AQ_8_2400          (70u)   //  2400 Hz at 8000 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_11K025_3325     (71u)   //  3325 Hz at 11025 Hz   len=63  cycles=19
+#define MEAS_TONE_ROW_AQ_12_3200         (72u)   //  3200 Hz at 12000 Hz   len=15  cycles=4
+#define MEAS_TONE_ROW_AQ_12_3600         (73u)   //  3600 Hz at 12000 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_12_5600         (74u)   //  5600 Hz at 12000 Hz   len=15  cycles=7
+#define MEAS_TONE_ROW_AQ_16_3750         (75u)   //  3750 Hz at 16000 Hz   len=64  cycles=15
+#define MEAS_TONE_ROW_AQ_16_3840         (76u)   //  3840 Hz at 16000 Hz   len=25  cycles=6
+#define MEAS_TONE_ROW_AQ_16_4032         (77u)   //  4032 Hz at 16000 Hz   len=250 cycles=63
+#define MEAS_TONE_ROW_AQ_16_4400         (78u)   //  4400 Hz at 16000 Hz   len=40  cycles=11
+#define MEAS_TONE_ROW_AQ_16_4800         (79u)   //  4800 Hz at 16000 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_22K05_3430      (80u)   //  3430 Hz at 22050 Hz   len=45  cycles=7
+#define MEAS_TONE_ROW_AQ_22K05_3675      (81u)   //  3675 Hz at 22050 Hz   len=6   cycles=1
+#define MEAS_TONE_ROW_AQ_22K05_3920      (82u)   //  3920 Hz at 22050 Hz   len=45  cycles=8
+#define MEAS_TONE_ROW_AQ_22K05_4050      (83u)   //  4050 Hz at 22050 Hz   len=49  cycles=9
+#define MEAS_TONE_ROW_AQ_22K05_4851      (84u)   //  4851 Hz at 22050 Hz   len=50  cycles=11
+#define MEAS_TONE_ROW_AQ_22K05_5145      (85u)   //  5145 Hz at 22050 Hz   len=30  cycles=7
+#define MEAS_TONE_ROW_AQ_22K05_5250      (86u)   //  5250 Hz at 22050 Hz   len=21  cycles=5
+#define MEAS_TONE_ROW_AQ_22K05_5600      (87u)   //  5600 Hz at 22050 Hz   len=63  cycles=16
+#define MEAS_TONE_ROW_AQ_22K05_5880      (88u)   //  5880 Hz at 22050 Hz   len=15  cycles=4
+#define MEAS_TONE_ROW_AQ_22K05_6125      (89u)   //  6125 Hz at 22050 Hz   len=18  cycles=5
+#define MEAS_TONE_ROW_AQ_22K05_6615      (90u)   //  6615 Hz at 22050 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_22K05_8820      (91u)   //  8820 Hz at 22050 Hz   len=5   cycles=2
+#define MEAS_TONE_ROW_AQ_24_1600         (92u)   //  1600 Hz at 24000 Hz   len=15  cycles=1
+#define MEAS_TONE_ROW_AQ_24_2250         (93u)   //  2250 Hz at 24000 Hz   len=32  cycles=3
+#define MEAS_TONE_ROW_AQ_24_3750         (94u)   //  3750 Hz at 24000 Hz   len=32  cycles=5
+#define MEAS_TONE_ROW_AQ_24_4080         (95u)   //  4080 Hz at 24000 Hz   len=100 cycles=17
+#define MEAS_TONE_ROW_AQ_24_4400         (96u)   //  4400 Hz at 24000 Hz   len=60  cycles=11
+#define MEAS_TONE_ROW_AQ_24_4750         (97u)   //  4750 Hz at 24000 Hz   len=96  cycles=19
+#define MEAS_TONE_ROW_AQ_24_5600         (98u)   //  5600 Hz at 24000 Hz   len=30  cycles=7
+#define MEAS_TONE_ROW_AQ_24_5760         (99u)   //  5760 Hz at 24000 Hz   len=25  cycles=6
+#define MEAS_TONE_ROW_AQ_24_6080         (100u)   //  6080 Hz at 24000 Hz   len=75  cycles=19
+#define MEAS_TONE_ROW_AQ_24_6400         (101u)   //  6400 Hz at 24000 Hz   len=15  cycles=4
+#define MEAS_TONE_ROW_AQ_24_7200         (102u)   //  7200 Hz at 24000 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_24_10800        (103u)   // 10800 Hz at 24000 Hz   len=20  cycles=9
+#define MEAS_TONE_ROW_AQ_24_11200        (104u)   // 11200 Hz at 24000 Hz   len=15  cycles=7
+#define MEAS_TONE_ROW_AQ_32_1600         (105u)   //  1600 Hz at 32000 Hz   len=20  cycles=1
+#define MEAS_TONE_ROW_AQ_32_2240         (106u)   //  2240 Hz at 32000 Hz   len=100 cycles=7
+#define MEAS_TONE_ROW_AQ_32_2400         (107u)   //  2400 Hz at 32000 Hz   len=40  cycles=3
+#define MEAS_TONE_ROW_AQ_32_3750         (108u)   //  3750 Hz at 32000 Hz   len=128 cycles=15
+#define MEAS_TONE_ROW_AQ_32_3840         (109u)   //  3840 Hz at 32000 Hz   len=25  cycles=3
+#define MEAS_TONE_ROW_AQ_32_4096         (110u)   //  4096 Hz at 32000 Hz   len=125 cycles=16
+#define MEAS_TONE_ROW_AQ_32_5440         (111u)   //  5440 Hz at 32000 Hz   len=100 cycles=17
+#define MEAS_TONE_ROW_AQ_32_5600         (112u)   //  5600 Hz at 32000 Hz   len=40  cycles=7
+#define MEAS_TONE_ROW_AQ_32_7500         (113u)   //  7500 Hz at 32000 Hz   len=64  cycles=15
+#define MEAS_TONE_ROW_AQ_32_7680         (114u)   //  7680 Hz at 32000 Hz   len=25  cycles=6
+#define MEAS_TONE_ROW_AQ_32_8064         (115u)   //  8064 Hz at 32000 Hz   len=250 cycles=63
+#define MEAS_TONE_ROW_AQ_32_8800         (116u)   //  8800 Hz at 32000 Hz   len=40  cycles=11
+#define MEAS_TONE_ROW_AQ_32_9600         (117u)   //  9600 Hz at 32000 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_32_12800        (118u)   // 12800 Hz at 32000 Hz   len=5   cycles=2
+#define MEAS_TONE_ROW_AQ_32_14400        (119u)   // 14400 Hz at 32000 Hz   len=20  cycles=9
+#define MEAS_TONE_ROW_AQ_44K1_1620       (120u)   //  1620 Hz at 44100 Hz   len=245 cycles=9
+#define MEAS_TONE_ROW_AQ_44K1_2205       (121u)   //  2205 Hz at 44100 Hz   len=20  cycles=1
+#define MEAS_TONE_ROW_AQ_44K1_2450       (122u)   //  2450 Hz at 44100 Hz   len=18  cycles=1
+#define MEAS_TONE_ROW_AQ_44K1_3430       (123u)   //  3430 Hz at 44100 Hz   len=90  cycles=7
+#define MEAS_TONE_ROW_AQ_44K1_3920       (124u)   //  3920 Hz at 44100 Hz   len=45  cycles=4
+#define MEAS_TONE_ROW_AQ_44K1_5040       (125u)   //  5040 Hz at 44100 Hz   len=35  cycles=4
+#define MEAS_TONE_ROW_AQ_44K1_5292       (126u)   //  5292 Hz at 44100 Hz   len=25  cycles=3
+#define MEAS_TONE_ROW_AQ_44K1_5600       (127u)   //  5600 Hz at 44100 Hz   len=63  cycles=8
+#define MEAS_TONE_ROW_AQ_44K1_5880       (128u)   //  5880 Hz at 44100 Hz   len=15  cycles=2
+#define MEAS_TONE_ROW_AQ_44K1_6125       (129u)   //  6125 Hz at 44100 Hz   len=36  cycles=5
+#define MEAS_TONE_ROW_AQ_44K1_6860       (130u)   //  6860 Hz at 44100 Hz   len=45  cycles=7
+#define MEAS_TONE_ROW_AQ_44K1_7350       (131u)   //  7350 Hz at 44100 Hz   len=6   cycles=1
+#define MEAS_TONE_ROW_AQ_44K1_7875       (132u)   //  7875 Hz at 44100 Hz   len=28  cycles=5
+#define MEAS_TONE_ROW_AQ_44K1_8100       (133u)   //  8100 Hz at 44100 Hz   len=49  cycles=9
+#define MEAS_TONE_ROW_AQ_44K1_9702       (134u)   //  9702 Hz at 44100 Hz   len=50  cycles=11
+#define MEAS_TONE_ROW_AQ_44K1_10290      (135u)   // 10290 Hz at 44100 Hz   len=30  cycles=7
+#define MEAS_TONE_ROW_AQ_44K1_10500      (136u)   // 10500 Hz at 44100 Hz   len=21  cycles=5
+#define MEAS_TONE_ROW_AQ_44K1_11200      (137u)   // 11200 Hz at 44100 Hz   len=63  cycles=16
+#define MEAS_TONE_ROW_AQ_44K1_11340      (138u)   // 11340 Hz at 44100 Hz   len=35  cycles=9
+#define MEAS_TONE_ROW_AQ_44K1_12250      (139u)   // 12250 Hz at 44100 Hz   len=18  cycles=5
+#define MEAS_TONE_ROW_AQ_44K1_17640      (140u)   // 17640 Hz at 44100 Hz   len=5   cycles=2
+#define MEAS_TONE_ROW_AQ_44K1_19600      (141u)   // 19600 Hz at 44100 Hz   len=9   cycles=4
+#define MEAS_TONE_ROW_AQ_48_1600         (142u)   //  1600 Hz at 48000 Hz   len=30  cycles=1
+#define MEAS_TONE_ROW_AQ_48_2250         (143u)   //  2250 Hz at 48000 Hz   len=64  cycles=3
+#define MEAS_TONE_ROW_AQ_48_2400         (144u)   //  2400 Hz at 48000 Hz   len=20  cycles=1
+#define MEAS_TONE_ROW_AQ_48_3072         (145u)   //  3072 Hz at 48000 Hz   len=125 cycles=8
+#define MEAS_TONE_ROW_AQ_48_3200         (146u)   //  3200 Hz at 48000 Hz   len=15  cycles=1
+#define MEAS_TONE_ROW_AQ_48_3360         (147u)   //  3360 Hz at 48000 Hz   len=100 cycles=7
+#define MEAS_TONE_ROW_AQ_48_3840         (148u)   //  3840 Hz at 48000 Hz   len=25  cycles=2
+#define MEAS_TONE_ROW_AQ_48_4080         (149u)   //  4080 Hz at 48000 Hz   len=200 cycles=17
+#define MEAS_TONE_ROW_AQ_48_4400         (150u)   //  4400 Hz at 48000 Hz   len=120 cycles=11
+#define MEAS_TONE_ROW_AQ_48_4608         (151u)   //  4608 Hz at 48000 Hz   len=125 cycles=12
+#define MEAS_TONE_ROW_AQ_48_5600         (152u)   //  5600 Hz at 48000 Hz   len=60  cycles=7
+#define MEAS_TONE_ROW_AQ_48_5760         (153u)   //  5760 Hz at 48000 Hz   len=25  cycles=3
+#define MEAS_TONE_ROW_AQ_48_6144         (154u)   //  6144 Hz at 48000 Hz   len=125 cycles=16
+#define MEAS_TONE_ROW_AQ_48_7500         (155u)   //  7500 Hz at 48000 Hz   len=32  cycles=5
+#define MEAS_TONE_ROW_AQ_48_8160         (156u)   //  8160 Hz at 48000 Hz   len=100 cycles=17
+#define MEAS_TONE_ROW_AQ_48_8800         (157u)   //  8800 Hz at 48000 Hz   len=60  cycles=11
+#define MEAS_TONE_ROW_AQ_48_9500         (158u)   //  9500 Hz at 48000 Hz   len=96  cycles=19
+#define MEAS_TONE_ROW_AQ_48_11200        (159u)   // 11200 Hz at 48000 Hz   len=30  cycles=7
+#define MEAS_TONE_ROW_AQ_48_11520        (160u)   // 11520 Hz at 48000 Hz   len=25  cycles=6
+#define MEAS_TONE_ROW_AQ_48_12160        (161u)   // 12160 Hz at 48000 Hz   len=75  cycles=19
+#define MEAS_TONE_ROW_AQ_48_12800        (162u)   // 12800 Hz at 48000 Hz   len=15  cycles=4
+#define MEAS_TONE_ROW_AQ_48_14400        (163u)   // 14400 Hz at 48000 Hz   len=10  cycles=3
+#define MEAS_TONE_ROW_AQ_48_19200        (164u)   // 19200 Hz at 48000 Hz   len=5   cycles=2
+#define MEAS_TONE_ROW_AQ_48_19500        (165u)   // 19500 Hz at 48000 Hz   len=32  cycles=13
+#define MEAS_TONE_ROW_AQ_48_22400        (166u)   // 22400 Hz at 48000 Hz   len=15  cycles=7
 
 typedef struct {
     const int32_t *samp;         // int24 samples (sign-extended in int32)
@@ -65,8 +214,12 @@ typedef struct {
 } meas_tone_table_t;
 
 // tone_row: 0..MEAS_TABLE_N_TONES-1 (see MEAS_TONE_ROW_* above); out-of-range falls back to
-// row 0. level_idx 0..5 = {-1,-60,-20,-40,-80,-6} dBFS.
+// row 0. level_idx 0..5 = {-1,-60,-20,-40,-80,-6} dBFS -- but a row may carry FEWER than
+// six (the fold-image rows carry -1 dBFS only), and level_idx then clamps to that row's 0.
+// The returned struct reports the level actually served in level_dbfs, which every caller
+// already prints; audio_app_meas_table_n_levels() answers the count before arming.
 const meas_tone_table_t *audio_app_meas_table( uint8_t tone_row, uint8_t level_idx );
+uint8_t audio_app_meas_table_n_levels( uint8_t tone_row );
 #endif // APP_ASRC_MEAS
 
 #endif // AUDIO_APP_MEAS_TONES_H

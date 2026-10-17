@@ -31,7 +31,7 @@ class Candidate:
 
 CANDIDATES = (
     Candidate("baseline-m32-bh4", 32, 0.450, "bh4", None, -2.0, -105.0),
-    Candidate("headroom-m30-kaiser11", 30, 0.465, "kaiser", 11.0, -1.1, -105.0),
+    Candidate("headroom-m30-kaiser11.3", 30, 0.464, "kaiser", 11.3, -1.1, -105.0),
     Candidate("headroom-m28-kaiser10.55", 28, 0.4632, "kaiser", 10.55, -1.1, -105.0),
 )
 
@@ -98,7 +98,7 @@ OUTPUT_NYQUIST_24000_HZ = 12000.0
 # so the OUTPUT Nyquist is 11025 Hz -- 975 Hz BELOW the intermediate's, unlike every row above.
 # That gap is why the 24 kHz coefficients cannot be reused: measured with the stopband left at
 # 12000 Hz the cascade is -24.70 dB and the stage alone -19.74 dB, because 11025-12000 Hz walks
-# through the stage at only ~-19 dB and the resampler's fc = 0.465*24000 = 11160 Hz sits ABOVE
+# through the stage at only ~-19 dB and the resampler's fc = 0.464*24000 = 11136 Hz sits ABOVE
 # 11025 Hz, so it cannot remove what then folds.  Hence a second coefficient set with its
 # stopband pinned on 11025 Hz.
 # 107 taps again, and shared with the 24 kHz set on purpose: 7875 = 11025 - 3150 keeps the same
@@ -128,7 +128,7 @@ MAX_CASCADE_IMAGE_DB = -100.0
 
 
 def resampler_prototype() -> np.ndarray:
-    """Interleaved polyphase prototype of the shipping resampler (headroom-m30-kaiser11).
+    """Interleaved polyphase prototype of the shipping resampler (headroom-m30-kaiser11.3).
 
     NOTE its sample rate: the interleave makes this an L-times-oversampled filter running at
     L * fs_intermediate, so every caller must evaluate it at L * fs_intermediate.
@@ -198,8 +198,8 @@ def check_frontend_cascade(label: str,
           if stage2 is not None else np.ones_like(folded))
     # The interleaved polyphase prototype is an L-times-oversampled filter: its
     # sample rate is L * intermediate, NOT the intermediate rate. Evaluating it against
-    # a 16 kHz axis (the bug fixed 2026-07-29) compressed its fc=0.465*16000=7440 Hz
-    # cutoff down to 7440/L = 58 Hz, so h3 read -300 dB across the whole alias
+    # a 16 kHz axis (the bug fixed 2026-07-29) compressed its fc=0.464*16000=7424 Hz
+    # cutoff down to 7424/L = 58 Hz, so h3 read -300 dB across the whole alias
     # band and this gate PASSed unconditionally -- it would have passed with
     # stage2 removed entirely. Control that validates the corrected axis: with
     # stage2 omitted the worst alias comes out at 0.00 dB, matching the -0.01 dB

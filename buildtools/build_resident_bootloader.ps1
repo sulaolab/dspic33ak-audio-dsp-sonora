@@ -250,7 +250,8 @@ if ($defineFlags.Count -ne 0) {
 # application's -DSONORA_GIT_COMMIT in build.ps1, and the same two traps: read
 # $LASTEXITCODE immediately after the native call (piping into Select-Object can stop
 # the pipeline early and leave it unset), and sanitize to [A-Za-z0-9_] so the result is
-# always one valid C token. A dirty tree becomes "<hash>_dirty"; no Git means "unknown".
+# always one valid C token. Any working-tree change becomes "<hash>_dirty" except untracked
+# files under _ai_out/ (same rule as build.ps1); no Git means "unknown".
 #
 # This is how an older boot image is identified and reproduced: build that commit.
 $bootRevision = 'unknown'
@@ -266,7 +267,7 @@ if ($null -ne $gitCmd) {
         $statusRaw = & $gitCmd.Source -C $repoRoot status --porcelain --untracked-files=normal 2>$null
         $statusOk  = ($LASTEXITCODE -eq 0)
         if ($statusOk) {
-            $dirty = @($statusRaw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $dirty = @($statusRaw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notlike '?? _ai_out/*' })
             if ($dirty.Count -gt 0) { $bootRevision += '_dirty' }
         }
     }

@@ -1,6 +1,169 @@
 #ifndef SONORA_ASRC_APP_BUILD_CONFIG_H
 #define SONORA_ASRC_APP_BUILD_CONFIG_H
 
+/* UNIVERSAL DEFAULT FOR THE TWO AK512 SHIPPING PRESETS (2026-09-17, owner decision).
+ *
+ * WHAT THIS IS.  Everything the Universal profile needs -- the Q31 rear, flash coefficient
+ * storage, L=256, the 1:1 front-end stage, member B's own pin -- already exists and is
+ * already gated on APP_ASRC_UNIVERSAL_PROFILE (and, downstream of it, on
+ * APP_ASRC_LPF1TO1_PROTOTYPE).  PR #31 qualified all of it as an opt-in profile.  This block
+ * is the ONLY thing that changes: which value those two macros resolve to when nobody passes
+ * a -Define, for exactly the two presets that PR #31's own build matrix ran as
+ * `bidir_shipping` / `96k_a2b_shipping`.  It is a DEFAULT SELECTION change, not a DSP change --
+ * no filter, no coefficient, no pin below this block is touched.
+ *
+ * WHY THIS IS THE FIRST THING IN THE FILE.  Both macros are tested as VALUES further down in
+ * this same file (the BIDIR preset's L=256 pin, member B's whole pin block) -- and this file is
+ * read before asrc_app_config.h, which is where the project-wide fallback 0 for both macros
+ * lives.  So a preset default has to arrive HERE, ahead of every consumer in this file, or
+ * those consumers see an undefined name exactly the way the C0.3 configuration guard (class A
+ * ORDER, buildtools/check_config_gate.py) already refused once this PR cycle.  APP_BUILD
+ * itself is available this early -- the very next block in this file already switches on it.
+ *
+ * WHY ONLY THESE TWO PRESETS.  APP_BUILD_ASRC_CODEC_BIDIR is Universal member A;
+ * APP_BUILD_ASRC_CODEC_96K_A_TO_B is member B.  No other preset is named here, so no other
+ * preset's default moves: AK128, the 96K_12CH_32K stress architecture, MEAS/HEADROOM builds
+ * and every Classic build keep reading the project-wide fallback in asrc_app_config.h exactly
+ * as before.  Widening the generic fallback instead of pinning these two presets was
+ * considered and rejected for that reason -- it would enable Universal on presets it was never
+ * qualified against.
+ *
+ * LPF1TO1_PROTOTYPE FOLLOWS THE RESOLVED PROFILE, NOT A SECOND HARD-CODED 1.  Universal
+ * requires it (asrc_app_config.h's own #error says so), so writing a bare `(1)` here would let
+ * `-Define APP_ASRC_UNIVERSAL_PROFILE=0` produce the broken state UNIVERSAL_PROFILE=0 with
+ * LPF1TO1_PROTOTYPE=1.  Assigning it FROM the (already-resolved) profile macro instead means
+ * the escape hatch in requirement 3 keeps working unchanged: an explicit 0 for the profile
+ * carries LPF1TO1 down to 0 with it, and only a bare no-define build (or an explicit profile=1)
+ * reaches Universal.
+ *
+ * THE ESCAPE HATCH IS UNCHANGED.  `#ifndef` never overrides an explicit -Define, on either
+ * macro, in either direction: -Define APP_ASRC_UNIVERSAL_PROFILE=0 still means Legacy on both
+ * presets, and -Define APP_ASRC_UNIVERSAL_PROFILE=1 still means what it always meant. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B)
+  #ifndef APP_ASRC_UNIVERSAL_PROFILE
+    #define APP_ASRC_UNIVERSAL_PROFILE (1)
+  #endif
+  #ifndef APP_ASRC_LPF1TO1_PROTOTYPE
+    #define APP_ASRC_LPF1TO1_PROTOTYPE APP_ASRC_UNIVERSAL_PROFILE
+  #endif
+#endif
+
+/* THE FOUR ANTI-ALIAS FRONT-END ROWS ARE DEFAULT ON FOR THE BIDIR PRESET (2026-09-20, owner
+ * decision after listening).
+ *
+ * WHAT THIS IS, AND WHAT IT IS NOT.  The four rows -- 22.05 <-> 8, 32 <-> 11.025, 44.1 <-> 12
+ * and 44.1 <-> 8 kHz -- already exist, are already implemented, and are already gated
+ * (asrc_app_config.h defines each at 0 and states what it adds).  This block is the ONLY thing
+ * that changes: which value those four macros resolve to when nobody passes a -Define, for
+ * exactly the one preset whose hardware evidence covers them.  It is a DEFAULT SELECTION
+ * change.  No filter, no coefficient, no policy, no law and no ring below this block moves --
+ * and that is checkable rather than asserted: s_asrc_unsafe_direct_routes[] is unchanged, every
+ * pair THAT TABLE LISTS still reads REFUSE on its DIRECT route (a filtered row publishes den != 1
+ * and asrc_direct_route_is_allowed() exempts it by ratio), ASRC_POLY_FC is still the selected
+ * production value,
+ * asrc_fill_law() and ASRC_FILL_TARGET_MAX are untouched, and no telemetry was removed.
+ *
+ * ★ "EVERY LISTED PAIR" IS NOT "ALL FOUR OF THESE PAIRS", and the difference matters here because
+ * this block is where someone will come to check the claim.  Three of the four rows above
+ * (22.05 -> 8, 32 -> 11.025, 44.1 -> 12 kHz) ARE in s_asrc_unsafe_direct_routes[].  44.1 -> 8 kHz
+ * is NOT, and must not be added: its DIRECT route reads ALLOW from the anti-alias predicate, and
+ * what refuses it is the FILL LAW (set_required 116 against TARGET_MAX 104).  The property the four
+ * rows share is "the pair does not exist without its filtered row", not "the policy refuses all
+ * four".  PR #37 had to correct exactly this claim in antialias_gate_delta.py and PR #38's review
+ * caught it again in the status board; test_asrc_rate_plan.py's OPTIN_FRONTEND_ROWS now carries the
+ * distinction as data (blocker="alias" vs "fill") and asserts it per row.
+ *
+ * WHY IT IS THE FIRST THING AFTER THE PROFILE BLOCK.  Same order argument as the block above:
+ * the project-wide fallback 0 for all four macros lives in asrc_app_config.h, which the
+ * preprocessor reaches AFTER this file, so a preset default has to arrive here, ahead of any
+ * consumer.  Each row's own `#if APP_ASRC_ANTIALIAS_* && !APP_ASRC_LPF1TO1_PROTOTYPE` #error
+ * sits in asrc_app_config.h and therefore reads both macros AFTER this block has resolved
+ * them -- which is what keeps the pairing check honest under this default.
+ *
+ * WHY ONLY THE BIDIR PRESET.  Its qualification is the qualification these rows have.  The
+ * evidence is that preset at 16+16 channels: 81/81 cells accepted / live / every impact counter
+ * delta 0, 6 windows x 960 s of long dwell in both orientations per pair, a 48/48 regression
+ * either side, worst arena 171 of 209, worst new-row load 72.5 % against the image's own
+ * pre-existing worst of 93.3 % (22.05/48, an EXISTING row this work did not touch), and owner
+ * listening PASS on 2026-09-20.  No other preset is named here, so no other preset's default
+ * moves -- 96K_A_TO_B, the 96K_12CH_32K stress architecture, AK128, every MEAS and HEADROOM
+ * build and every Classic build keep reading the fallback 0 in asrc_app_config.h.  Widening
+ * the generic fallback instead was considered and rejected for exactly that reason: the arena
+ * and CPU evidence above is per-preset, and 96K_12CH_32K in particular ships on ~1.2 pt of CPU
+ * window.
+ *
+ * MEAS IS DELIBERATELY NOT INCLUDED, and this is a trap rather than an omission.  A MEAS build
+ * still reads 0, so measuring one of these four pairs on a MEAS image WITHOUT passing the gate
+ * measures the REFUSED DIRECT route and reports it as the pair -- which looks healthy in the
+ * log.  Pass the gate explicitly and confirm `fe=` in the *ac arm line before trusting a
+ * capture.  Naming MEAS here would hide that: a measurement image should measure what it was
+ * asked to measure, not inherit a product default.
+ *
+ * THE ESCAPE HATCH IS UNCHANGED.  All four are #ifndef, so -Define APP_ASRC_ANTIALIAS_...=0
+ * returns this preset to the pre-2026-09-20 image, per row, and a build with all four at 0 is
+ * the image the tree produced before this block.
+ *
+ * WHAT IT COSTS.  +908 B of program for the four armed rows (measured: 253,472 -> 254,380 B),
+ * and nothing in data memory -- the coefficient sets are const and the front-end history arena
+ * is statically sized for the worst row either way.
+ *
+ * [internal] study_remaining_rate_pairs_20260920.md sections 6 and 8,
+ * [internal] report_owner_listening_20260920.md, [internal] status_board_20260920c.md. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR)
+  #ifndef APP_ASRC_ANTIALIAS_22K05_TO_8K
+    #define APP_ASRC_ANTIALIAS_22K05_TO_8K (1)
+  #endif
+  #ifndef APP_ASRC_ANTIALIAS_32K_TO_11K025
+    #define APP_ASRC_ANTIALIAS_32K_TO_11K025 (1)
+  #endif
+  #ifndef APP_ASRC_ANTIALIAS_44K1_TO_12K
+    #define APP_ASRC_ANTIALIAS_44K1_TO_12K (1)
+  #endif
+  #ifndef APP_ASRC_ANTIALIAS_44K1_TO_8K
+    #define APP_ASRC_ANTIALIAS_44K1_TO_8K (1)
+  #endif
+#endif
+
+/* The full81 campaign measured six additional lower-rate DIRECT down-conversions aliasing into
+ * the protected band.  They are one implementation class: a source-rate 1:1 LPF using arrays
+ * already present in both Universal product images.  The 96K_A_TO_B console and pair policy allow
+ * these low/low pairs, so that product preset must not silently fall back to the known-bad direct
+ * route.  Its v6.30 A/B map adds 2,024 program bytes and no data/Y-history/coefficient storage.
+ *
+ * MEAS remains explicit: a measurement image measures the gate it was asked to measure.  The
+ * #ifndef is the per-preset escape hatch for a controlled pre-fix comparison. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || \
+    (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B)
+  #ifndef APP_ASRC_ANTIALIAS_DIRECT_1TO1
+    #define APP_ASRC_ANTIALIAS_DIRECT_1TO1 (1)
+  #endif
+#endif
+
+/* Nine further direct-route holes (2026-10-03 qualification), same 1:1 class and existing arrays.
+ * BIDIR: qualified on MEAS cd951f5 (81 cells, X 14 -> 5) and on the product image
+ * cc8d73e (18 directed cells live, RT clean, max_demand <= 87.7 %, 2 x 960 s dwell on 44.1<->24).
+ * 96K_A_TO_B (2026-10-05): same rear and coefficient arrays at 8 ch, so the BIDIR alias figures carry;
+ * its own image c9f0953 ran all 22 low/low + 96k cells A->B live, RT clean, max_demand <= 34.4 % on
+ * these rows, 960 s dwell on 44.1->32; +144 B program with DIRECT5, no data.  #ifndef = escape hatch. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || \
+    (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B)
+  #ifndef APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT
+    #define APP_ASRC_ANTIALIAS_DIRECT_1TO1_EXT (APP_ASRC_ANTIALIAS_DIRECT_1TO1)   /* follows its base gate's opt-out */
+  #endif
+#endif
+
+/* The last five direct-route holes (2026-10-04): two 1:1 rows + three /2 or /3 + 1:1, existing arrays.
+ * BIDIR: qualified on MEAS 4aed8d1 (qual81 RT 81/81, 0 FAIL, alias -112.2..-125.7 dBc on
+ * the five) and on the product image a3c41d8 (10 directed cells live, RT clean, max_demand <= 70.2 %,
+ * 960 s dwell on 32->12).  96K_A_TO_B qualified with the EXT rows above (2026-10-05, same image).
+ * #ifndef = escape hatch. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || \
+    (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B)
+  #ifndef APP_ASRC_ANTIALIAS_DIRECT5
+    #define APP_ASRC_ANTIALIAS_DIRECT5 (APP_ASRC_ANTIALIAS_DIRECT_1TO1)   /* follows its base gate's opt-out */
+  #endif
+#endif
+
 /* ASRC App variation expansion.  No Classic Demo feature is selected here. */
 #ifndef APP_ASRC_CLOCK_OWNER
   #if (APP_BUILD == APP_BUILD_ASRC_DSPIC_BIDIR) || (APP_BUILD == APP_BUILD_ASRC_DSPIC_LIGHT)
@@ -138,10 +301,52 @@
   #ifndef APP_ASRC_Q31_PRE_HALFBAND
     #define APP_ASRC_Q31_PRE_HALFBAND  (1)
   #endif
-  /* Rear polyphase at M=28 (fc 0.4632, Kaiser beta 10.55).  Host gate: M30 is
-   * -0.741 dB at 20 kHz / -108.5 dB worst image, M28 -0.928 dB / -105.3 dB. */
-  #ifndef APP_ASRC_EXPERIMENTAL_M28
-    #define APP_ASRC_EXPERIMENTAL_M28  (1)
+  /* Rear polyphase: M=30, fc 0.464, Kaiser beta 11.3 -- the production geometry.
+   *
+   * THIS PRESET USED TO PIN M=28 HERE AND IT NEVER TOOK EFFECT.  The pin was
+   * `#ifndef APP_ASRC_EXPERIMENTAL_M28 / #define 1`, but apps/app_build_config.h
+   * defaults that same switch to 0 at its line 137 and only includes THIS header
+   * at its line 275 -- so the macro is always already defined by the time the
+   * preset is read, and a preset-level `#ifndef` on it is unreachable by
+   * construction.  Every image of this preset has run M30.  Measured, not
+   * argued: the board reported `ASRCpath[M=30]`, named the then-current kernel `poly-k11`
+   * (the DEFAULT ASRC_POLY_KAISER_NAME -- the M28 arm would say
+   * "poly-k10.55"), and a live tap measured -1.323 dB at 13,680 Hz against a
+   * host model that gives M30 -1.282 dB and M28 -1.589 dB.
+   *
+   * So the pin is removed rather than repaired.  M28 bought 2 taps of CPU on
+   * the composed front end; the third band bought far more than that, so there
+   * is nothing left for it to buy here -- and the whole 2026-09-10 validation
+   * (Hard RT, 30-minute soak with 804 M samples at clips=0, listening PASS)
+   * was performed on M30.  Changing the filter after that evidence, to reach a
+   * geometry nothing needs, would only invalidate the evidence.
+   *
+   * M28 IS RETIRED, PRESET-WIDE, AS OF 2026-09-12 (see the shared M30-family block
+   * further down in this file): `-Define APP_ASRC_EXPERIMENTAL_M28=1` is now a build
+   * error on every AK512 M30 preset, this one included, not just unreachable on it.
+   * The guard after the M selection below still fails the build if this preset ever
+   * resolves to anything but 30, so the signboard cannot drift even if that changes.
+   *
+   * Host gate for the record: M30 -0.741 dB at 20 kHz / -108.5 dB worst image;
+   * M28 -0.928 dB / -105.3 dB. */
+  /* Rear phase count: L = 128, PINNED, and this preset is the reason the standard
+   * BIDIR preset's L=256 (2026-09-15) had to be a per-preset pin rather than a new
+   * generic default.
+   *
+   * The Q31 coefficient table is (L+1) x M x 4 B and this preset keeps it in RAM
+   * (it inherits the generic ASRC_Q31_COEFF_STORAGE default; see asrc_poly_q31.inc),
+   * so L=256 would cost +15,360 B of DATA memory: 52,146 B -> 67,506 B against a
+   * 65,536 B region.  It does not fit -- not tightly, at all.  Pinning the table into
+   * flash instead would fit, and costs +13.2 pt of the CPU window (measured, see
+   * asrc_poly_q31.inc), which this preset does not have: its worst leg B response is
+   * 494.1 us against the 500 us block, about 1.2 pt.
+   *
+   * So L=128 here is a resource decision, not a quality one, and it is spelled out
+   * rather than inherited so that it does not move if the generic default does.  The
+   * guard after the M selection below fails the build if it ever resolves otherwise.
+   * [internal] study_ak512_universal_nyquist_prototype_phase1_2026-09-14.md 31.9 */
+  #ifndef ASRC_POLY_L
+    #define ASRC_POLY_L  (128u)
   #endif
   /* Two engines.  APP_ENA_ASRC_BIDIR defaults to 1 in asrc_app_config.h and this
    * preset is absent from the lists above that force it to 0, so nothing needs
@@ -220,8 +425,8 @@
  * 0..7.  There are two objects, A->B and B->A, so the bidirectional target is
  * 8ch <-> 8ch (16 processing channels total).
  *
- * Polyphase, at the AK512 M30 production filter (M=30 taps, fc=0.465, Kaiser
- * beta=11) and, since the resident bootloader moved to a 16 KiB region on
+ * Polyphase, at the AK512 M30 production filter (M=30 taps, fc=0.464, Kaiser
+ * beta=11.3) and, since the resident bootloader moved to a 16 KiB region on
  * 2026-08-20, at the AK512 phase count as well, with the coefficients resident
  * in program flash rather than RAM.  What each choice is forced by:
  *
@@ -274,7 +479,7 @@
     #define ASRC_POLY_L  (128u)
   #endif
   #ifndef ASRC_POLY_FC
-    #define ASRC_POLY_FC  (0.465f)
+    #define ASRC_POLY_FC  (0.464f)
   #endif
   #ifndef ASRC_POLY_WINDOW
     #define ASRC_POLY_WINDOW  (2) /* ASRC_WINDOW_KAISER_11 */
@@ -290,12 +495,16 @@
   #ifndef APP_ASRC_FIFO_FRAMES
     #define APP_ASRC_FIFO_FRAMES  (64u)
   #endif
-  /* FILL SETPOINT SLACK -- measured, not assumed.
+  /* FILL SETPOINT SLACK -- measured, not assumed.  (LOWER HALF SUPERSEDED 2026-09-12; see the
+   * CORRECTION at the end of this block.  The measurement is kept because it is still the record of
+   * what a dense-block-phase pair does, and because it is the measurement the correction reads.)
    *
-   * The setpoint is R(step) + ASRC_FILL_JITTER and the ceiling is
-   * ASRC_FILL_TARGET_MAX = FIFO-4-BLOCK-JITTER, so the slack appears on BOTH bounds and
-   * a value only fits while  2*JITTER <= FIFO - BLOCK - 20 - floor(step*(BLOCK-1)).  For the
-   * worst Main-profile ratio (48/44.1, step 1.08844) that is 2*J <= 12, i.e. J <= 6.
+   * When this was written the setpoint was R(step) + ASRC_FILL_JITTER and the ceiling was
+   * ASRC_FILL_TARGET_MAX = FIFO-4-BLOCK-JITTER, so the slack appeared on BOTH bounds and
+   * a value only fit while  2*JITTER <= FIFO - BLOCK - 20 - floor(step*(BLOCK-1)).  For the
+   * worst Main-profile ratio (48/44.1, step 1.08844) that was 2*J <= 12, i.e. J <= 6.  Since
+   * 2026-09-12 the setpoint comes from ASRC_FILL_BLOCK_RESERVE and JITTER holds only the UPPER
+   * bound, so that two-sided constraint no longer applies and J is free of the low-rate rows.
    *
    * 4 was too small, and by exactly the amount this raises it.  MEASURED 2026-08-20 on an AK512
    * board over ~4 minutes of 48<->44.1 with a min-hold on the pull-start fill
@@ -315,38 +524,54 @@
    * (p-p 17 against BLOCK 16) suggested the excursion was a full block phase, +/-8, which
    * would have needed J>=8 and could not fit.  That spread is an artefact of sampling one
    * asynchronous fill per print -- the worst PULL is 5 down, not 8.
+   *
+   * CORRECTION 2026-09-12 -- the retraction just above was right about THIS PAIR and wrong as a
+   * general statement, and the difference is the block PHASE, not the sampling.  48 <-> 44.1 kHz is
+   * 147/160: 160 phase classes, so the pull-start fill sawtooth is dense and its amplitude really is
+   * about BLOCK/2, which is the 5 measured above.  A pair on a LOW-ORDER rational has q classes
+   * spaced BLOCK/q, and when the phase slips one producer block the top class loses a whole block:
+   * worst = set - BLOCK + (BLOCK/2)(q-1)/q, i.e. a FULL block at q = 1.  So "the worst pull is 5
+   * down, not 8" holds for 48 <-> 44.1 and does not generalise -- AK512 32 -> 12 kHz (8/3, q = 3)
+   * measured 10 down from a setpoint of 64 and starved.  The lower reserve is therefore derived from
+   * BLOCK now (ASRC_FILL_BLOCK_RESERVE), not from this table.  What this table still settles is that
+   * 4 frames of UPPER headroom was too small on this ring, which is why J = 8 stays below.
+   * [internal] ak512_32to12_starve_analysis_2026-09-11.md.
    */
   #ifndef ASRC_FILL_JITTER
-    /* 8 since 2026-08-20: at block 8 the bound above becomes 2J <= 29, so the ceiling is 14
-     * and 8 is a middle value that keeps the low rates unclamped (24 kHz needs R+J = 38
-     * against a ceiling of 44).  At 44.1 it is not binding -- FIFO/2 = 32 is larger. */
+    /* 8 since 2026-08-20.  The original justification was the two-sided bound (at block 8, 2J <= 29
+     * -> ceiling 14, and 8 is a middle value that keeps the low rates unclamped).  Since 2026-09-12
+     * J is UPPER-bound only, so what 8 now buys is headroom between the setpoint and the producer
+     * overflow guard, and its cost is ASRC_FILL_TARGET_MAX = 64-4-8-8 = 44 -- which is exactly what
+     * refuses the six low-rate pairs listed below.  Lowering it to 4 would lift the cap to 48, which
+     * (checked, not guessed: [internal tool] a1_fill_reserve_gate_delta.py) brings all six back; that is a live option for this ring, but it trades upper headroom the
+     * 2026-08-20 measurement said this ring needed, so it is a measurement question, not an edit. */
     #define ASRC_FILL_JITTER  (8u)
   #endif
-  /* SLACK THE *ar PAIR GATE REQUIRES -- this ring's number, not AK512's.
+  /* SLACK THE *ar PAIR GATE REQUIRES -- RETIRED 2026-09-12, and this ring keeps the derived value.
    *
-   * audio_app_asrc.c defaults ASRC_FILL_SLACK_REQUIRED to 8, measured on AK512 (FIFO 128,
-   * block 16) over all 100 pairs.  The quantity is the servo's worst downward excursion from
-   * its setpoint plus one, so it belongs to the ring geometry and has to be restated here.
+   * This profile used to set ASRC_FILL_SLACK_REQUIRED = 7, reasoning that the required slack is
+   * "the servo's worst downward excursion from its setpoint plus one" and measuring that excursion
+   * at 6 on 48 <-> 44.1 kHz (the ADDENDUM below).  The measurement was right and the reasoning was
+   * incomplete: an excursion measured on a pair with 160 block-phase classes is the DENSE-phase
+   * limit BLOCK/2, and a pair sitting on a low-order rational loses a whole producer BLOCK instead.
+   * AK512 32 -> 12 kHz = 8/3 (three classes) starved on 8 frames of slack for exactly that reason.
+   * The quantity is now derived from the ring geometry -- ASRC_FILL_BLOCK_RESERVE = BLOCK+1 = 9
+   * here -- and audio_app_asrc.c #errors if this macro is defined, so a stale override cannot sit
+   * here doing nothing.  See asrc_fill_law() and
+   * [internal] ak512_32to12_starve_analysis_2026-09-11.md.
    *
-   * 7 for this ring: the block-8 measurement in the ADDENDUM below reports
-   *     AB 48->44.1  R=23 set=32 fmin>=28   excursion set-fmin = 4
-   *     BA 44.1->48  R=22 set=32 fmin>=26   excursion set-fmin = 6
-   * so the worst excursion seen is 6 and a pull needs fmin >= R+1, i.e. slack >= 7.
-   *
-   * NOT 6.  6 is the block-16 number (the table above the ADDENDUM: set-fmin = 5), and block
-   * 16 is retired on this profile -- carrying 6 forward would be citing a measurement of a ring
-   * this build no longer has.
-   *
-   * The value is not load-bearing on this ring, which is why one rate pair's worth of evidence
-   * is enough to write it down: an offline gate-prediction sweep (maintainer-side, not part of
-   * this repository) sweeps the gate over 6, 7 and 8 and all three accept the same 67 of 81 pairs.  The clamp at ASRC_FILL_TARGET_MAX = 44
-   * leaves no pair with a slack between 3 and 8, so the only pairs the constant newly refuses
-   * are 44.1 <-> 12 kHz (R=41, set=44, slack=3) at any of the three values.  Whether those two
-   * run clean today is the one thing an AK128 hardware sweep still has to answer.
+   * WHAT THAT COSTS THIS RING, and it is not nothing: FIFO 64 with block 8 has
+   * ASRC_FILL_TARGET_MAX = 44, so six pairs whose required setpoint lands at 45-47 are refused
+   * where the old gate accepted them -- 22.05 -> 8, 24 -> 8, 32 -> 11.025, 44.1 -> 16, 48 -> 16 and
+   * 96 -> 32 kHz.  THREE of those (24 -> 8, 48 -> 16, 96 -> 32) fail this profile's OWN retired
+   * constant of 7 once R is corrected to the nominal-integer form, i.e. they were accepted only
+   * because the old R under-counted by one frame; the other three fail only the full-block reserve.
+   * Every remaining pair keeps its verdict and gains 1-2 frames of setpoint (see
+   * [internal tool] a1_fill_reserve_gate_delta.py).  Whether this ring wants those six back -- by
+   * measurement on hardware, or by declaring a smaller reserve with a transport argument for why a
+   * producer block cannot be deferred here -- is an open AK128 question, not something to answer by
+   * restoring a constant whose premise was the dense-phase limit.
    */
-  #ifndef ASRC_FILL_SLACK_REQUIRED
-    #define ASRC_FILL_SLACK_REQUIRED  (7u)
-  #endif
   /* CONSUMER BLOCK LENGTH -- the low-rate reach knob on this compact ring.
    *
    * One pull drains a whole block with the producer's ISR locked out, so it needs
@@ -390,7 +615,7 @@
    * So the look-ahead wall is cheap to remove and the ring even GAINS 2 KB.  What block 8
    * does NOT buy is anti-aliasing: both directions still report fe=direct, i.e. the poly
    * cutoff stays at ASRC_POLY_FC of the INPUT rate, so everything between the output
-   * Nyquist and 0.465*48 kHz folds back.  That is a listening decision, not a telemetry
+   * Nyquist and ASRC_POLY_FC*48 kHz folds back.  That is a listening decision, not a telemetry
    * one, and it has precedent -- the 22.05 kHz pair this build already ships and has
    * passed a listening test is fe=direct too.
    *
@@ -482,12 +707,17 @@
     #define APP_MEAS_CTRL_TRACE  (0)
   #endif
 #endif
-  /* TEMPORARY AK128 BASELINE (2026-08-25): retain TDM8, eight independent
-   * channels and bidirectional ASRC, but qualify only 32 / 44.1 / 48 kHz.
-   * The low-rate Q31 front end costs 6,080 B for its ASRC_CH-wide history on
-   * this 16 KB part.  It is deliberately out of this image; the console
-   * rejects every rate that would need it before tearing a stream down. */
-  #define APP_ASRC_AK128_BASELINE_RATE_ONLY  (1)
+  /* AK128 ROM-fit product surface: retain TDM8, eight independent channels
+   * and bidirectional ASRC, but support the 48 kHz <-> 48 kHz cell only.
+   *
+   * This is deliberately a compile-time product restriction, rather than a
+   * console-only menu filter.  It lets audio_app_asrc.c omit the generic
+   * multi-rate admission predicates, while its public pair gate still rejects
+   * an out-of-cell request before transport teardown.  The two 48 kHz clocks
+   * remain independent, so the ASRC engines and their L128/M30 filter are
+   * retained; this does not lower the interpolation geometry or its quality.
+   */
+  #define APP_ASRC_AK128_FIXED_48K_PAIR  (1)
   #ifndef APP_ASRC_RUNTIME_48K_TO_8
     #define APP_ASRC_RUNTIME_48K_TO_8  (0)
   #endif
@@ -577,20 +807,134 @@
   #endif
 #endif
 
-#if APP_ASRC_EXPERIMENTAL_M28 && \
-    (APP_BUILD != APP_BUILD_ASRC_CODEC_BIDIR) && \
-    (APP_BUILD != APP_BUILD_ASRC_CODEC_MEAS) && \
-    (APP_BUILD != APP_BUILD_ASRC_CODEC_96K_A_TO_B) && \
-    (APP_BUILD != APP_BUILD_ASRC_MEAS_96K_A_TO_B) && \
-    (APP_BUILD != APP_BUILD_ASRC_MEAS_96K_B_TO_A) && \
-    (APP_BUILD != APP_BUILD_ASRC_CODEC_96K_12CH_32K)
-  #error "APP_ASRC_EXPERIMENTAL_M28 is supported only with the standard BIDIR/MEAS presets or the 96 kHz leg presets"
+/* PRODUCTION SAMPLE ARM for the shipping AK512 bidir profile: Q31, coefficients in flash.
+ *
+ * PINNED HERE AND NOT IN THE GENERIC #ifndef (asrc_app_config.h for the arm,
+ * asrc_poly_q31.inc for the storage) because those defaults are shared with presets this
+ * configuration was never measured against, and a global flip would move two of them
+ * silently:
+ *
+ *   AK128 bi-codec  inherits the generic arm default, so it would go float -> Q31 with no
+ *     measurement behind it, on the profile with ~3.5 KB of data RAM to spare.
+ *   96K_12CH_32K    already pins ASRC_SAMPLE_Q31 = 1 but inherits the generic RAM storage
+ *     default, and it ships on +5.9 us of leg-B wall margin ([internal]
+ *     report_ak512_96k32k_12ch_main_landing_2026-09-08.md).  The recorded RAM -> FLASH cost
+ *     for the Q31 table is +13.2 pt of the CPU window (see asrc_poly_q31.inc) -- margin
+ *     that preset does not have.
+ *
+ * Measured for THIS preset at 16+16 ch over the full 9x9 rate matrix: 71 of 81 pairs run
+ * (the other 10 are the pre-existing pair-gate refusals), every one with miss / starve /
+ * drop / bad delta 0, worst max_demand 80.5 % at 48 -> 32 kHz, and Q31 beats float on every
+ * cell paired on one commit (+2.3 .. +12.0 pt).  Data RAM +250 B, program -2,596 B.
+ * [internal] ak512_q31_flash_full_ratepair_production_feasibility_2026-09-12.md
+ *
+ * FLOAT REMAINS BUILDABLE: both are #ifndef, so -Define ASRC_SAMPLE_Q31=0 returns this
+ * profile to the float arm and its own ASRC_COEFF_STORAGE pin below.  Q31 with RAM
+ * coefficients is NOT a candidate -- it traps deterministically at this channel count
+ * (section 11 of the same report).
+ *
+ * ASRC_COEFF_STORAGE_FLASH is defined in audio_app_asrc.c; as a macro body that is fine,
+ * the same way the float pin further down relies on it. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR)
+  #ifndef ASRC_SAMPLE_Q31
+    #define ASRC_SAMPLE_Q31  (1)
+  #endif
+  #ifndef ASRC_Q31_COEFF_STORAGE
+    #define ASRC_Q31_COEFF_STORAGE  (ASRC_COEFF_STORAGE_FLASH)
+  #endif
+  /* P0 QUIET_TRACK default ON for this preset (2026-09-29, owner decision), at the verified
+   * operating point only (asrc_app_config.h APP_P0_POINT_A_HZ).  It follows the sample arm and
+   * the FF guard it enters from, so -Define ASRC_SAMPLE_Q31=0 still builds, without the track. */
+  #ifndef APP_ASRC_QUIET_TRACK
+    #define APP_ASRC_QUIET_TRACK  ( ASRC_SAMPLE_Q31 && ( APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8 ) )
+  #endif
+  /* PHASE COUNT L = 256, PINNED FOR THIS PRESET **UNDER THE UNIVERSAL PROFILE ONLY**
+   * (2026-09-15 owner decision on the value; 2026-09-16 on where the gate sits).
+   *
+   * WHY THE GATE.  This preset IS Universal member A, but it is also the shipping/legacy
+   * AK512 bidir image, and those are the same MPLAB configuration.  Pinned unconditionally
+   * the phase count would move the SHIPPING image -- program +15,360 B and a different rear
+   * filter -- which is a default change, and the Universal profile is specified as opt-in
+   * until its listening gate is closed.  So the pin is `APP_ASRC_UNIVERSAL_PROFILE &&`
+   * exactly as member B's is, and a plain build of this preset is byte-for-byte the image
+   * the pre-Universal tree produced.  Member A without the profile is not member A.
+   *
+   * WHY `defined(...) &&` AND NOT A BARE TEST.  The macro's fallback 0 lives in
+   * asrc_app_config.h, which the preprocessor reaches AFTER this file, so a bare
+   * `#if APP_ASRC_UNIVERSAL_PROFILE` here is reading an undefined name and relying on C's
+   * implicit-zero rule.  That is exactly the dependency the C0.3 configuration guard
+   * (buildtools/check_config_gate.py, class A ORDER) refuses, and it refused this -- so the
+   * test is spelled out: defined and true, or explicitly not the profile.  Behaviour is
+   * unchanged either way; what changes is that the intent is in the source rather than in
+   * the language's default.
+   *
+   * WHAT IT BUYS, when the profile is on.  This is the universal-rate profile: it is the one asked to hold a
+   * uniform spectral specification (worst in-band unwanted component <= -100 dBc over
+   * 0 .. 0.8125 x output Nyquist, passband +/-0.10 dB) across the whole 45-pair rate
+   * matrix.  At L=128 three pairs miss it -- the 160/147 family (12->11.025, 24->22.05,
+   * 48->44.1) at -98.27 dBc, and they miss it on the REAR resampler's own
+   * phase-interpolation spur, which no front end can filter.  Doubling L moves that spur
+   * by 20*log10(4) = 12.04 dB and closes the specification: 45/45 pairs pass, and in
+   * every remaining non-PASS row the limiter has moved back to the front-end alias.
+   *
+   * WHAT IT COSTS.  Program memory, (L+1) x M x 4 B: 15,480 B -> 30,840 B, i.e.
+   * +15,360 B, and nothing else.  RAM is unchanged because ASRC_Q31_COEFF_STORAGE is
+   * FLASH here (the pin just above).  Runtime CPU is unchanged because blend_row reads
+   * two rows per output frame at any L, so the MAC count, the per-frame coefficient
+   * traffic, ASRC_POLY_AHEAD and the A1 fill law are all L-independent -- which is also
+   * why this does not disturb the A1 qualification fence.
+   *
+   * WHY IT IS PINNED HERE AND NOT IN THE GENERIC #ifndef.  Exactly the reason the two
+   * pins above are: the generic default (asrc_app_config.h, L=128) is shared with presets
+   * that cannot pay +15,360 B of program, and a global flip would move them silently.
+   *   96K_12CH_32K   its Q31 table is in RAM, so the cost would land in DATA memory:
+   *     52,146 B -> 67,506 B against a 65,536 B region.  Moving it to flash to dodge that
+   *     costs +13.2 pt of the CPU window and the preset ships on ~1.2 pt.  It stays L=128,
+   *     pinned explicitly in its own block above and guarded below.
+   *   AK128 bi-codec its float table is already in flash, and the 108 KiB application
+   *     region had 10,580 B free at the last measurement -- 4,780 B short.  It pins
+   *     L=128 in its own block above.
+   *
+   * THE FLOAT ARM NEEDS ONE MORE SWITCH NOW.  Both pins are #ifndef, so
+   * -Define ASRC_SAMPLE_Q31=0 still returns this profile to the float arm -- but the float
+   * flash tables in audio_app_asrc.c are (128,32) / (128,30) / (64,30), so that build must
+   * also say -Define ASRC_POLY_L=128.  Without it the build stops at the float table
+   * selector with a message naming the missing geometry, which is the intended loud
+   * failure: there is no (256,30) float table in the tree and generating one would put
+   * 30,840 B in a profile that does not ship.
+   *
+   * [internal] study_ak512_universal_nyquist_prototype_phase1_2026-09-14.md, sections 31
+   * (the 45-pair L128/L256 comparison) and 31.9 (the per-profile resource derivation). */
+  #if defined( APP_ASRC_UNIVERSAL_PROFILE ) && APP_ASRC_UNIVERSAL_PROFILE
+    #ifndef ASRC_POLY_L
+      #define ASRC_POLY_L  (256u)
+    #endif
+  #endif
 #endif
 
-/* Standard BIDIR and MEAS use production M30.  M28 is deliberately hidden
- * behind a compile-time developer switch rather than a routine build preset.
- * Host gate: M30 -0.741 dB @20 kHz / -108.5 dB worst image; experimental M28
- * -0.928 dB / -105.3 dB. */
+/* M28 IS RETIRED FOR THE ENTIRE AK512 M30 PRODUCT FAMILY (2026-09-12, owner decision).
+ *
+ * It was never a routine build preset -- always this one compile-time developer switch,
+ * gated to the presets below -- and it is not going to be used going forward.  The switch
+ * itself (its 0/1 sanity check in app_build_config.h) is left defined so a stray
+ * `-Define APP_ASRC_EXPERIMENTAL_M28=1` gets a clear, immediate error naming the reason,
+ * rather than being silently absorbed by an #ifndef somewhere and only surfacing as a
+ * confusing failure much later (which is exactly what used to happen: see the M28-pin
+ * history in the 96K_12CH_32K preset block above, and the A1 qualification fence's own
+ * `_Static_assert`, which already refuses any M30-family image that resolves to
+ * ASRC_POLY_AHEAD == 14 -- M28's value -- rather than the qualified 15.  This #error just
+ * says the same thing before the fence has to). */
+#if APP_ASRC_EXPERIMENTAL_M28
+  #error "APP_ASRC_EXPERIMENTAL_M28 is retired: M28 is not supported on any AK512 M30 production preset (APP_BUILD_ASRC_CODEC_BIDIR, ASRC_CODEC_MEAS, the BIDIR/MEAS M30 headroom builds, the 96 kHz A<->B/MEAS presets, or ASRC_CODEC_96K_12CH_32K). The geometry and table (asrc_poly_q31_table_m28.h) stay in the tree as a record; they are not a live production option."
+#endif
+
+/* Standard BIDIR and MEAS use production M30 / fc 0.464 / Kaiser beta 11.3
+ * unconditionally now that the M28 switch above
+ * is a hard error rather than a second arm.
+ * Host gate for the record: M30 -0.815 dB @20 kHz / -107.2 dB worst image; M28
+ * -0.928 dB / -105.3 dB -- M28 was never the better filter, only the cheaper one, and the
+ * third-band front end (see the 96K_12CH_32K preset block) bought more CPU than M28 ever
+ * did, which is most of why nobody needs the taps M28 saved any more. */
 #if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || \
     (APP_BUILD == APP_BUILD_ASRC_CODEC_MEAS) || \
     (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR_HEADROOM_M30) || \
@@ -599,20 +943,141 @@
     (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_A_TO_B) || \
     (APP_BUILD == APP_BUILD_ASRC_MEAS_96K_B_TO_A) || \
     (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K)
-  #if APP_ASRC_EXPERIMENTAL_M28
-    #define ASRC_POLY_M                   (28u)
-    #define ASRC_POLY_FC                  (0.4632f)
-    /* Literal window value: the ASRC_WINDOW_* names live in asrc_app_config.h,
-     * which app_specific_config_defs.h includes AFTER this header, so they are
-     * not in scope here. 2 == ASRC_WINDOW_KAISER_11. */
-    #define ASRC_POLY_WINDOW              (2) /* ASRC_WINDOW_KAISER_11 family */
-    #define ASRC_POLY_KAISER_BETA         (10.55f)
-    #define ASRC_POLY_KAISER_NAME         "poly-k10.55"
-  #else
-    #define ASRC_POLY_M                   (30u)
-    #define ASRC_POLY_FC                  (0.465f)
-    #define ASRC_POLY_WINDOW              (2) /* ASRC_WINDOW_KAISER_11 */
+  /* THE AK512 M30 PRODUCT FAMILY, NAMED ONCE.  These eight presets are the ones whose ring the
+   * A1 qualification fence's pair list was derived for, so they are the ones the fence must be
+   * ACTIVE on -- see the _Static_assert in audio_app_asrc.c.
+   *
+   * It is defined HERE, inside the block that already enumerates the family, because the
+   * membership test and the filter resolution must not drift apart: a preset added to the list
+   * above gets the flag automatically, and one removed loses it.  Spelling the eight-way
+   * condition out a second time in audio_app_asrc.c is exactly the drift this avoids.
+   *
+   * Membership is a PRESET fact, not a filter-geometry fact -- which matters now only in
+   * principle, since the #error above means every member always resolves M30 in practice. */
+  #define APP_ASRC_RING_IS_AK512_M30_FAMILY  (1)
+
+  /* THE LONGER REAR PROTOTYPE, M34 (2026-09-30, owner decision "M32 か M34").
+   *
+   *   M34 / Kaiser beta 14.0 / fc 0.46336 / L 256, Q31, baked by
+   *   tools/asrc/asrc_q31_resampler_model.py table --banner-exact --taps 34 --fc 0.46336 --beta 14.0 --phases 256
+   *
+   * Host model ([internal] rear-filter host study, 2026-09-30, reproduced bit-exactly against the M30
+   * table): BA 8 -> 48 kHz THD+N -123.6 -> -136.6 dB, 8k-f image -124.6 -> -146.1 dBc, stopband
+   * worst -111.9 -> -132.6 dB, and no tested input tone's image is worse than M30 (the M32/beta13
+   * alternative is 7 dB worse at the 3.25 kHz protected-band edge, which is why it was not taken).
+   *
+   * SCOPE: exactly the images that run the Universal Q31 rear at L=256 through this preset list --
+   * member A (standard BIDIR), member B (96K_A_TO_B; owner approval 2026-10-01, so both images of
+   * the two-image bundle run ONE rear again) and the MEAS preset built with the Universal defines
+   * (the P0 AB/BA measurement images).  Member B's price at 96 kHz / 8 ch is estimated in the M34
+   * report (one engine, 8 ch: +3.9 pt at 96 -> 96, +2.0 pt at 96 -> 48 whose measured M30
+   * max_demand is 71.5 %) and must be measured
+   * with `*ts` on hardware.  96K_12CH_32K is pinned to M30 by its own #error below and its _opt
+   * kernels are assembled for 30 taps.
+   *
+   * WHAT MOVES WITH M.  ASRC_POLY_MH 14 -> 16 and ASRC_POLY_AHEAD 15 -> 17 (asrc_app_config.h):
+   * the A1 fill law's R_safe and the setpoint rise by 2 frames on the 24 down-conversion pairs
+   * above the FIFO/2 floor; the fence's unqualified-direct list is IDENTICAL at AHEAD 17
+   * (re-derived with [internal tool] a1_fill_reserve_gate_delta.py, which carries the M34 row), which
+   * is why the fence in audio_app_asrc.c accepts AHEAD 17 when -- and only when -- this is on.
+   * Ring RAM +M*4 B per channel (mirror overhang), s_ceff_q31 +16 B per engine, table +4,112 B
+   * of flash.
+   *
+   * BACK TO M30: -Define APP_ASRC_REAR_POLY_M34=0.  The M30 table, vectors and every M30 number
+   * stay valid for that build. */
+  #ifndef APP_ASRC_REAR_POLY_M34
+    #if ( (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || (APP_BUILD == APP_BUILD_ASRC_CODEC_MEAS) || \
+          (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B) ) && \
+        defined( APP_ASRC_UNIVERSAL_PROFILE ) && APP_ASRC_UNIVERSAL_PROFILE
+      #define APP_ASRC_REAR_POLY_M34  (1)
+    #else
+      #define APP_ASRC_REAR_POLY_M34  (0)
+    #endif
   #endif
+  #if APP_ASRC_REAR_POLY_M34
+    #define ASRC_POLY_M                 (34u)
+    #define ASRC_POLY_FC                (0.46336f)
+    #define ASRC_POLY_WINDOW            (2) /* ASRC_WINDOW_KAISER_11: the Kaiser formula; beta below */
+    #define ASRC_POLY_KAISER_BETA       (14.0f)
+    /* The telemetry signboard names the window it really runs: `[poly-k14 x16ch]`.  It used to
+     * stay at the default "poly-k11.3" so host parsers kept matching -- a log excerpt then
+     * claimed beta 11.3 for a beta 14 image (#41 review).  The one parser that matched the
+     * name (tools/asrc/q31_rate_regression.py) now takes any `poly-k<beta>`; the geometry is
+     * still in the boot banner `ASRCpath[M=34 L=256 ...]`. */
+    #define ASRC_POLY_KAISER_NAME       "poly-k14"
+    /* APP_ASRC_Q31_OPT_KERNELS stays 0 on these presets, so the generic
+     * mchp_asrc_q31_blend_row / _row16 run (any even M >= 2, no --defsym).  M34 is not a
+     * multiple of 4, so it could NOT take the float 2x2 SCHED_V2/V3 unrolls -- which the Q31
+     * rear never uses. */
+  #else
+  #define ASRC_POLY_M                   (30u)
+  #define ASRC_POLY_FC                  (0.464f)
+  #define ASRC_POLY_WINDOW              (2) /* ASRC_WINDOW_KAISER_11 */
+  #endif
+
+  /* LIN4 REAR BLEND KERNEL, DEFAULT ON FOR THE AK512 BIDIR AND MEAS Q31 PRESETS (2026-10-11, owner
+   * decision).  The SAME linear blend as mchp_asrc_q31_blend_row, read four taps per pass from the
+   * table padded to a 16-byte row stride: bit-exact (the boot poly selftest checks every row at six
+   * weights against the shipped kernel), 606 -> 380 cycles per output frame.  Evidence: [internal]
+   * REPORT_asrc_hifi_48to44k1_p5_2026-10-11.md -- product BIDIR 81/81 cells RT clean, max_demand
+   * median -5.5 pt (worst cell A22.05k/B48k 96.5 -> 88.7 %); BA MEAS quick81 0 spectral FAIL.
+   *
+   * SCOPE: exactly the M34 rear on BIDIR and MEAS, the configuration it was measured on.  Not member
+   * B (96K_A_TO_B, never run with it), not the M30 escape hatch (APP_ASRC_REAR_POLY_M34=0 keeps the
+   * shipped kernel), not AK128 (float rear; LIN4 does not apply there).
+   *
+   * Not taken when a build asks for a call site LIN4 does not replace: the quadratic research blend,
+   * the _opt kernels or the stage profile (asrc_app_config.h #errors on each pairing).  Those are
+   * tested with defined() because their own fallbacks are read after this file.
+   *
+   * BACK TO THE SHIPPED KERNEL: -Define APP_ASRC_REAR_LIN4=0.  Both kernels stay in the tree. */
+  #ifndef APP_ASRC_REAR_LIN4
+    #if APP_ASRC_REAR_POLY_M34 && \
+        ( (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) || (APP_BUILD == APP_BUILD_ASRC_CODEC_MEAS) ) && \
+        defined( ASRC_SAMPLE_Q31 ) && ASRC_SAMPLE_Q31 && \
+        !( defined( APP_ASRC_REAR_QUAD_BLEND ) && APP_ASRC_REAR_QUAD_BLEND ) && \
+        !( defined( APP_ASRC_Q31_OPT_KERNELS ) && APP_ASRC_Q31_OPT_KERNELS ) && \
+        !( defined( APP_ASRC_STAGE_PROFILE ) && APP_ASRC_STAGE_PROFILE )
+      #define APP_ASRC_REAR_LIN4  (1)
+    #else
+      #define APP_ASRC_REAR_LIN4  (0)
+    #endif
+  #endif
+
+  /* THE SIGNBOARD GUARD.  This preset's entire 2026-09-10 validation was taken on
+   * M30, and a preset-level pin on APP_ASRC_EXPERIMENTAL_M28 is unreachable (see the
+   * preset block above), so a build of it that silently resolved to another geometry
+   * would invalidate every recorded number without saying so.  Fail the build instead.
+   * M28 is retired before this block is reached (see the #error above); this guard
+   * remains as an independent invariant that the validated 96K_12CH_32K preset must
+   * resolve M30. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K) && (ASRC_POLY_M != 30u)
+  #error "APP_BUILD_ASRC_CODEC_96K_12CH_32K is validated at ASRC_POLY_M == 30 (see the preset block); this build resolved to something else"
+#endif
+
+  /* THE SAME SIGNBOARD, FOR L.  Added 2026-09-15 with the standard BIDIR preset's
+   * L=256: the phase count is now a per-preset resource decision, so the two presets
+   * that must NOT follow it say so as an invariant and not only as a pin.  Both
+   * failures are silent otherwise -- 96K_12CH_32K would overflow data memory at link
+   * time with no mention of L, and a BIDIR image that quietly resolved L=128 would
+   * still run while missing the -100 dBc specification on three rate pairs. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K) && (ASRC_POLY_L != 128u)
+  #error "APP_BUILD_ASRC_CODEC_96K_12CH_32K is validated at ASRC_POLY_L == 128 and its Q31 coefficient table is in RAM: L=256 costs +15,360 B of data memory (52,146 -> 67,506 B against 65,536 B), and moving the table to flash to fit it costs +13.2 pt of a CPU window that has ~1.2 pt spare. See the preset block."
+#endif
+  /* THE ESCAPE IS DELIBERATE AND IT IS NOT A LOOPHOLE.  Without it this invariant forbids
+   * its own control experiment: the only way to build the Q31 arm at L=128 for an A/B against
+   * L=256 would be to edit this file, and an A/B whose control needs a source edit does not get
+   * run.  (Found immediately, 2026-09-15: an arm-time intermediate-ring ovf count differed
+   * between the two images and the L=128 Q31 control could not be built to check it.)  So the
+   * escape is a -Define nobody reaches by accident, it names what it acknowledges, and an image
+   * built with it is NOT the specified product image -- it is a measurement. */
+/* SCOPED TO THE PROFILE, 2026-09-16, for the same reason the pin above is: without the
+ * profile this preset is the legacy shipping image, which is specified at L=128 and must not
+ * be refused by its own tree.  `defined(...) &&` for the reason spelled out at the pin: the
+ * profile macro's fallback is in asrc_app_config.h, read after this file. */
+#if (APP_BUILD == APP_BUILD_ASRC_CODEC_BIDIR) &&     defined( APP_ASRC_UNIVERSAL_PROFILE ) && APP_ASRC_UNIVERSAL_PROFILE &&     ASRC_SAMPLE_Q31 && (ASRC_POLY_L != 256u) && !defined( ASRC_POLY_L_ACK_NOT_SPECIFIED )
+  #error "APP_BUILD_ASRC_CODEC_BIDIR under APP_ASRC_UNIVERSAL_PROFILE is Universal member A and is specified at ASRC_POLY_L == 256: at L=128 the 160/147 rate family (12->11.025, 24->22.05, 48->44.1) sits at -98.27 dBc and misses the -100 dBc product gate on the rear resampler's own phase-interpolation spur, which no front end can filter. Build the float arm with -Define ASRC_SAMPLE_Q31=0 -Define ASRC_POLY_L=128 if L=128 is what you want."
+#endif
 
   /* Coefficient storage for the shipping AK512 bidir profile.
    *
@@ -621,8 +1086,8 @@
    * spare data RAM (62,396 B of sections plus the stack fill the whole 64 KiB
    * region), so the identical bits are taken from program flash instead:
    * audio_app_asrc_poly_l128m30_flash.c, generated by
-   * tools/gen_asrc_poly_flash_table.py for exactly L=128, M=30, fc=0.465,
-   * window=2 -- the values resolved above.  The kernel arithmetic is
+   * tools/gen_asrc_poly_flash_table.py for exactly L=128, M=30, fc=0.464,
+   * window=2, Kaiser beta=11.3 -- the values resolved above.  The kernel arithmetic is
    * byte-identical; only c0/c1 change where they point.  Cost is about
    * +6.4 pt of the CPU window (flash reads are slower than RAM reads).
    *
@@ -638,6 +1103,78 @@
     #ifndef ASRC_COEFF_STORAGE
       #define ASRC_COEFF_STORAGE  (ASRC_COEFF_STORAGE_FLASH)
     #endif
+  #endif
+#endif
+
+/* Every other preset is outside the family.  Spelled out rather than left undefined: an #if on a
+ * name that was never defined reads 0 and passes silently, which is the failure mode this file
+ * warns about elsewhere, and here it would silently disarm the fence's own assert. */
+#ifndef APP_ASRC_RING_IS_AK512_M30_FAMILY
+  #define APP_ASRC_RING_IS_AK512_M30_FAMILY  (0)
+#endif
+/* The M34 rear exists only inside the family block above; a -Define APP_ASRC_REAR_POLY_M34=1 on
+ * any other preset would otherwise be absorbed silently and build M32/M30. */
+#ifndef APP_ASRC_REAR_POLY_M34
+  #define APP_ASRC_REAR_POLY_M34  (0)
+#endif
+#if APP_ASRC_REAR_POLY_M34 && !APP_ASRC_RING_IS_AK512_M30_FAMILY
+  #error "APP_ASRC_REAR_POLY_M34 applies only to the AK512 M30-family presets (standard BIDIR / MEAS under APP_ASRC_UNIVERSAL_PROFILE); this preset does not resolve the rear geometry there"
+#endif
+
+/* UNIVERSAL PROFILE, MEMBER B: THE Q31 REAR, PINNED (2026-09-16, owner decision).
+ *
+ * The Universal profile is a two-image bundle -- the split is forced, not preferred: 96 kHz
+ * bidirectional is impossible on the board's WM8904 (no simultaneous ADC+DAC at or above
+ * 88.2 kHz) and 16 channels do not fit the 166.7 us block a 96 kHz leg leaves.  So member A is
+ * the standard BIDIR preset (Q31 rear, flash coefficients, L=256, all pinned above) and member B
+ * is this 96 kHz A->B preset.  Until this pin, member B inherited the GENERIC float arm, so the
+ * bundle shipped two different rear resamplers under one profile name.
+ *
+ * WHY THAT IS NOT COSMETIC.  Phase H raised L to 256 for exactly one reason: the Q31 rear's
+ * phase-interpolation spur, whose closed form 40*log10(f/(L*rear_in)) matches measurement to
+ * 0.02 dB.  A float rear does not have that spur, so a float member B is not the thing Phase H
+ * qualified -- L=256 buys it nothing, and its audio evidence would belong to a different filter.
+ * Two images, one architecture, is the whole claim the profile makes.
+ *
+ * WHAT IT COSTS, measured on THIS preset (MPLAB X v6.35 / xc-dsc 3.31.01 / DFP 1.5.269 -- the
+ * report this cites said v6.30, which was wrong: every build log says v6.35, and v6.30's
+ * generator cannot resolve this project's pinned DFP at all.  MPLAB configuration
+ * dsPIC33AK512_ASRC_SERIAL_UPDATE, coefficient bank CRC32 0x02692603): program 214,108 ->
+ * 253,924 B (+39,816 B), data 54,528 -> 23,826 B (-30,702 B, 83 % -> 36 % of the 65,536 B
+ * region).  Data FALLS: the Q31 table is pinned into flash below, while the float L=256 table was
+ * generated into RAM at boot.  There is therefore no resource argument on the other side either.
+ *
+ * LEGACY 96k A->B IS UNTOUCHED.  The pins sit inside `#if APP_ASRC_UNIVERSAL_PROFILE`, so a
+ * non-Universal build of this preset keeps the float arm and the generic phase count.  This is a
+ * PROFILE decision; it deliberately does not become the preset's default.
+ *
+ * IF APP_ASRC_UNIVERSAL_PROFILE IS NOT DEFINED YET WHEN THIS IS READ the pins do not fire -- it
+ * arrives as a -Define, and this header is read before the `#ifndef` default in asrc_app_config.h.
+ * That is stated as `defined(...) &&` rather than left to C's implicit-zero rule, because the C0.3
+ * configuration guard (buildtools/check_config_gate.py, class A ORDER) refuses a guard that reads
+ * a macro whose first #define the preprocessor has not reached.  It refused this line.
+ * That failure is loud rather than silent, which is why the pin is allowed to depend on it: the
+ * three profile-side invariants (L == 256 and the Q31 rear in asrc_app_config.h, flash storage in
+ * asrc_poly_q31.inc) are all evaluated AFTER every preset has had its say, and each stops the
+ * build naming its own reason.
+ *
+ * [internal] study_ak512_universal_phase_i_firmware_realization_2026-09-16.md sections 12 and
+ * I3-9. */
+#if defined( APP_ASRC_UNIVERSAL_PROFILE ) && APP_ASRC_UNIVERSAL_PROFILE &&     (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_A_TO_B)
+  #ifndef ASRC_SAMPLE_Q31
+    #define ASRC_SAMPLE_Q31  (1)
+  #endif
+  /* Flash, not RAM.  ASRC_COEFF_STORAGE_FLASH is defined in audio_app_asrc.c; as a macro body
+   * that is fine, exactly as the BIDIR pin above relies on it. */
+  #ifndef ASRC_Q31_COEFF_STORAGE
+    #define ASRC_Q31_COEFF_STORAGE  (ASRC_COEFF_STORAGE_FLASH)
+  #endif
+  /* L = 256, so that the profile's phase-count requirement is a PIN here and not only an #error
+   * in asrc_app_config.h.  Before this, member B reached L=256 by an explicit -Define on the
+   * command line, which is a build-recipe fact rather than a source fact and does not survive
+   * being rebuilt from the MPLAB configuration alone. */
+  #ifndef ASRC_POLY_L
+    #define ASRC_POLY_L  (256u)
   #endif
 #endif
 

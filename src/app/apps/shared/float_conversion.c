@@ -1,13 +1,15 @@
-﻿
+
 #include "app_specific_config_defs.h"
 #include "app_runtime_overrides.h"
 #include <xc.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h> // memcpy
 #include <math.h>   // fminf / fmaxf
 
 #include "apps/shared/float_conversion.h"
+#include "board/clock/sonora_clock.h"
 
 
 //===========================================================
@@ -294,6 +296,56 @@ void convert_codec_float_to_int(const float* __restrict float_in,
  * @param up_sample_factor  upsample factor (PWM carrier = 48000 * up_sample_factor)
  * @param per_count         PWM period count (20-bit max: up to 1048575)
  */
+/*
+ * convert_float_to_pwm_q31
+ *
+ * One channel of a ch-major float buffer -> Q1.31 for hal_pwm_audio. Only the
+ * PWM gain is applied here; the duty mapping, minimum pulse and upsampling
+ * belong to the hal_pwm_audio backend. Not Post_Gain_CODEC, not 24-bit.
+ *
+ * @param float_in     ch-major input buffer [channels][num_samples]
+ * @param slot         channel index to convert
+ * @param q31_out      num_samples Q1.31 values
+ * @param num_samples  samples per channel
+ */
+void convert_float_to_pwm_q31(const float* float_in,
+                              uint8_t      slot,
+                              int32_t*     q31_out,
+                              size_t       num_samples)
+{
+    const float* __restrict in_ch = &float_in[(size_t)slot * num_samples];
+
+    for (size_t i = 0; i < num_samples; i++)
+    {
+        const float data = in_ch[i] * Post_Gain_PWM;
+        uint32_t bits;
+        int32_t q;
+
+        // Bit test, not data != data: this project builds with -ffast-math,
+        // which lets the compiler assume NaN never occurs.
+        memcpy(&bits, &data, sizeof bits);
+        if ((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u)
+        {
+            q = 0;                      // NaN
+        }
+        else if (data >= 1.0f)
+        {
+            q = INT32_MAX;
+        }
+        else if (data <= -1.0f)
+        {
+            q = INT32_MIN;
+        }
+        else
+        {
+            // |data| < 1: data * 2^31 is exact (power-of-two scale) and lies
+            // in (-2^31, 2^31); the conversion truncates the sub-LSB part.
+            q = (int32_t)(data * 2147483648.0f);
+        }
+        q31_out[i] = q;
+    }
+}
+
 void convert_float_to_pwm_20bit(const float* float_in,
                                 int          channels_in,
                                 uint8_t      slot,
@@ -310,8 +362,13 @@ void convert_float_to_pwm_20bit(const float* float_in,
         return;
 #endif //defined(ENA_DBG_SANITY_CHK)
 
+#if APP_PWM_OUTPUT == 1
+    // MPQ6612A tMON typ 200 ns; conservative 500 ns initial headroom.
+    const double duty_min_d = (double)((SONORA_CLOCK_PWM_MCLK_HZ / 2000000u) << 4);
+#else
     const double duty_min_d = 256.0;                      // 0x100: dsPIC33AK512 min PWM reg val
-    const double duty_max_d = (double)per_count - 256.0;  // per_count - 0x100
+#endif
+    const double duty_max_d = (double)per_count - duty_min_d;  // per_count - 0x100
     const double duty_center_d    = (duty_min_d + duty_max_d) * 0.5;
     const double duty_amp_d       = (duty_max_d - duty_min_d) * 0.5;
 
@@ -340,3 +397,26 @@ void convert_float_to_pwm_20bit(const float* float_in,
         }
     }
 }
+
+#if PWM_AUDIO_SCOPE_ONLY
+/* Completed interleaved TDM TX Q31 -> PWM, no further gain or normalization.
+ * Offset signed Q31 to unsigned before multiplication. 64-bit arithmetic
+ * handles INT32_MIN/MAX and rounds to nearest without float endpoint loss.
+ * Keep a 0x100 register guard at each end; the bridge stays asleep. */
+void convert_codec_q31_to_pwm_20bit(const int32_t* pcm, unsigned stride,
+                                  int32_t* output, size_t num_samples,
+                                  uint8_t up_sample_factor, uint32_t per_count)
+{
+    if (!pcm || !output || !stride || !up_sample_factor || per_count <= 512u)
+        return;
+    const uint32_t duty_min = 256u;
+    const uint32_t span = per_count - 2u * duty_min;
+    for (size_t i = 0; i < num_samples; ++i) {
+        const uint32_t biased = (uint32_t)pcm[i * stride] ^ 0x80000000u;
+        const uint32_t duty = duty_min + (uint32_t)
+            (((uint64_t)biased * span + 0x80000000ULL) >> 32);
+        for (uint8_t k = 0; k < up_sample_factor; ++k)
+            output[i * up_sample_factor + k] = (int32_t)duty;
+    }
+}
+#endif

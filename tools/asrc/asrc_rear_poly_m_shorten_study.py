@@ -44,8 +44,8 @@ thresholds max_image_db = -105.0 and max_edge_loss_db = -1.1 carried on the Cand
 itself.  Its normalisation (AUDIO_EDGE = 20 kHz of 48 kHz) is that gate's own
 convention and is left alone; the rear's shape is rate-agnostic in normalised terms.
 
-Unlike the pre-stage, shortening this filter moves the passband too: its cutoff is
-0.465 of 32 kHz = 14.88 kHz, so 13-15 kHz sits on the shoulder.  cutoff and Kaiser
+Unlike the pre-stage, shortening this filter moves the passband too: the current cutoff is
+0.464 of 32 kHz = 14.848 kHz, so 13-15 kHz sits on the shoulder.  cutoff and Kaiser
 beta are therefore re-chosen for every M -- the pre-stage study's lesson (a window
 parameter picked for the long filter is badly mistuned once it gets short) applies
 verbatim.
@@ -83,7 +83,7 @@ def _load(name: str, relative: str):
 lw = _load("rear_lw", "tools/asrc/asrc_fir_lightweight_feasibility.py")
 g96 = lw._g96()
 chk = g96.chk
-SHIPPED = g96.SHIPPED               # headroom-m30-kaiser11: M=30, fc 0.465, beta 11
+SHIPPED = g96.SHIPPED               # headroom-m30-kaiser11.3: M=30, fc 0.464, beta 11.3
 L_REAR = g96.L_REAR                 # 128 phases
 
 # ------------------------------------------------------------------ CPU anchors
@@ -214,7 +214,7 @@ def main() -> int:
         rows.append(row)
         return row
 
-    add("SHIP M30 fc0.4650 b11", SHIPPED)
+    add("SHIP M30 fc0.4640 b11.3", SHIPPED)
 
     for taps in args.taps:
         best = None

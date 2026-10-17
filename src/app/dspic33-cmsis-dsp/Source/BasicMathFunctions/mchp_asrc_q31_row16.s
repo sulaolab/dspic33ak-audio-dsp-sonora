@@ -103,6 +103,258 @@ _q31_blend_tap:
     .size   _mchp_asrc_q31_blend_row, .-_mchp_asrc_q31_blend_row
 
 ;-----------------------------------------------------------------------------
+;   void mchp_asrc_q31_blend_row_quad(const int32_t *c0,   /* w0  row p     */
+;                                     const int32_t *c1,   /* w1  row p+1   */
+;                                     const int32_t *c2,   /* w2  row p+2   */
+;                                     int32_t       *ceff, /* w3  taps out  */
+;                                     uint32_t       taps, /* w4  >= 1      */
+;                                     int32_t        wbq,  /* w5  Q31 w     */
+;                                     int32_t        gq);  /* w6  Q31 w(w-1)/2 */
+;
+;   t = round_q31( c0 + wbq*d1 );  ceff[k] = round_q31( t + gq*d2 )
+;   d1 = c1-c0,  d2 = (c2-c1)-d1
+;
+;   RESEARCH (APP_ASRC_REAR_QUAD_BLEND, Hi-Fi 48 -> 44.1 kHz study).  Two chained copies of
+;   _mchp_asrc_q31_blend_row's lac/mac/sacr -- NOT lac/mac/mac/sacr, which the note at
+;   _mchp_asrc_q31_blend_row_opt measured 1..2 LSB low.  Oracle asrc_q31_ref_blend_quad().  Own section,
+;   so --gc-sections drops it from every image that does not call it.  No modulo, no AGU MAC
+;   prefetch (register operands only), so MODCON is not touched.
+;-----------------------------------------------------------------------------
+    .section .dspic33cmsisdsp_quad_blend_row, code
+    .global    _mchp_asrc_q31_blend_row_quad
+    .type      _mchp_asrc_q31_blend_row_quad, @function
+_mchp_asrc_q31_blend_row_quad:
+    push.l  w8
+    push.l  w9
+    push.l  w10
+    push.l  w11
+    push.l  w12
+    push.l  w13
+    push.l  w14
+    push.l  CORCON
+    fractsetup w8                   ; fractional mode: sets sacr.l alignment
+    asr.l   w4, #1, w4              ; taps in PAIRS (M is even; the C side asserts it)
+
+    ; Two taps per pass, the same per-tap arithmetic as before -- only the ORDER changes, so
+    ; that no instruction reads the register the one before it wrote (the sub.l -> use latency
+    ; the _opt note above measured as a neop).  ACCA only, as the other kernels here.
+_q31_quad_pair:
+    mov.l   [w0++], w7              ; c0[k]
+    mov.l   [w1++], w8              ; c1[k]
+    mov.l   [w2++], w9              ; c2[k]
+    mov.l   [w0++], w10             ; c0[k+1]
+    mov.l   [w1++], w11             ; c1[k+1]
+    mov.l   [w2++], w12             ; c2[k+1]
+    sub.l   w8, w7, w13             ; d1 k
+    sub.l   w11, w10, w14           ; d1 k+1
+    sub.l   w9, w8, w9              ; e1 k
+    sub.l   w12, w11, w12           ; e1 k+1
+    sub.l   w9, w13, w9             ; d2 k   = e1 - d1
+    sub.l   w12, w14, w12           ; d2 k+1
+    lac.l   w7, a                   ; stage 1, tap k:   a = c0 + wbq*d1
+    mac.l   w5, w13, a
+    sacr.l  a, w7                   ; t k   (= the shipped linear blend, bit for bit)
+    lac.l   w10, a                  ; stage 1, tap k+1
+    mac.l   w5, w14, a
+    sacr.l  a, w10                  ; t k+1
+    lac.l   w7, a                   ; stage 2, tap k:   ceff = t + gq*d2
+    mac.l   w6, w9, a
+    sacr.l  a, [w3++]
+    lac.l   w10, a                  ; stage 2, tap k+1
+    mac.l   w6, w12, a
+    sacr.l  a, [w3++]
+    dtb     w4, _q31_quad_pair
+
+    pop.l   CORCON
+    pop.l   w14
+    pop.l   w13
+    pop.l   w12
+    pop.l   w11
+    pop.l   w10
+    pop.l   w9
+    pop.l   w8
+    return
+    .size   _mchp_asrc_q31_blend_row_quad, .-_mchp_asrc_q31_blend_row_quad
+
+;-----------------------------------------------------------------------------
+;   _mchp_asrc_q31_blend_row_quad4(c0, c1, c2, ceff, taps, wbq, gq)   w0..w6
+;   _mchp_asrc_q31_blend_row_quad's arithmetic, bit for bit, read FOUR TAPS PER ROW AT A TIME.
+;
+;   WHY.  The boot bench (2026-10-11, ...184) put the pair kernel above at 924 cycles from flash
+;   against 492 from RAM: the cost is the CPU data reads of program flash, not the instructions.
+;   Those reads go through the NVM controller's data read buffer, and every switch to another
+;   row is a new flash line.  With the table padded to a 16-byte row stride and 16-byte aligned
+;   (ASRC_Q31_ROW_STRIDE / ASRC_Q31_TABLE_ALIGN), taps 4j..4j+3 of a row are one line, so this
+;   kernel takes one line per row per group of four instead of one per row per pair: 646 cycles.
+;   (Probed and dropped the same night: loads grouped per row in pairs, 772; a precomputed d2
+;   table, 696; a packed {c0,d1,d2/4} stream, 576 but no longer exact.)
+;
+;   d1 = c1 - c0 is formed with subr.l straight from c1's stream; d2 = (c2 - c0) - d1 - d1,
+;   which is (c2 - c1) - d1 modulo 2^32, i.e. the same 32-bit value _quad forms with sub.l.
+;   Two taps run side by side in ACCA and ACCB; each stage is still one lac/mac/sacr.
+;   taps must be 4n + 2 (the C side asserts it): n groups of four, then one pair.
+;-----------------------------------------------------------------------------
+    .section .dspic33cmsisdsp_quad_blend_row4, code
+    .global    _mchp_asrc_q31_blend_row_quad4
+    .type      _mchp_asrc_q31_blend_row_quad4, @function
+_mchp_asrc_q31_blend_row_quad4:
+    push.l  w8
+    push.l  w9
+    push.l  w10
+    push.l  w11
+    push.l  w12
+    push.l  w13
+    push.l  w14
+    push.l  CORCON
+    fractsetup w8
+    asr.l   w4, #2, w4              ; groups of four (the trailing pair is done below)
+
+_q31_q4_group:
+    mov.l   [w0++], w7              ; c0 k..k+3  (one flash line)
+    mov.l   [w0++], w8
+    mov.l   [w0++], w9
+    mov.l   [w0++], w10
+    subr.l  w7, [w1++], w11         ; d1 = c1 - c0, k..k+3  (one flash line)
+    subr.l  w8, [w1++], w12
+    subr.l  w9, [w1++], w13
+    subr.l  w10, [w1++], w14
+    ; taps k, k+1
+    lac.l   w7, a
+    lac.l   w8, b
+    mac.l   w5, w11, a
+    mac.l   w5, w12, b
+    subr.l  w7, [w2++], w7          ; c2 - c0
+    subr.l  w8, [w2++], w8
+    sub.l   w7, w11, w7
+    sub.l   w8, w12, w8
+    sub.l   w7, w11, w7             ; d2 k
+    sub.l   w8, w12, w8             ; d2 k+1
+    sacr.l  a, w11                  ; t k   (= the shipped linear blend)
+    sacr.l  b, w12                  ; t k+1
+    lac.l   w11, a
+    lac.l   w12, b
+    mac.l   w6, w7, a
+    mac.l   w6, w8, b
+    sacr.l  a, [w3++]
+    sacr.l  b, [w3++]
+    ; taps k+2, k+3
+    lac.l   w9, a
+    lac.l   w10, b
+    mac.l   w5, w13, a
+    mac.l   w5, w14, b
+    subr.l  w9, [w2++], w9
+    subr.l  w10, [w2++], w10
+    sub.l   w9, w13, w9
+    sub.l   w10, w14, w10
+    sub.l   w9, w13, w9
+    sub.l   w10, w14, w10
+    sacr.l  a, w13
+    sacr.l  b, w14
+    lac.l   w13, a
+    lac.l   w14, b
+    mac.l   w6, w9, a
+    mac.l   w6, w10, b
+    sacr.l  a, [w3++]
+    sacr.l  b, [w3++]
+    dtb     w4, _q31_q4_group
+
+    ; trailing pair (taps 4n, 4n+1)
+    mov.l   [w0++], w7
+    mov.l   [w0++], w8
+    subr.l  w7, [w1++], w11
+    subr.l  w8, [w1++], w12
+    lac.l   w7, a
+    lac.l   w8, b
+    mac.l   w5, w11, a
+    mac.l   w5, w12, b
+    subr.l  w7, [w2++], w7
+    subr.l  w8, [w2++], w8
+    sub.l   w7, w11, w7
+    sub.l   w8, w12, w8
+    sub.l   w7, w11, w7
+    sub.l   w8, w12, w8
+    sacr.l  a, w11
+    sacr.l  b, w12
+    lac.l   w11, a
+    lac.l   w12, b
+    mac.l   w6, w7, a
+    mac.l   w6, w8, b
+    sacr.l  a, [w3++]
+    sacr.l  b, [w3++]
+
+    pop.l   CORCON
+    pop.l   w14
+    pop.l   w13
+    pop.l   w12
+    pop.l   w11
+    pop.l   w10
+    pop.l   w9
+    pop.l   w8
+    return
+    .size   _mchp_asrc_q31_blend_row_quad4, .-_mchp_asrc_q31_blend_row_quad4
+
+;-----------------------------------------------------------------------------
+;   _mchp_asrc_q31_blend_row_lin4(c0, c1, ceff, taps, wbq)   w0..w4
+;   The shipped linear blend (_mchp_asrc_q31_blend_row) read four taps per row at a time; the
+;   same lac/mac/sacr per tap, so bit-exact to it.  RESEARCH probe of what the grouped read
+;   would save on the PRODUCT kernel.  taps must be 4n + 2.
+;-----------------------------------------------------------------------------
+    .section .dspic33cmsisdsp_lin_blend_row4, code
+    .global    _mchp_asrc_q31_blend_row_lin4
+    .type      _mchp_asrc_q31_blend_row_lin4, @function
+_mchp_asrc_q31_blend_row_lin4:
+    push.l  w8
+    push.l  w9
+    push.l  w10
+    push.l  w11
+    push.l  w12
+    push.l  CORCON
+    fractsetup w8
+    asr.l   w3, #2, w3
+_q31_l4_group:
+    mov.l   [w0++], w5
+    mov.l   [w0++], w6
+    mov.l   [w0++], w7
+    mov.l   [w0++], w8
+    subr.l  w5, [w1++], w9
+    subr.l  w6, [w1++], w10
+    subr.l  w7, [w1++], w11
+    subr.l  w8, [w1++], w12
+    lac.l   w5, a
+    lac.l   w6, b
+    mac.l   w4, w9, a
+    mac.l   w4, w10, b
+    sacr.l  a, [w2++]
+    sacr.l  b, [w2++]
+    lac.l   w7, a
+    lac.l   w8, b
+    mac.l   w4, w11, a
+    mac.l   w4, w12, b
+    sacr.l  a, [w2++]
+    sacr.l  b, [w2++]
+    dtb     w3, _q31_l4_group
+    mov.l   [w0++], w5
+    mov.l   [w0++], w6
+    subr.l  w5, [w1++], w9
+    subr.l  w6, [w1++], w10
+    lac.l   w5, a
+    lac.l   w6, b
+    mac.l   w4, w9, a
+    mac.l   w4, w10, b
+    sacr.l  a, [w2++]
+    sacr.l  b, [w2++]
+    pop.l   CORCON
+    pop.l   w12
+    pop.l   w11
+    pop.l   w10
+    pop.l   w9
+    pop.l   w8
+    return
+    .size   _mchp_asrc_q31_blend_row_lin4, .-_mchp_asrc_q31_blend_row_lin4
+
+    .section .dspic33cmsisdsp, code
+
+;-----------------------------------------------------------------------------
 ;   void mchp_asrc_q31_row16(const int32_t *hist0,   /* w0  &ch[0][wbase] */
 ;                           uint32_t stride_bytes,  /* w1  per-channel   */
 ;                           const int32_t *ceff,    /* w2  blended row   */

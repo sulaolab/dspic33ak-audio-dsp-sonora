@@ -21,6 +21,7 @@
 
 typedef enum {
     NORA_ADC_INSTANCE_1 = 1,
+    NORA_ADC_INSTANCE_2 = 2,
     NORA_ADC_INSTANCE_3 = 3,
     NORA_ADC_INSTANCE_4 = 4,
     NORA_ADC_INSTANCE_5 = 5,

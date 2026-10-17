@@ -51,7 +51,7 @@ chk = _load("chk", "tools/asrc/asrc_headroom_filter_check.py")
 dsg = _load("dsg", "tools/asrc/asrc_decimator_48_to_8_design.py")
 
 L = chk.L                            # 128 resampler phases
-SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11: 30 taps, fc 0.465 of the INPUT rate
+SHIPPED = chk.CANDIDATES[1]          # headroom-m30-kaiser11.3: 30 taps, fc 0.464 of the INPUT rate
 IN_HZ = 48000.0
 OUT_HZ = 32000.0
 OUT_NYQ = 16000.0
@@ -198,7 +198,7 @@ def optC(passband):
 PASSBANDS = (15000.0, 14000.0, 13600.0, 12800.0, 12000.0, 11000.0)
 
 print("=" * 104)
-print("0. WHAT HAPPENS TODAY   fe=direct, resampler cutoff fixed at 0.465*48000 = 22320 Hz")
+print("0. WHAT HAPPENS TODAY   fe=direct, resampler cutoff fixed at 0.464*48000 = 22272 Hz")
 print("=" * 104)
 _mask = FREQS > OUT_NYQ
 _mag = mag_at(PROTO_SHIPPED, float(L) * IN_HZ, fold(FREQS, IN_HZ))

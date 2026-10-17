@@ -1,4 +1,7 @@
 #include "app_specific_config_defs.h"
+#if PWM_AUDIO_SCOPE_ONLY || (APP_USE_PWM_AUDIO && APP_PWM_AUDIO_HAL)
+#include "classic_audio_pwm.h"
+#endif
 
 #if !SONORA_APP_IS_CLASSIC
 #  error "classic_console.c is Classic-app-owned; build it only in a Classic manifest (SONORA_APP_IS_CLASSIC). Check nbproject/configurations.xml source exclusions."
@@ -8,7 +11,15 @@
 #include <stdint.h>
 
 #include "apps/sonora_app_console.h"
+#include "timer_app.h"
+#include "board/devices/pot_drv.h"
+#include "dsp/gain_ctrl.h"
 #include "classic_controls.h"   // UsrOperate_* (raw hotkey actions)
+
+#if defined(ENA_BIQUAD_TIER1_BENCH) && ENA_BIQUAD_TIER1_BENCH
+#include "dsp/biquad_tier1_bench.h"
+#include "dsp/shared_ref/iir_bench_reference.h"
+#endif
 
 #if defined(ENA_BIQUAD_IIR_CASCADE) || defined(ENA_BASS_ENHANCER)
 #include "app_utils.h"   // biquad_mono_t (needed by biquad_cascade_4ch.h / bass_enhancer.h)
@@ -474,6 +485,68 @@ void sonora_app_console_onmsg( app_console_msg_t* msg )
 
     switch( msg->name )
     {
+    case 'm': // ?cm: digital mute and ramp status
+        if( msg->kind == '?' && msg->data_len == 0u ) {
+            app_mute_print(); msg->status = APP_CONSOLE_OK;
+        } else {
+            msg->data_len = 0u; msg->status = APP_CONSOLE_ERR_BAD_DATA;
+        }
+        break;
+    case 'P': // ?cP reports raw external POT and ADC route (uppercase)
+        if (msg->kind == '?' && msg->data_len == 0u) {
+            POT_PrintStatus(); msg->status = APP_CONSOLE_OK;
+        } else {
+            msg->data_len = 0u; msg->status = APP_CONSOLE_ERR_BAD_DATA;
+        }
+        break;
+#if PWM_AUDIO_SCOPE_ONLY || (APP_USE_PWM_AUDIO && APP_PWM_AUDIO_HAL)
+    case 'p': // HAL lab *cp55xx; scope also supports 00/01/02/03
+#if APP_USE_PWM_AUDIO && APP_PWM_AUDIO_HAL
+        if (msg->kind == '?' && msg->data_len == 0u) {
+            classic_audio_pwm_control_print();
+            msg->status = APP_CONSOLE_OK;
+            break;
+        }
+        if (msg->kind == '*' && msg->data_len == 2u &&
+            msg->data[0] == 0x55u && msg->data[1] <= 1u) {
+            const bool ok = classic_audio_pwm_lab_control(msg->data[1] != 0u);
+            printf(" PWMlab control=%u ok=%u\n", (unsigned)msg->data[1], (unsigned)ok);
+            classic_audio_pwm_control_print();
+            msg->data_len = 0u;
+            msg->status = ok ? APP_CONSOLE_OK : APP_CONSOLE_ERR_OPERATION_FAILED;
+            break;
+        }
+#endif
+#if PWM_AUDIO_SCOPE_ONLY
+        if (msg->kind != '*' || msg->data_len != 1u || msg->data[0] > 3u) {
+            printf(" PWMscope: *cp00 stop / *cp01 start / *cp02 neutral / *cp03 audio\n");
+            msg->data_len = 0u;
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            break;
+        }
+        {
+            const unsigned action = msg->data[0];
+            bool ok = true;
+            if (action == 0u) classic_audio_pwm_stop();
+            if (action == 1u) ok = classic_audio_pwm_start();
+            if (action >= 2u) classic_audio_pwm_scope_set_silence(action == 2u);
+            printf(" PWMscope control=%u ok=%u\n", action, (unsigned)ok);
+#if APP_PWM_AUDIO_HAL
+            classic_audio_pwm_control_print();
+#else
+            printf(" nSLEEP remains Low\n");
+#endif
+            msg->data_len = 0u;
+            msg->status = ok ? APP_CONSOLE_OK : APP_CONSOLE_ERR_OPERATION_FAILED;
+        }
+        break;
+#else
+        printf(" PWMlab: *cp5500 stop / *cp5501 start + nSLEEP High / ?cp status\n");
+        msg->data_len = 0u;
+        msg->status = APP_CONSOLE_ERR_BAD_DATA;
+        break;
+#endif
+#endif
 #if defined(ENA_BIQUAD_IIR_CASCADE)
     case 'f':   // biquad cascade bypass/normal: "*cf VV" (write only)
         if( msg->kind != '*' )
@@ -540,6 +613,150 @@ void sonora_app_console_onmsg( app_console_msg_t* msg )
         classic_console_synth( msg );
         break;
 
+#if defined(ENA_BIQUAD_TIER1_BENCH) && ENA_BIQUAD_TIER1_BENCH
+    /*
+     * Tier 1 DF2T bench. Measurement only, foreground only, and present only in
+     * an opt-in build -- see ENA_BIQUAD_TIER1_BENCH in
+     * app_specific_config_defs.h. Every one of these is write-only ('*'),
+     * because each one runs something rather than reporting a stored value.
+     *
+     *   *ct   known-answer test over both banks, with the fault injections
+     *   *cB   build info: kernel, geometry, placement, bank CRCs
+     *   *cw   section sweep, allpass bank, 1..84 sections
+     *   *cq   the challenge point: 84 sections, allpass bank
+     *
+     * Note *cw is the sweep here and NOT the Type_LB gust-band key of the same
+     * letter: that key is gated on ENA_AVAS_TYPE_LB_SYNTH, which no bench build
+     * enables. The overlap is checked by the #error below rather than left to
+     * whoever next enables both.
+     */
+#if defined(ENA_AVAS_TYPE_LB_SYNTH)
+#  error "ENA_BIQUAD_TIER1_BENCH and ENA_AVAS_TYPE_LB_SYNTH both claim console key 'w'."
+#endif
+
+    case 'T':   // Tier 1 KAT: "*cT"
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        msg->data_len = 0u;
+        (void)biquad_tier1_bench_self_test();
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 'B':   // Tier 1 build info: "*cB"
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        msg->data_len = 0u;
+        biquad_tier1_bench_print_build_info();
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 'W':   // Tier 1 section sweep: "*cW"
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        msg->data_len = 0u;
+        biquad_tier1_bench_sweep();
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 'Q':   // Tier 1 challenge point: "*cQ"
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        msg->data_len = 0u;
+        biquad_tier1_bench_run( IIR_BENCH_AP_SECTIONS, BIQUAD_TIER1_BANK_AP );
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+#if defined(BIQUAD_TIER1_KERNEL) \
+ && ( ( BIQUAD_TIER1_KERNEL == 4 ) || ( BIQUAD_TIER1_KERNEL == 5 ) \
+   || ( BIQUAD_TIER1_KERNEL == 6 ) )
+    /*
+     * Spacing sweep, present only in an experiment build: =4 sweeps the
+     * cross-sample edge, =5 the in-sample d1 edge. The keys are the same either
+     * way - the image can only hold one sweep, and it names which one in its own
+     * output - so a procedure written for one build works for the other.
+     *
+     * Two keys, because the correctness gate and the measurement must be
+     * separately runnable: a cycle table from arms that have not been proved
+     * bit-identical to opt_v1 is not evidence of anything.
+     *
+     *   *cG      run the sweep with the PMU on  (the experiment)
+     *   *cG 00   run it with the PMU off        (the control: does the
+     *                                           instrument move the number?)
+     *   *cV      verify every arm against opt_v1, bit for bit
+     */
+    case 'G':   // spacing sweep: "*cG" / "*cG 00"
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        {
+            /*
+             * Payload is DECODED BINARY, not the ASCII the user typed: "*cG 00"
+             * arrives as one byte 0x00, the same convention as "*cy SS" above.
+             *
+             * Absent payload means PMU ON, because that is the experiment. A
+             * single 0x00 selects the control. Anything else is rejected rather
+             * than guessed at - a mistyped payload quietly selecting the control
+             * would print a table with no stall columns, which reads as a PMU
+             * failure rather than as the user's typo.
+             */
+            const uint16_t in_len = msg->data_len;
+            bool           pmu    = true;
+
+            msg->data_len = 0u;
+
+            if( in_len != 0u )
+            {
+                if( ( in_len == 1u ) && ( msg->data[0] == 0x00u ) )
+                {
+                    pmu = false;
+                }
+                else
+                {
+                    printf( " \"*cG\" = spacing sweep, PMU on."
+                            " \"*cG 00\" = same sweep, PMU off (control).\n" );
+                    msg->status = APP_CONSOLE_ERR_BAD_DATA;
+                    break;
+                }
+            }
+
+            biquad_tier1_bench_gap_sweep( IIR_BENCH_AP_SECTIONS, pmu );
+            msg->status = APP_CONSOLE_OK;
+        }
+        break;
+
+    case 'V':   // spacing-sweep correctness gate: "*cV"
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        msg->data_len = 0u;
+        (void)biquad_tier1_bench_gap_verify();
+        msg->status = APP_CONSOLE_OK;
+        break;
+#endif /* BIQUAD_TIER1_KERNEL == 4, 5 or 6 */
+#endif /* ENA_BIQUAD_TIER1_BENCH */
+
     default:
         msg->data_len = 0u;
         msg->status   = APP_CONSOLE_ERR_NOT_FOUND;
@@ -555,6 +772,29 @@ void sonora_app_console_onmsg( app_console_msg_t* msg )
 // operation, exactly as the original code did with its inline local_flush_uart_data().
 sonora_hotkey_result_t sonora_app_handle_hotkey( char c )
 {
+    /* VT100 CSI (ESC [ A/B) and application cursor mode (ESC O A/B).
+     * Consume the sequence as a unit: its A must not toggle Type_LB, and B
+     * must not bypass IIR. Timeout discards an incomplete prefix. */
+    static uint8_t escape_state;
+    static uint32_t escape_ms;
+    const uint32_t now = GetTicks();
+    if (escape_state && (uint32_t)(now - escape_ms) > 250u) escape_state = 0u;
+    if ((uint8_t)c == 0x1Bu) {
+        escape_state = 1u; escape_ms = now; return SONORA_HOTKEY_HANDLED;
+    }
+    if (escape_state == 1u) {
+        escape_state = (c == '[' || c == 'O') ? 2u : 0u;
+        return SONORA_HOTKEY_HANDLED;
+    }
+    if (escape_state == 2u) {
+        if (c >= 0x40 && c <= 0x7e) {
+            escape_state = 0u;
+#if defined(ENA_AVAS_TYPE_TY_SYNTH) || defined(ENA_AVAS_TYPE_LB_SYNTH)
+            if (c == 'A' || c == 'B') UsrOperate_avas_pitch_step(c == 'A' ? 10.0f : -10.0f);
+#endif
+        }
+        return SONORA_HOTKEY_HANDLED;
+    }
     switch( c )
     {
 #if defined(ENA_BIQUAD_IIR_CASCADE)
@@ -568,23 +808,19 @@ sonora_hotkey_result_t sonora_app_handle_hotkey( char c )
         return SONORA_HOTKEY_HANDLED;
 #endif /* defined(ENA_BIQUAD_IIR_CASCADE) */
 
-    /* The two AVAS sources are exclusive at run time (their loads would add up),
-     * so each key only ever asks; the toggle refuses if the other is sounding. */
+    /* Stopped: a starts TY, A starts LB. Either key stops the sounding voice. */
 #if defined(ENA_AVAS_TYPE_TY_SYNTH)
     case 'a':
-        UsrOperate_avas_synth();
+        UsrOperate_avas_synth_key('a');
         return SONORA_HOTKEY_HANDLED;
 #endif /* defined(ENA_AVAS_TYPE_TY_SYNTH) */
 #if defined(ENA_AVAS_TYPE_LB_SYNTH)
     case 'A':
-        UsrOperate_avas_synth_type_lb();
+        UsrOperate_avas_synth_key('A');
         return SONORA_HOTKEY_HANDLED;
 #endif /* defined(ENA_AVAS_TYPE_LB_SYNTH) */
 
-    /* No hotkey for the AVAS pitch trim: the POT is its only control (see
-     * classic_controls.c).  '[' / ']' briefly held it and were removed -- keys
-     * would need a soft-takeover arbitration against an absolute knob, for a
-     * second way to do the same thing.  '?cs' reports the current value. */
+    /* Up/down arrows: +/-10 cent; '?cs' reports pitch; '?cP' reports POT. */
 
     case 'k':
         UsrOperate_kinkon();

@@ -5,11 +5,26 @@
 
 /* ASRC-owned clock measurement and feed-forward control. */
 void asrc_clock_control_init_reset( void );
+/* Re-arm only feed-forward publication after an ASRC-engine warm reset. */
+void asrc_clock_control_servo_rearm( void );
 void asrc_clock_control_tick( void );
+/* P0 MEAS: precise FF windows close after a common elapsed time T = code x 500 ms
+ * (0 = 256-period windows, the boot default). Takes effect at the next rate epoch. */
+void asrc_clock_control_ff_cotimed_set( uint8_t code );
+/* P0 MEAS: two-stage FF -- publish the 256-period FF first (early audio), then hand the
+ * co-timed FF to the engine bumplessly; QUALITY_READY waits for it. Next rate epoch. */
+void asrc_clock_control_ff_two_stage_set( uint8_t on );
 
 /* Capture counters stay independent of the audio DMA and feed its liveness guard. */
 uint32_t asrc_clock_control_capture_count_a( void );
 uint32_t asrc_clock_control_capture_count_b( void );
+
+/* P0 step 5 (MEAS): how late the running leg-B pull started after its own hardware instant,
+ * in high-res-timer ticks (>= 0; 0 without CCP rate detect). Call once per A->B pull. */
+int32_t asrc_clock_control_legb_defer_ticks( void );
+/* The same after leg A's grid, for the B->A engine's pull (BA MEAS image). */
+int32_t asrc_clock_control_lega_defer_ticks( void );
+void    asrc_clock_control_legb_defer_print( void );
 
 /*
  * CCP-MEASURED sample rate of one logical leg, in Hz; 0 while nothing has been measured yet

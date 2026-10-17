@@ -106,24 +106,52 @@
 
 /* --------------------------------------------------------- coefficients --- */
 
-/* One baked table per geometry, selected on M.  The M30 table is the shipping
- * default and is byte-identical to what it always was; the M28 table exists for
- * the 96 kHz profile (APP_ASRC_EXPERIMENTAL_M28).  Both are emitted by
- *   tools/asrc/asrc_q31_resampler_model.py table --taps <M> --fc <fc> --beta <b>
+/* One baked table per geometry, SELECTED ON (L, M) -- not on M alone.
+ *
+ * It was selected on M alone until 2026-09-15, when L=256 arrived: the L/M
+ * cross-check below would have caught the mismatch, but only as "regenerate the
+ * table", which is the wrong instruction when the right table already exists in
+ * the tree.  L is part of the geometry a table is designed for, so it belongs in
+ * the selector.
+ *
+ *   asrc_poly_q31_table.h            L=128 M=30  the L128 shipping geometry,
+ *                                    byte-identical to what it always was
+ *   asrc_poly_q31_table_l256m30.h    L=256 M=30  the standard AK512 BIDIR
+ *                                    universal-rate geometry (2026-09-15)
+ *   asrc_poly_q31_table_l256m34.h    L=256 M=34  the longer Universal rear
+ *                                    (fc 0.46336, Kaiser beta 14.0; 2026-09-30,
+ *                                    APP_ASRC_REAR_POLY_M34 -- generated with
+ *                                    --banner-exact so fc is not rounded to 0.463)
+ *   asrc_poly_q31_table_m28.h        L=128 M=28  retired 96 kHz geometry, kept
+ *                                    as a record (APP_ASRC_EXPERIMENTAL_M28)
+ *
+ * All are emitted by
+ *   tools/asrc/asrc_q31_resampler_model.py table --taps <M> --fc <fc> --beta <b> --phases <L>
  * and carry fc/beta in their banner, which is the ONLY place those two are
  * recorded on the target: the #error below can check L and M, but a table
  * designed with the wrong fc or beta is a well-formed table and cannot be
- * detected here.  Read the banner when adding one. */
-#if   ( ASRC_POLY_M == 30u )
+ * detected here.  Read the banner when adding one.
+ *
+ * L COSTS PROGRAM MEMORY AND NOTHING ELSE.  The table is (L+1) x M x 4 B --
+ * 15,480 B at L=128, 30,840 B at L=256 -- and blend_row still reads exactly two
+ * rows (p and p+1) per output frame whatever L is, so the MAC count, the traffic
+ * per frame, ASRC_POLY_AHEAD and the fill law are all L-independent.  That is why
+ * a profile can pin L per preset: it is a resource trade, not a rate decision.
+ * [internal] study_ak512_universal_nyquist_prototype_phase1_2026-09-14.md 31.9 */
+#if   ( ASRC_POLY_L == 128u ) && ( ASRC_POLY_M == 30u )
 #  include "asrc_poly_q31_table.h"
-#elif ( ASRC_POLY_M == 28u )
+#elif ( ASRC_POLY_L == 256u ) && ( ASRC_POLY_M == 30u )
+#  include "asrc_poly_q31_table_l256m30.h"
+#elif ( ASRC_POLY_L == 256u ) && ( ASRC_POLY_M == 34u )
+#  include "asrc_poly_q31_table_l256m34.h"
+#elif ( ASRC_POLY_L == 128u ) && ( ASRC_POLY_M == 28u )
 #  include "asrc_poly_q31_table_m28.h"
 #else
-#  error "no baked Q31 coefficient table for this ASRC_POLY_M -- generate one with tools/asrc/asrc_q31_resampler_model.py table --taps <ASRC_POLY_M> --fc <ASRC_POLY_FC> --beta <ASRC_POLY_KAISER_BETA> and select it above"
+#  error "no baked Q31 coefficient table for this (ASRC_POLY_L, ASRC_POLY_M) -- generate one with tools/asrc/asrc_q31_resampler_model.py table --taps <ASRC_POLY_M> --fc <ASRC_POLY_FC> --beta <ASRC_POLY_KAISER_BETA> --phases <ASRC_POLY_L>, generate the matching Proof-A vectors, and add an arm to both selectors here"
 #endif
 
 #if (ASRC_POLY_Q31_TABLE_L != ASRC_POLY_L) || (ASRC_POLY_Q31_TABLE_M != ASRC_POLY_M)
-#  error "asrc_poly_q31_table.h was generated for a different L/M -- regenerate it with tools/asrc/asrc_q31_resampler_model.py table"
+#  error "the included Q31 coefficient table declares a different L/M than this build resolved -- the selector above picked the wrong file, or the file's banner and its name disagree; regenerate it with tools/asrc/asrc_q31_resampler_model.py table --phases <ASRC_POLY_L> --taps <ASRC_POLY_M>"
 #endif
 
 /*
@@ -138,7 +166,9 @@
  * bit-exact -- which is exactly how this was found: the coefficient probe
  * failed while the arithmetic was correct.
  *
- * STORAGE IS ITS OWN KNOB -- ASRC_Q31_COEFF_STORAGE -- AND IT DEFAULTS TO RAM.
+ * STORAGE IS ITS OWN KNOB -- ASRC_Q31_COEFF_STORAGE -- AND ITS GENERIC DEFAULT IS RAM.
+ * The shipping AK512 bidir preset pins FLASH in asrc_app_build_config.h; read the
+ * 2026-09-12 note at the end of this block before treating RAM as a live option.
  *
  *   RAM   (default) : initialised data, writable.  blend_row reads this table once
  *           per output frame, and RAM reads are what make that cheap.
@@ -166,11 +196,42 @@
  * dominates after the division.  Do not re-derive either arm's figure from the
  * shape of the code; both came from hardware dwells.
  *
+ * 2026-09-12: THE "HOLD RAM AS A FUTURE OPTION" HALF OF THAT DECISION IS CLOSED, AND THE
+ * 74.4 % FIGURE ABOVE IS NOT REACHABLE ON THIS TREE.  Rebuilt at 16+16 ch on de0bab7, the
+ * RAM arm does not run at all: data memory lands at 92 %, the stack collides with .bss and
+ * the image traps in _mchp_asrc_q31_row16 at SPLIM+776 B, deterministically, every boot.
+ * That is a genuine stack overflow from RAM pressure, not the A1 silicon STACK ERROR that
+ * `interrupt,context` works around.  So the trade is not "13.2 pt for 15,480 B" any more --
+ * there is no working RAM image to buy the points from, and the owner has closed RAM as a
+ * production candidate (do not re-propose it as a performance ceiling or as a reason to
+ * chase a RAM diet).  FLASH is what the shipping bidir preset selects, and what the full
+ * 81-cell rate-pair qualification was taken on.
+ * [internal] ak512_q31_flash_full_ratepair_production_feasibility_2026-09-12.md section 11
+ * and [internal] ak512_48k_family_float_vs_q31_2026-09-12.md section 11.
+ *
  * Nothing writes this table (the only readers are blend_row, the coefficient probe
  * and the table hash), so const costs no code when FLASH is selected.
  */
 #ifndef ASRC_Q31_COEFF_STORAGE
 #  define ASRC_Q31_COEFF_STORAGE  (ASRC_COEFF_STORAGE_RAM)
+#endif
+/* THE UNIVERSAL PROFILE REFUSES THE RAM ARM, on both of its images.
+ *
+ * Stated here and not in asrc_app_config.h for a mechanical reason: ASRC_COEFF_STORAGE_RAM and
+ * ASRC_COEFF_STORAGE_FLASH are defined in audio_app_asrc.c, so an #if on them from a header read
+ * earlier would compare against 0 for both names and read as satisfied whatever the build chose.
+ * This is the first point where the selector's value is final AND the names are in scope.
+ *
+ * WHY IT IS REFUSED.  On member A (16 + 16 channels) the RAM arm does not run at all -- data
+ * memory lands at 92 %, the stack collides with .bss and the image traps in _mchp_asrc_q31_row16
+ * deterministically every boot (see the PLACEMENT note above); the owner closed RAM as a
+ * production candidate on 2026-09-12.  On member B the whole resource case for the Q31 rear is
+ * that its (L+1) x M x 4 B = 30,840 B table is NOT in data memory: with the table in RAM the
+ * measured 54,528 -> 23,826 B improvement disappears and the profile would be paying +39,816 B of
+ * program for nothing.  So the refusal is one statement about the bundle, not two coincidences. */
+#if APP_ASRC_UNIVERSAL_PROFILE && APP_ASRC_RING_IS_AK512_M30_FAMILY && \
+    (ASRC_Q31_COEFF_STORAGE != ASRC_COEFF_STORAGE_FLASH)
+#  error "APP_ASRC_UNIVERSAL_PROFILE on the AK512 M30 family needs the Q31 coefficient table in flash (ASRC_Q31_COEFF_STORAGE == ASRC_COEFF_STORAGE_FLASH): the 16+16-channel member traps in _mchp_asrc_q31_row16 every boot with the table in RAM (data memory at 92 %, stack into .bss), and on the 96 kHz member the table in RAM cancels the entire data-memory saving that justifies the Q31 rear. RAM was closed as a production candidate on 2026-09-12; do not re-propose it."
 #endif
 #if (ASRC_Q31_COEFF_STORAGE == ASRC_COEFF_STORAGE_FLASH)
 #  define ASRC_POLY_Q31_STORAGE_QUAL  const
@@ -180,11 +241,52 @@
 #  define ASRC_POLY_Q31_STORAGE_NAME  "ram"
 #endif
 
+#if APP_ASRC_REAR_QUAD_BLEND
+/* TABLE LAYOUT FOR THE QUAD BLEND (P4 step 2, measured 2026-10-11 on ...184).  CPU data reads of
+ * program flash go through the NVM controller's read buffer, one 16-byte line at a time, so the
+ * blend's cost is set by how many lines it opens, not by its instruction count (boot bench: the
+ * pair kernel 924 cycles from flash, 492 from RAM).  Rows padded to 36 words (144 B, a whole
+ * number of lines) on a 16-byte-aligned table let _blend_row_quad4 open one line per row per four
+ * taps: 924 -> 646 cycles, and max_demand at 16 ch 46.9 -> 40.6 % (flag OFF: 39.0 %).  Cost: 2 x 4
+ * pad bytes per row, 2,064 B of flash.  The pad words are zero and never read.  Defaults apply to
+ * the quad build only; the shipped table (flag OFF) keeps its packed [L+1][M] layout. */
+#ifndef ASRC_Q31_TABLE_ALIGN
+#define ASRC_Q31_TABLE_ALIGN  (16)
+#endif
+#ifndef ASRC_Q31_ROW_STRIDE
+#define ASRC_Q31_ROW_STRIDE   ( ( ASRC_POLY_M + 3u ) & ~3u )
+#endif
+#if ( ASRC_Q31_ROW_STRIDE < ASRC_POLY_M )
+#  error "ASRC_Q31_ROW_STRIDE must be at least ASRC_POLY_M"
+#endif
+/* The quadratic blend reads rows p..p+2, so p = L-1 needs row L+1: one row past the table. */
+#include "asrc_poly_q31_table_l256m34_xrow.h"
+#if (ASRC_POLY_Q31_TABLE_XROW_L != ASRC_POLY_L) || (ASRC_POLY_Q31_TABLE_XROW_M != ASRC_POLY_M)
+#  error "the quadratic-blend extra row was generated for a different table"
+#endif
+static ASRC_POLY_Q31_STORAGE_QUAL int32_t
+    s_poly_q31[ASRC_POLY_L + 2u][ASRC_Q31_ROW_STRIDE] __attribute__(( aligned(ASRC_Q31_TABLE_ALIGN) )) =
+{
+    ASRC_POLY_Q31_TABLE_INIT,
+    ASRC_POLY_Q31_TABLE_XROW_INIT
+};
+#elif APP_ASRC_REAR_LIN4
+/* Same padded layout as the quad build above, without the extra row (the linear blend reads p, p+1). */
+#define ASRC_Q31_ROW_STRIDE   ( ( ASRC_POLY_M + 3u ) & ~3u )
+static ASRC_POLY_Q31_STORAGE_QUAL int32_t
+    s_poly_q31[ASRC_POLY_L + 1u][ASRC_Q31_ROW_STRIDE] __attribute__(( aligned(16) )) =
+{
+    ASRC_POLY_Q31_TABLE_INIT
+};
+extern void mchp_asrc_q31_blend_row_lin4( const int32_t* c0, const int32_t* c1,
+                                          int32_t* ceff, uint32_t taps, int32_t wbq );
+#else
 static ASRC_POLY_Q31_STORAGE_QUAL int32_t
     s_poly_q31[ASRC_POLY_L + 1u][ASRC_POLY_M] __attribute__(( aligned(4) )) =
 {
     ASRC_POLY_Q31_TABLE_INIT
 };
+#endif
 
 #define ASRC_POLY_Q31_ROW(p)  ((const int32_t*)&s_poly_q31[(p)][0])
 
@@ -224,6 +326,81 @@ extern void mchp_asrc_q31_blend_row( const int32_t* c0, const int32_t* c1,
 extern void mchp_asrc_q31_row16( const int32_t* hist0, uint32_t stride_bytes,
                                  const int32_t* ceff, uint32_t taps,
                                  int32_t* out, uint32_t nch );
+
+#if APP_ASRC_REAR_QUAD_BLEND
+/*
+ * QUADRATIC PHASE BLEND (research, APP_ASRC_REAR_QUAD_BLEND).  Newton form of the Lagrange
+ * polynomial through rows p, p+1, p+2 at w in [0,1) past row p:
+ *
+ *   ceff[k] = c0 + w*d1 + g*d2,   d1 = c1 - c0,  d2 = (c2 - c1) - d1,  g = w*(w-1)/2 in [-1/8, 0]
+ *
+ * TWO CHAINED STAGES, EACH THE LINEAR KERNEL'S lac/mac/sacr:  t = sacr( c0 + wbq*d1 ),  then
+ * ceff = sacr( t + gq*d2 ).  NOT one accumulator with two MACs: mchp_asrc_q31_row16.s records
+ * (2026-09-07, 33AK512MPS512) that two fractional MACs into one accumulator come out 1..2 LSB low
+ * against the whole-product model, while one lac/mac/sacr is bit-exact.  Stage 1 IS the shipped
+ * linear blend, bit for bit; stage 2 adds the curvature term.  The extra rounding is 0.5 Q31 LSB
+ * of a coefficient (-186 dB).  d1, d2 are formed in 32 bits (sub.l): adjacent rows of a
+ * 256-phase table differ by far less than 2^31.
+ */
+extern void mchp_asrc_q31_blend_row_quad( const int32_t* c0, const int32_t* c1,
+                                          const int32_t* c2, int32_t* ceff, uint32_t taps,
+                                          int32_t wbq, int32_t gq );
+extern void mchp_asrc_q31_blend_row_quad4( const int32_t* c0, const int32_t* c1,
+                                           const int32_t* c2, int32_t* ceff, uint32_t taps,
+                                           int32_t wbq, int32_t gq );
+extern void mchp_asrc_q31_blend_row_lin4( const int32_t* c0, const int32_t* c1,
+                                          int32_t* ceff, uint32_t taps, int32_t wbq );
+/* Which quad kernel the hot path calls: 4 = _quad4 (default; pays off only on the padded,
+ * 16-byte-aligned table above, correct on any table), 0 = the pair kernel (_quad), kept for A/B. */
+#ifndef APP_ASRC_REAR_QUAD_KERNEL
+#define APP_ASRC_REAR_QUAD_KERNEL  (4)
+#endif
+#if APP_ASRC_REAR_QUAD_KERNEL == 4
+#  define ASRC_Q31_QUAD_BLEND_FN  mchp_asrc_q31_blend_row_quad4
+#elif APP_ASRC_REAR_QUAD_KERNEL == 0
+#  define ASRC_Q31_QUAD_BLEND_FN  mchp_asrc_q31_blend_row_quad
+#else
+#  error "APP_ASRC_REAR_QUAD_KERNEL is 0 (pair) or 4 (four-tap groups)"
+#endif
+_Static_assert( ( ASRC_POLY_M % 4u ) == 2u,
+    "_blend_row_quad4 / _lin4 run groups of four taps and one trailing pair: M must be 4n+2" );
+
+/* g = w*(w-1)/2 in Q31, from the same float weight asrc_q31_wb() converts.  Non-positive, and
+ * at most 1/8 in magnitude, so it cannot leave int32. */
+static inline int32_t asrc_q31_wq2( float wb )
+{
+    const int32_t v = (int32_t)( ( wb * ( wb - 1.0f ) * 0.5f ) * 2147483648.0f );
+    return ( v > 0 ) ? 0 : v;
+}
+
+/* sacr.l under the CORCON fractsetup leaves: round half to EVEN, then saturate. */
+static inline int32_t asrc_q31_sacr_convergent( int64_t acc )
+{
+    int64_t       v   = acc >> 31;
+    const int64_t rem = acc & 0x7FFFFFFFLL;
+    if( rem > 0x40000000LL )        { v += 1; }
+    else if( rem == 0x40000000LL )  { if( ( v & 1 ) != 0 ) { v += 1; } }
+    if( v > 2147483647LL )          { return (int32_t)0x7FFFFFFF; }
+    if( v < -2147483648LL )         { return (int32_t)0x80000000; }
+    return (int32_t)v;
+}
+
+/* The oracle for mchp_asrc_q31_blend_row_quad: each stage's accumulator modelled whole (value << 31
+ * plus one exact int32 x int32 product), convergent rounding, as the hardware-verified linear blend.  No widened differences -- see the XC-DSC
+ * note in asrc_q31_ref_blend(). */
+static inline void asrc_q31_ref_blend_quad( const int32_t* c0, const int32_t* c1, const int32_t* c2,
+                                            int32_t wbq, int32_t gq, int32_t* ceff )
+{
+    for( uint32_t k = 0u; k < ASRC_POLY_M; k++ )
+    {
+        const int32_t d1  = (int32_t)( (uint32_t)c1[k] - (uint32_t)c0[k] );
+        const int32_t e1  = (int32_t)( (uint32_t)c2[k] - (uint32_t)c1[k] );
+        const int32_t d2  = (int32_t)( (uint32_t)e1 - (uint32_t)d1 );
+        const int32_t s1  = asrc_q31_sacr_convergent( ( (int64_t)c0[k] << 31 ) + (int64_t)wbq * (int64_t)d1 );
+        ceff[k] = asrc_q31_sacr_convergent( ( (int64_t)s1 << 31 ) + (int64_t)gq * (int64_t)d2 );
+    }
+}
+#endif
 
 #if APP_ASRC_Q31_OPT_KERNELS
 /*
@@ -359,19 +536,91 @@ static inline uint32_t asrc_q31_phase_of( float frac, float* wb )
     return p;
 }
 
+/* Split applied-step representation for the Q31 rear.  `whole` advances the
+ * ring cursor; `frac` is the non-negative Q1.31 part accumulated modulo one.
+ * Conversion is once per output block, not once per output frame. */
+typedef struct
+{
+    uint32_t whole;
+    uint32_t frac;
+} asrc_q31_step_t;
+
+static inline int32_t asrc_q31_signed_step_of( float v )
+{
+    return (int32_t)( v * 2147483648.0f );
+}
+
+static inline asrc_q31_step_t asrc_q31_step_of( float base, float corr )
+{
+    asrc_q31_step_t out;
+    int32_t whole = (int32_t)( base + 0.5f );
+    /* base-whole is in [-0.5,0.5).  Servo correction is bounded to +/-0.5%,
+     * so the signed sum cannot overflow int32 before normalization. */
+    const int32_t total = asrc_q31_signed_step_of( base - (float)whole ) +
+                          asrc_q31_signed_step_of( corr );
+    if( total < 0 )
+    {
+        whole--;
+        out.frac = (uint32_t)total + 0x80000000u;
+    }
+    else
+    {
+        out.frac = (uint32_t)total;
+    }
+    out.whole = (uint32_t)whole;
+    return out;
+}
+
+static inline void asrc_q31_phase_advance( volatile uint32_t* rd, volatile uint32_t* frac,
+                                           asrc_q31_step_t step )
+{
+    const uint32_t sum = *frac + step.frac; /* each operand < 2^31; no overflow */
+    *frac = sum & 0x7FFFFFFFu;
+    *rd += step.whole + ( sum >> 31u );
+}
+
+/* Phase selection from the fixed accumulator.  All supported Q31 tables have
+ * a power-of-two phase count; the high bits select the row and the remaining
+ * bits form the interpolation weight.  Converting only the final remainder to
+ * float preserves the accumulated sub-binary32 step motion. */
+static inline uint32_t asrc_q31_phase_of_fixed( uint32_t frac, float* wb )
+{
+#if ASRC_POLY_L == 64u
+    const uint32_t log2_l = 6u;
+#elif ASRC_POLY_L == 128u
+    const uint32_t log2_l = 7u;
+#elif ASRC_POLY_L == 256u
+    const uint32_t log2_l = 8u;
+#else
+#error "fixed Q31 phase requires a supported power-of-two ASRC_POLY_L"
+#endif
+    const uint32_t p = frac >> ( 31u - log2_l );
+    const uint32_t w = ( frac << log2_l ) & 0x7FFFFFFFu;
+    *wb = (float)w * 4.656612873077392578125e-10f;
+    return p;
+}
+
 /* ------------------------------------------------- portable C reference ---- */
 #if APP_ASRC_Q31_SELFTEST
 
-/* Proof-A oracle, one per geometry, selected exactly like the table above:
- * the expected outputs depend on M, so an M28 build checked against the M30
- * vectors fails every case (and did, on 2026-09-08: the coeff probe reported
- * got 15748 want -4550 -- the table was right, the oracle was stale). */
-#if   ( ASRC_POLY_M == 30u )
+/* Proof-A oracle, one per geometry, selected exactly like the table above --
+ * on (L, M), for the same reason.  The expected outputs depend on M, so an M28
+ * build checked against the M30 vectors fails every case (and did, on
+ * 2026-09-08: the coeff probe reported got 15748 want -4550 -- the table was
+ * right, the oracle was stale).  They depend on L just as hard: the probes name
+ * rows p=64/127/128, and every case's phase is frac*L, so an L=256 build read
+ * against the L=128 vectors fails the same way.  There is no partial credit
+ * here -- one file per geometry, or the oracle is not an oracle. */
+#if   ( ASRC_POLY_L == 128u ) && ( ASRC_POLY_M == 30u )
 #  include "asrc_poly_q31_vectors.h"
-#elif ( ASRC_POLY_M == 28u )
+#elif ( ASRC_POLY_L == 256u ) && ( ASRC_POLY_M == 30u )
+#  include "asrc_poly_q31_vectors_l256m30.h"
+#elif ( ASRC_POLY_L == 256u ) && ( ASRC_POLY_M == 34u )
+#  include "asrc_poly_q31_vectors_l256m34.h"
+#elif ( ASRC_POLY_L == 128u ) && ( ASRC_POLY_M == 28u )
 #  include "asrc_poly_q31_vectors_m28.h"
 #else
-#  error "no Proof-A vectors for this ASRC_POLY_M -- generate them with tools/asrc/asrc_q31_resampler_model.py vectors --taps <ASRC_POLY_M> --fc <ASRC_POLY_FC> --beta <ASRC_POLY_KAISER_BETA> and select them above"
+#  error "no Proof-A vectors for this (ASRC_POLY_L, ASRC_POLY_M) -- generate them with tools/asrc/asrc_q31_resampler_model.py vectors --taps <ASRC_POLY_M> --fc <ASRC_POLY_FC> --beta <ASRC_POLY_KAISER_BETA> --phases <ASRC_POLY_L> and select them above"
 #endif
 
 /*
@@ -595,8 +844,11 @@ static uint32_t asrc_q31_check_coeff( void )
 #define ASRC_Q31_ST_SPAN     ( ( ( ASRC_Q31_VEC_NOUT * ASRC_Q31_ST_STEP_N ) / \
                                  ASRC_Q31_ST_STEP_D ) + ASRC_POLY_M )
 
-/* Proofs B and C over the generated vectors. */
-static uint32_t asrc_q31_check_vectors( void )
+/* Proofs B and C over the generated vectors.
+ * noinline, like check_16ch below: if the compiler merged the two into
+ * asrc_poly_q31_selftest() their locals would be SUMMED in one frame rather than share
+ * slots ([internal] REPORT_ram_stack_ledger_2026-09-30.md, "inline trap"). */
+static __attribute__(( noinline )) uint32_t asrc_q31_check_vectors( void )
 {
     uint32_t fails = 0u;
     int32_t  xbuf[ASRC_Q31_VEC_NIN];        /* stack, i.e. X space, as the kernel needs */
@@ -687,15 +939,50 @@ static uint32_t asrc_q31_check_vectors( void )
  * crosstalk -- a stride error, a stale accumulator, a shared pointer -- shows up
  * as a mismatch on the channel that got contaminated.
  *
- * Scratch is this function's OWN history and OWN blended row, both on the stack, both
- * in X -- see SELFTEST SCRATCH above for why it must not be the live engine's.  The
- * reference is evaluated inside the same loop as the kernel, so no 16 x nout
- * expectation array is needed and the frame stays small.
+ * BOOT-WORK-AREA BORROW (P1, owner approval 2026-10-01).  The history is NOT a local any
+ * more: `hist[16][48+M]` was 4992 B at M30 (5248 B at M34), ~80 % of the deepest stack path
+ * (`*ar` -> asrc_transport_reset -> reset_all -> here), and it grew with M.  It now borrows
+ * the ring of engine 0, ASRC_Q31_ST_LENDER, under the three conditions of the ledger's
+ * declaration rule:
+ *   1. it runs only while !asrc_audio_path_isr_has_started().  That flag is latched at the
+ *      top of BOTH leg callbacks (asrc_audio_path.c), and those two callbacks are the only
+ *      callers of every push/pull that touches s_asrc[] -- so before it is set no ISR has
+ *      ever read or written the lender.  After it is set the test is SKIPPED and says so
+ *      (asrc_poly_q31_selftest_16ch_skipped()); the 2026-09-06 intermittent FAILs were
+ *      exactly a borrow of this ring while streaming, which is what the gate prevents;
+ *   2. the lender is reset before streaming: this function zeroes the borrowed rows itself
+ *      on exit, and audio_app_asrc_reset_all() runs asrc_reset() on every engine after the
+ *      selftests anyway;
+ *   3. capacity is a _Static_assert below.
+ * Engine 0 rather than s_asrc[ASRC_ENGINE_AB]: index 0 exists in every image whatever the
+ * engine count or numbering (BA MEAS may drop the AB engine), and s_asrc is pinned to X
+ * space in the Q31 arm, which is where row16 wants the sample operand.  A side benefit:
+ * the stride is the PRODUCTION one again (sizeof(ch[0]) = ASRC_FIFO_PHYS * 4 B), which the
+ * stack-local version had given up.  Recorded in [internal tool] p0/ram_classes.csv.
+ * Cost of the gate: the per-`*ar` / `*as 07` recheck of THIS test is lost (the coefficient
+ * probe and the 110 vectors still run every time).
  */
-static uint32_t asrc_q31_check_16ch( void )
+#define ASRC_Q31_ST_LENDER   ( &s_asrc[0] )
+_Static_assert( ( sizeof( s_asrc[0].ch ) / sizeof( s_asrc[0].ch[0] ) ) >= ASRC_CH,
+                "check_16ch borrow: the lender ring has fewer channel rows than ASRC_CH" );
+_Static_assert( ( sizeof( s_asrc[0].ch[0] ) / sizeof( s_asrc[0].ch[0][0] ) ) >= ASRC_Q31_ST_SPAN,
+                "check_16ch borrow: a lender channel row is shorter than ASRC_Q31_ST_SPAN" );
+_Static_assert( sizeof( s_asrc[0].ch[0][0] ) == sizeof( int32_t ),
+                "check_16ch borrow: the lender ring is not 32-bit samples (Q31 arm only)" );
+
+static uint8_t s_poly_q31_16ch_skipped;   /* 1 = last selftest skipped check_16ch (ISRs live) */
+
+uint8_t asrc_poly_q31_selftest_16ch_skipped( void )
+{
+    return s_poly_q31_16ch_skipped;
+}
+
+static __attribute__(( noinline )) uint32_t asrc_q31_check_16ch( void )
 {
     uint32_t  fails = 0u;
-    int32_t   hist[ASRC_CH][ASRC_Q31_ST_SPAN];  /* own history, own stride */
+    int32_t ( *const hist )[ sizeof( s_asrc[0].ch[0] ) / sizeof( s_asrc[0].ch[0][0] ) ] =
+        (int32_t ( * )[ sizeof( s_asrc[0].ch[0] ) / sizeof( s_asrc[0].ch[0][0] ) ])
+            &ASRC_Q31_ST_LENDER->ch[0][0];      /* borrowed, boot only -- see above */
     int32_t   ceff[ASRC_POLY_M];                /* own blended row         */
     int32_t   ceff_ref[ASRC_POLY_M];
     int32_t   got[ASRC_CH];
@@ -747,8 +1034,147 @@ static uint32_t asrc_q31_check_16ch( void )
         frac += step;
         while( frac >= 1.0f ) { frac -= 1.0f; rd++; }
     }
+    /* Give the lender back clean: the borrow must not leave test data in a ring that
+     * asrc_reset() would otherwise be the only thing to clear. */
+    for( uint32_t c = 0u; c < ASRC_CH; c++ )
+    {
+        for( uint32_t i = 0u; i < nin; i++ ) { hist[c][i] = 0; }
+    }
     return fails;
 }
+
+#if APP_ASRC_REAR_QUAD_BLEND
+/* The quadratic kernel against its oracle, bit for bit, over the table edges and the weight
+ * extremes.  Own scratch on the stack (X), never an engine's row. */
+static uint32_t s_q31_quad_cases;
+static uint32_t s_q31_quad_fails;
+uint32_t asrc_q31_quad_selftest_cases( void ) { return s_q31_quad_cases; }
+uint32_t asrc_q31_quad_selftest_fails( void ) { return s_q31_quad_fails; }
+static __attribute__(( noinline )) uint32_t asrc_q31_check_quad( void )
+{
+    static const uint16_t ps[] = { 0u, 1u, 77u, 128u, 254u, 255u };
+    static const float    ws[] = { 0.0f, 1.0e-6f, 0.25f, 0.5f, 0.6180339f, 0.999999f };
+    int32_t  got[ASRC_POLY_M];
+    int32_t  ref[ASRC_POLY_M];
+    uint32_t fails = 0u;
+    s_q31_quad_cases = 0u;
+    for( uint32_t i = 0u; i < ( sizeof( ps ) / sizeof( ps[0] ) ); i++ )
+    {
+        for( uint32_t j = 0u; j < ( sizeof( ws ) / sizeof( ws[0] ) ); j++ )
+        {
+            const uint32_t p   = ps[i];
+            const int32_t  wbq = asrc_q31_wb( ws[j] );
+            const int32_t  gq  = asrc_q31_wq2( ws[j] );
+            mchp_asrc_q31_blend_row_quad( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                          ASRC_POLY_Q31_ROW( p + 2u ), got, ASRC_POLY_M, wbq, gq );
+            asrc_q31_ref_blend_quad( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                     ASRC_POLY_Q31_ROW( p + 2u ), wbq, gq, ref );
+            for( uint32_t k = 0u; k < ASRC_POLY_M; k++ )
+            {
+                s_q31_quad_cases++;
+                if( got[k] != ref[k] )
+                {
+                    if( fails == 0u ) { asrc_q31_note( "quad blend", i * 8u + j, k, got[k], ref[k] ); }
+                    fails++;
+                }
+            }
+            mchp_asrc_q31_blend_row_quad4( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                           ASRC_POLY_Q31_ROW( p + 2u ), got, ASRC_POLY_M, wbq, gq );
+            for( uint32_t k = 0u; k < ASRC_POLY_M; k++ )
+            {
+                s_q31_quad_cases++;
+                if( got[k] != ref[k] )
+                {
+                    if( fails == 0u ) { asrc_q31_note( "quad4 blend", i * 8u + j, k, got[k], ref[k] ); }
+                    fails++;
+                }
+            }
+            mchp_asrc_q31_blend_row( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                     ref, ASRC_POLY_M, wbq );
+            mchp_asrc_q31_blend_row_lin4( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                          got, ASRC_POLY_M, wbq );
+            for( uint32_t k = 0u; k < ASRC_POLY_M; k++ )
+            {
+                s_q31_quad_cases++;
+                if( got[k] != ref[k] )
+                {
+                    if( fails == 0u ) { asrc_q31_note( "lin4 blend", i * 8u + j, k, got[k], ref[k] ); }
+                    fails++;
+                }
+            }
+        }
+    }
+    s_q31_quad_fails = fails;
+    return fails;
+}
+
+/*
+ * BLEND COST BENCH (research, Hi-Fi P4 step 2).  Where do the quad blend's cycles go: the
+ * extra instructions, or the extra flash row?  Each arm is the minimum over trials of one
+ * whole-row call, timed from boot context with the audio ISRs not yet started, so the
+ * minimum is the uninterrupted cost.  1 high-res tick = 2 instruction cycles on dsPIC33A.
+ * Rows come either straight from the flash table or from a stack copy (X RAM); "flash - ram" is
+ * what the flash reads cost.  The quad arms also check the oracle -- counted in s_q31_quad_fails.
+ */
+#define ASRC_Q31_BENCH_ARMS  (7u)
+static uint32_t s_q31_bench_ticks[ASRC_Q31_BENCH_ARMS];
+static const char* const s_q31_bench_name[ASRC_Q31_BENCH_ARMS] =
+{
+    "lin   flash", "lin   ram", "quad  flash", "quad  ram", "quad4 flash", "quad4 ram", "lin4  flash"
+};
+static __attribute__(( noinline )) void asrc_q31_bench_quad( void )
+{
+    int32_t  r[3][ASRC_POLY_M] __attribute__(( aligned(4) ));
+    int32_t  got[ASRC_POLY_M];
+    int32_t  ref[ASRC_POLY_M];
+    const uint32_t p   = 77u;
+    const int32_t  wbq = asrc_q31_wb( 0.6180339f );
+    const int32_t  gq  = asrc_q31_wq2( 0.6180339f );
+    const int32_t* f0  = ASRC_POLY_Q31_ROW( p );
+    const int32_t* f1  = ASRC_POLY_Q31_ROW( p + 1u );
+    const int32_t* f2  = ASRC_POLY_Q31_ROW( p + 2u );
+    for( uint32_t a = 0u; a < ASRC_Q31_BENCH_ARMS; a++ ) { s_q31_bench_ticks[a] = 0xFFFFFFFFu; }
+    for( uint32_t k = 0u; k < ASRC_POLY_M; k++ ) { r[0][k] = f0[k]; r[1][k] = f1[k]; r[2][k] = f2[k]; }
+    for( uint32_t t = 0u; t < 64u; t++ )
+    {
+        for( uint32_t a = 0u; a < ASRC_Q31_BENCH_ARMS; a++ )
+        {
+            const uint32_t t0 = nora_high_res_timer_get_count();
+            switch( a )
+            {
+            case 0u: mchp_asrc_q31_blend_row( f0, f1, got, ASRC_POLY_M, wbq ); break;
+            case 1u: mchp_asrc_q31_blend_row( r[0], r[1], got, ASRC_POLY_M, wbq ); break;
+            case 2u: mchp_asrc_q31_blend_row_quad( f0, f1, f2, got, ASRC_POLY_M, wbq, gq ); break;
+            case 3u: mchp_asrc_q31_blend_row_quad( r[0], r[1], r[2], got, ASRC_POLY_M, wbq, gq ); break;
+            case 4u: mchp_asrc_q31_blend_row_quad4( f0, f1, f2, got, ASRC_POLY_M, wbq, gq ); break;
+            case 5u: mchp_asrc_q31_blend_row_quad4( r[0], r[1], r[2], got, ASRC_POLY_M, wbq, gq ); break;
+            default: mchp_asrc_q31_blend_row_lin4( f0, f1, got, ASRC_POLY_M, wbq ); break;
+            }
+            const uint32_t dt = nora_high_res_timer_get_count() - t0;
+            if( dt < s_q31_bench_ticks[a] ) { s_q31_bench_ticks[a] = dt; }
+            if( ( a >= 2u ) && ( a <= 5u ) )
+            {
+                asrc_q31_ref_blend_quad( f0, f1, f2, wbq, gq, ref );
+                for( uint32_t k = 0u; k < ASRC_POLY_M; k++ )
+                {
+                    s_q31_quad_cases++;
+                    if( got[k] != ref[k] ) { s_q31_quad_fails++; }
+                }
+            }
+        }
+    }
+}
+void asrc_q31_bench_quad_print( void )
+{
+    printf( " ASRC Q31 blend bench (M=%u, min of 64, cycles = 2 x ticks) table@0x%06lx row77@0x%06lx:\n", (unsigned)ASRC_POLY_M,
+            (unsigned long)(uintptr_t)ASRC_POLY_Q31_ROW( 0u ), (unsigned long)(uintptr_t)ASRC_POLY_Q31_ROW( 77u ) );
+    for( uint32_t a = 0u; a < ASRC_Q31_BENCH_ARMS; a++ )
+    {
+        printf( "   %-12s %4lu ticks = %4lu cyc\n", s_q31_bench_name[a],
+                (unsigned long)s_q31_bench_ticks[a], (unsigned long)( 2u * s_q31_bench_ticks[a] ) );
+    }
+}
+#endif
 
 uint32_t asrc_poly_q31_selftest( void )
 {
@@ -761,7 +1187,46 @@ uint32_t asrc_poly_q31_selftest( void )
     if( fails == 0u )                       /* vectors are meaningless if the */
     {                                       /* table differs -- do not report */
         fails += asrc_q31_check_vectors();   /* 110 failures for one ulp       */
-        fails += asrc_q31_check_16ch();
+#if APP_ASRC_REAR_QUAD_BLEND
+        const uint32_t quad_fails = asrc_q31_check_quad();
+        fails += quad_fails;
+        asrc_q31_bench_quad();                         /* adds its quad / quad4 checks to the count */
+        fails += s_q31_quad_fails - quad_fails;
+#endif
+#if APP_ASRC_REAR_LIN4
+        /* lin4 against the shipped kernel, bit for bit, every row and six weights. */
+        {
+            static const float ws[] = { 0.0f, 1.0e-6f, 0.25f, 0.5f, 0.6180339f, 0.999999f };
+            int32_t got[ASRC_POLY_M];
+            int32_t ref[ASRC_POLY_M];
+            for( uint32_t p = 0u; p < ASRC_POLY_L; p++ )
+            {
+                for( uint32_t j = 0u; j < ( sizeof( ws ) / sizeof( ws[0] ) ); j++ )
+                {
+                    const int32_t wbq = asrc_q31_wb( ws[j] );
+                    mchp_asrc_q31_blend_row( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                             ref, ASRC_POLY_M, wbq );
+                    mchp_asrc_q31_blend_row_lin4( ASRC_POLY_Q31_ROW( p ), ASRC_POLY_Q31_ROW( p + 1u ),
+                                                  got, ASRC_POLY_M, wbq );
+                    for( uint32_t k = 0u; k < ASRC_POLY_M; k++ )
+                    {
+                        if( got[k] != ref[k] )
+                        {
+                            if( fails == 0u ) { asrc_q31_note( "lin4 blend", p * 8u + j, k, got[k], ref[k] ); }
+                            fails++;
+                        }
+                    }
+                }
+            }
+        }
+#endif
+        /* Borrows engine 0's ring (see check_16ch): boot only.  After the first leg ISR the
+         * test is skipped and the caller prints that it was, never a silent pass. */
+        s_poly_q31_16ch_skipped = asrc_audio_path_isr_has_started() ? 1u : 0u;
+        if( !s_poly_q31_16ch_skipped )
+        {
+            fails += asrc_q31_check_16ch();
+        }
     }
     return fails;
 }

@@ -697,8 +697,16 @@ This is the same mechanism as `APP_SRC_DIRNAME` (the `Source:` line):
 `build.ps1` passes `-DSONORA_GIT_COMMIT=<value>` to the compiler as a bare
 token, and `main.c` stringifies it for display.
 
-- A build with tracked or untracked working-tree changes shows `<short7>_dirty`
-  (`_dirty`, not `-dirty`, so it stays a valid C token).
+- A build with working-tree changes shows `<short7>_dirty` (`_dirty`, not
+  `-dirty`, so it stays a valid C token). Untracked files count too, because an
+  untracked file can be a build input (a generated include, a coefficient file).
+  The one exception is untracked files under `_ai_out/`, which holds run output
+  and logs and is never a build input. A whitespace-only change to
+  `nbproject/Makefile-variables.mk` or `nbproject/project.xml` is also ignored:
+  the makefile generator step of `-Full` rewrites both on every run, before the
+  commit is stamped. A real edit to either file still makes the build `_dirty`. Files ignored by `.gitignore` (for example
+  `artifacts/` and `buildtools/active_build.json`) never appear in this check;
+  the build selection shows up separately in the `APP_BUILD` banner.
 - Where Git is unavailable — a source archive, for instance — it becomes
   `unknown`.
 - Building directly from MPLAB X IDE, bypassing `build.ps1`, shows `(unknown)`
@@ -904,7 +912,7 @@ BL <short7> DE ABI=1
 ```
 
 - The script injects `-DSONORA_BOOT_GIT_COMMIT=<short7>` (`<short7>_dirty` if
-  the working tree is dirty, `unknown` without git). Building directly from the
+  the working tree is dirty by the rule above, `unknown` without git). Building directly from the
   IDE also gives `unknown`.
 - If you need an older bootloader, check out that commit or release tag and
   build it. Release-tag practice belongs to git (and to whoever uses it); the

@@ -16,7 +16,7 @@ must reproduce its recorded CRC32.
 
     # generate the AK512 M30 production geometry at a smaller phase count
     python tools/gen_asrc_poly_flash_table.py --L 64 --M 30 \
-        --fc 0.465 --window kaiser11 --beta 11.0
+        --fc 0.464 --window kaiser11 --beta 11.3
 
 Window / fc / beta must match what the firmware's ASRC_POLY_* macros resolve
 to for the build that will link the table; a mismatch is silent and shows up
@@ -284,9 +284,9 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--L", type=int, default=64, help="phase count (table has L+1 rows)")
     ap.add_argument("--M", type=int, default=30, help="taps per phase (must be even)")
-    ap.add_argument("--fc", type=float, default=0.465, help="normalised cutoff (ASRC_POLY_FC)")
+    ap.add_argument("--fc", type=float, default=0.464, help="normalised cutoff (ASRC_POLY_FC)")
     ap.add_argument("--window", choices=WINDOWS, default="kaiser11")
-    ap.add_argument("--beta", type=float, default=11.0, help="Kaiser beta (kaiser11 only)")
+    ap.add_argument("--beta", type=float, default=11.3, help="Kaiser beta (kaiser11 only)")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="default: src/app/apps/asrc next to this tool's repo root")
     ap.add_argument("--selftest", action="store_true",

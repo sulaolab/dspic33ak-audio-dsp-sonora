@@ -287,13 +287,22 @@ void nora_spi_i2s_tdm_diag_check_deadline_hot(
 
 
 /*
- * Snapshot the block-ISR load monitor.
+ * Snapshot the block-ISR load monitor -- COUNTS ONLY.
  *
- * The caller masks the updating ISR around this call. Returns false until at least
- * one timed event exists or if the high-resolution timer was not initialized. When
- * clear_peak is true, min/max/event accumulation starts fresh afterward.
+ * The caller masks the updating ISR around this call, so everything in here is charged to that
+ * ISR's interrupt-entry latency. The three tick->us conversions that used to live at the bottom of
+ * this function are 64-bit divisions on values ALREADY COPIED OUT of the shared struct -- pure
+ * arithmetic with nothing to protect -- so they moved to nora_spi_i2s_tdm_diag_load_scale(), which
+ * the caller runs after restoring the interrupt.
+ *
+ * Measured on AK506 Nano (84-stage x 4ch DRC, block period 666.6 us, margin +15.5 us): the
+ * periodic report's masked reads delayed block-ISR ENTRY by +53.0 us and were audible as a click.
+ * `resp` is entry->exit and `miss` is a whole block late, so neither could see it.
+ *
+ * Returns false until at least one timed event exists or if the high-resolution timer was not
+ * initialized. When clear_peak is true, min/max/event accumulation starts fresh afterward.
  */
-bool nora_spi_i2s_tdm_diag_get_load( nora_spi_i2s_tdm_diag_t* d,
+bool nora_spi_i2s_tdm_diag_get_load_counts( nora_spi_i2s_tdm_diag_t* d,
                                           nora_spi_i2s_tdm_load_t*  monitor,
                                           bool                           clear_peak )
 {
@@ -335,11 +344,32 @@ bool nora_spi_i2s_tdm_diag_get_load( nora_spi_i2s_tdm_diag_t* d,
     monitor->max_count   = max_count;
     monitor->event_count = event_count;
 
-    monitor->last_us10 = nora_high_res_timer_count_to_us_x10( last_count );
-    monitor->min_us10  = nora_high_res_timer_count_to_us_x10( min_count  );
-    monitor->max_us10  = nora_high_res_timer_count_to_us_x10( max_count  );
+    /* Left ZERO on purpose -- nora_spi_i2s_tdm_diag_load_scale() fills these outside the caller's
+     * interrupt mask. Zero rather than stale: a caller that forgets to scale then reads an obvious
+     * 0.0 us instead of last window's number. */
+    monitor->last_us10 = 0u;
+    monitor->min_us10  = 0u;
+    monitor->max_us10  = 0u;
 
     return valid;
+}
+
+
+/*
+ * Tick -> tenths-of-a-microsecond for the three load fields. Deliberately separate from
+ * nora_spi_i2s_tdm_diag_get_load_counts(): it touches no shared state, so it must run with the
+ * block ISR re-enabled. See that function's header for the measurement that forced the split.
+ */
+void nora_spi_i2s_tdm_diag_load_scale( nora_spi_i2s_tdm_load_t* monitor )
+{
+    if( monitor == NULL )
+    {
+        return;
+    }
+
+    monitor->last_us10 = nora_high_res_timer_count_to_us_x10( monitor->last_count );
+    monitor->min_us10  = nora_high_res_timer_count_to_us_x10( monitor->min_count  );
+    monitor->max_us10  = nora_high_res_timer_count_to_us_x10( monitor->max_count  );
 }
 
 

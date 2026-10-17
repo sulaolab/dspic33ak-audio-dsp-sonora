@@ -177,11 +177,33 @@ void nora_cpu_load_prof_reset( void )
 }
 
 
+/*
+ * INTERRUPT-MASK BUDGET -- read this before adding anything to the critical section below.
+ *
+ * The masked region holds off EVERY vector, the audio block ISR included, so its length is added
+ * straight to that ISR's interrupt-entry latency. It is not paid by the caller; it is paid by the
+ * hardest real-time thing in the system.
+ *
+ * This function used to compute the per-window means -- six 64-bit divisions -- INSIDE the mask.
+ * Measured on AK506 Nano at 84-stage x 4ch DRC (block period 666.6 us, ISR response 651.1 us,
+ * margin +15.5 us): the periodic report that calls this delayed the block ISR's ENTRY by +53.0 us
+ * against a 667.6-670.4 us quiet baseline -- 3.4x the whole margin -- and it was audible as a click
+ * synchronised to the report. `resp` (entry->exit) and `miss` (a whole block late) are both
+ * structurally blind to an entry delay, so every existing instrument read healthy throughout.
+ *
+ * So: inside the mask, COPY raw shared state to locals and reset the accumulators. Nothing else.
+ * Division, scaling and any other derived value belong after the unlock, where the block ISR can
+ * preempt them freely. The 64-bit copies stay inside because a 64-bit load is not atomic against
+ * the hooks on this core -- shortening the mask must not be bought with a torn read.
+ */
 bool nora_cpu_load_prof_get( nora_cpu_load_snapshot_t* out, bool clear_peak )
 {
     unsigned int isr_state;
     uint32_t     windows;
     uint8_t      i;
+    /* Raw accumulators, carried out of the critical section so the division happens outside it. */
+    uint64_t     acc_self[NORA_CPU_LOAD_OWNER_COUNT];
+    uint64_t     acc_stolen[NORA_CPU_LOAD_LEG_COUNT];
 
     if( out == NULL )
     {
@@ -206,7 +228,6 @@ bool nora_cpu_load_prof_get( nora_cpu_load_snapshot_t* out, bool clear_peak )
     out->depth_overflow      = g_nora_cpu_load_prof.depth_overflow;
     out->max_sum_ticks       = g_nora_cpu_load_prof.max_sum_ticks;
     out->max_demand_ticks    = g_nora_cpu_load_prof.max_demand_ticks;
-    out->initialized         = true;
 
     windows = g_nora_cpu_load_prof.windows;
 
@@ -214,19 +235,13 @@ bool nora_cpu_load_prof_get( nora_cpu_load_snapshot_t* out, bool clear_peak )
     {
         out->last_self_ticks[i] = g_nora_cpu_load_prof.last_self_ticks[i];
         out->max_self_ticks[i]  = g_nora_cpu_load_prof.max_self_ticks[i];
-        /* Per-window mean. Zero windows means nothing has closed yet -- report 0 rather than
-         * dividing, and let the caller see windows == 0 and say so. */
-        out->mean_self_ticks[i] = ( windows != 0u )
-            ? (uint32_t)( g_nora_cpu_load_prof.acc_self_ticks[i] / (uint64_t)windows )
-            : 0u;
+        acc_self[i]             = g_nora_cpu_load_prof.acc_self_ticks[i];
     }
 
     for( i = 0u; i < (uint8_t)NORA_CPU_LOAD_LEG_COUNT; i++ )
     {
         out->last_stolen_ticks[i] = g_nora_cpu_load_prof.last_stolen_ticks[i];
-        out->mean_stolen_ticks[i] = ( windows != 0u )
-            ? (uint32_t)( g_nora_cpu_load_prof.acc_stolen_ticks[i] / (uint64_t)windows )
-            : 0u;
+        acc_stolen[i]             = g_nora_cpu_load_prof.acc_stolen_ticks[i];
     }
 
     if( clear_peak )
@@ -247,6 +262,27 @@ bool nora_cpu_load_prof_get( nora_cpu_load_snapshot_t* out, bool clear_peak )
     }
 
     nora_cpu_load_prof_unlock( isr_state );
+
+    /* ---- Derived values. INTERRUPTS ARE ON from here; keep it that way. ----
+     * Six 64-bit divisions on local copies. Identical arithmetic on identical inputs to what used
+     * to run inside the mask, so every published figure is bit-for-bit unchanged -- only the
+     * interrupt latency it cost is gone. Per-window mean: zero windows means nothing has closed
+     * yet, so report 0 rather than dividing, and let the caller see windows == 0 and say so. */
+    for( i = 0u; i < (uint8_t)NORA_CPU_LOAD_OWNER_COUNT; i++ )
+    {
+        out->mean_self_ticks[i] = ( windows != 0u )
+            ? (uint32_t)( acc_self[i] / (uint64_t)windows )
+            : 0u;
+    }
+
+    for( i = 0u; i < (uint8_t)NORA_CPU_LOAD_LEG_COUNT; i++ )
+    {
+        out->mean_stolen_ticks[i] = ( windows != 0u )
+            ? (uint32_t)( acc_stolen[i] / (uint64_t)windows )
+            : 0u;
+    }
+
+    out->initialized = true;
 
     return true;
 }

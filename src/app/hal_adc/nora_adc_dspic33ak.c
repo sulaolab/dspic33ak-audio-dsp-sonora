@@ -33,6 +33,12 @@ static const dspic33ak_adc_regs_t adc1_regs = {
     .RSTAT = &AD1RSTAT,
 };
 
+/* ADC2 supplies external Nano slot2 POT (AD2AN2); independent of ADC1/5. */
+static const dspic33ak_adc_regs_t adc2_regs = {
+    .CON = &AD2CON, .STAT = &AD2STAT, .SWTRG = &AD2SWTRG,
+    .DATAOVR = &AD2DATAOVR, .CMPSTAT = &AD2CMPSTAT, .RSTAT = &AD2RSTAT,
+};
+
 static const dspic33ak_adc_regs_t adc5_regs = {
     .CON = &AD5CON,
     .STAT = &AD5STAT,
@@ -52,6 +58,16 @@ static const dspic33ak_adc_device_t adc_devices[] = {
             .DATA = &AD1CH0DATA,
             .CNT = &AD1CH0CNT,
             .RES = &AD1CH0RES,
+            .positive_input_mask = DSPIC33AK_ADC_CHCON1_PINSEL_MASK,
+            .positive_input_pos = DSPIC33AK_ADC_CHCON1_PINSEL_POS,
+        },
+    },
+    {
+        .instance = NORA_ADC_INSTANCE_2,
+        .regs = &adc2_regs,
+        .channel0 = {
+            .CON1 = &AD2CH0CON1, .CON2 = &AD2CH0CON2, .DATA = &AD2CH0DATA,
+            .CNT = &AD2CH0CNT, .RES = &AD2CH0RES,
             .positive_input_mask = DSPIC33AK_ADC_CHCON1_PINSEL_MASK,
             .positive_input_pos = DSPIC33AK_ADC_CHCON1_PINSEL_POS,
         },

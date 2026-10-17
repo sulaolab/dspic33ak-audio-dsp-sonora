@@ -26,6 +26,7 @@
                                        // *ar: audio_app_asrc_rate_pair_is_supported
 #include "asrc_full_iir_48_to_32.h"   // *aj: trial 48->32 anti-alias stage select
 #include "asrc_clock_control.h"       // *aj 02: CCP period-queue observation window reset
+#include "asrc_decimator_48_to_8.h"   // *av: 96->32 third-band front-end select
 
 //===========================================================
 // asrc_console.c
@@ -47,6 +48,33 @@ static bool asrc_console_request_sample_rate_hz( uint8_t target, uint32_t sample
     }
     return audio_transport_reconfigure_leg_rate_hz( leg, sample_rate_hz );
 }
+
+#if APP_ASRC_MEAS
+/* Snapshot the RATE PAIR as part of the P1 command record.  The transport
+ * publishes the newly requested leg only after a successful synchronous
+ * restart, so use the pre-restart snapshot and substitute the accepted target
+ * here.  This makes the P1 identity correct even while the restart is in
+ * progress; `target > 1` is the explicit `*as07` servo re-arm case. */
+static void asrc_console_p1_begin( uint8_t target, uint32_t target_rate_hz )
+{
+    audio_transport_snapshot_t snap;
+    uint32_t rate_a_hz = 0u;
+    uint32_t rate_b_hz = 0u;
+
+    if( audio_transport_snapshot_get( &snap ) )
+    {
+        rate_a_hz = snap.legs[AUDIO_TRANSPORT_LEG_A].configured_rate_hz;
+        if( snap.leg_count > (uint8_t)AUDIO_TRANSPORT_LEG_B )
+        {
+            rate_b_hz = snap.legs[AUDIO_TRANSPORT_LEG_B].configured_rate_hz;
+        }
+    }
+
+    if( target == 0u ) { rate_a_hz = target_rate_hz; }
+    if( target == 1u ) { rate_b_hz = target_rate_hz; }
+    audio_app_asrc_p1_begin( rate_a_hz, rate_b_hz );
+}
+#endif
 
 // *ar CC RR : set a codec leg's sample rate. CC = 0(A)/1(B), RR = rate index (0..9).
 //
@@ -80,12 +108,10 @@ static void asrc_console_rate( app_console_msg_t* msg )
         return;
     }
 
-#if defined(APP_ASRC_AK128_BASELINE_RATE_ONLY) && APP_ASRC_AK128_BASELINE_RATE_ONLY
-    if( ( rates_hz[rate_index] != 32000u ) &&
-        ( rates_hz[rate_index] != 44100u ) &&
-        ( rates_hz[rate_index] != 48000u ) )
+#if defined(APP_ASRC_AK128_FIXED_48K_PAIR) && APP_ASRC_AK128_FIXED_48K_PAIR
+    if( rates_hz[rate_index] != 48000u )
     {
-        printf(" \"*ar\" AK128 baseline supports 32 / 44.1 / 48 kHz only\n");
+        printf(" \"*ar\" AK128 Bi-Codec supports 48 kHz <-> 48 kHz only\n");
         msg->status = APP_CONSOLE_ERR_BAD_DATA;
         return;
     }
@@ -146,8 +172,17 @@ static void asrc_console_rate( app_console_msg_t* msg )
     }
 #endif
 
+#if APP_ASRC_MEAS
+    /* P1 t=0 is immediately before the reconfiguration begins, after every
+     * static/pair gate above has accepted the command.  The transport restart
+     * is synchronous, so arming later would miss its reset and first ratio. */
+    asrc_console_p1_begin( target, rates_hz[rate_index] );
+#endif
     if( !asrc_console_request_sample_rate_hz( target, rates_hz[rate_index] ) )
     {
+#if APP_ASRC_MEAS
+        audio_app_asrc_p1_reject();
+#endif
         printf(" \"*ar\" rate switch rejected (unsupported fs or not a codec-master build)\n");
         msg->status = APP_CONSOLE_ERR_BAD_DATA;
         return;
@@ -353,6 +388,221 @@ static void asrc_console_full_iir_mode( app_console_msg_t* msg )
 }
 #endif /* APP_ASRC_FULL_IIR_48_TO_32 */
 
+#if APP_ASRC_THIRDBAND_96_TO_32
+/*
+ * *av SS : select the A->B 96 -> 32 kHz FRONT END, and report it.
+ *
+ *   *av00  composed  -- the shipping 41-tap /2 pre-stage + 97-tap 2/3 rows (this is what boots)
+ *   *av01  thirdband -- the 3-path polyphase allpass, 16 first-order sections
+ *   *av02  clear this stage's block / output / clip / refused counters, so a steady-state
+ *          delta can be taken separately from the start-up and switch transients
+ *   ?av    report mode, whether it is armed for the live chain, the identity and the counters
+ *
+ * 'v' for front-end VARIANT.  Not 'j' (the 48 -> 32 anti-alias stage select), not 'n' (the
+ * third-band kernel BENCH, which prices this same filter without putting it on the audio
+ * path) and not 'b' (the binary A->B stream arm).
+ *
+ * A mode change is applied by RE-APPLYING leg A's current rate, the same way `*aj` does, and
+ * here it is not merely tidier -- it is the only correct way.  The two front ends share one
+ * arena: turning the third band off means rebuilding the composed chain's rings and
+ * coefficients from scratch, which asrc_decimator_q31_init() does on the restart path and
+ * nothing else does at all.  Expect the switch to be AUDIBLE: this filter needs 30.2 ms to
+ * settle to -120 dB, and the restart is mute-bounded anyway.
+ *
+ * Selecting it when the live chain is not 96 -> 32 kHz is NOT an error: the mode is global
+ * and the stage replaces one chain only.  The arm hook says so on the console.
+ */
+static void asrc_console_thirdband_mode( app_console_msg_t* msg )
+{
+    const uint16_t in_len = msg->data_len;
+    const uint8_t  sub    = ( in_len > 0u ) ? msg->data[0] : 0xFFu;
+
+    msg->data_len = 0u;
+
+    if( msg->kind != '*' )
+    {
+        if( in_len != 0u )
+        {
+            printf(" \"?av\" takes no payload\n");
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            return;
+        }
+        {
+            uint32_t blocks = 0u, out_frames = 0u, clips = 0u, refused = 0u, crc = 0u;
+            uint16_t sections = 0u;
+            int16_t  hshift = 0;
+            int32_t  alias_milli = 0;
+            asrc_thirdband_96_to_32_stats( &blocks, &out_frames, &clips, &refused );
+            asrc_thirdband_96_to_32_identity( &crc, &sections, &hshift, &alias_milli );
+            printf(" \"?av\" 96->32 front end=%s armed=%u  %usec hshift=%d"
+                   " alias=%ldmdBc crc=%08lX\n",
+                   ( asrc_thirdband_96_to_32_mode() == ASRC_THIRDBAND_MODE_ON )
+                       ? "thirdband" : "composed",
+                   (unsigned)( asrc_thirdband_96_to_32_armed() ? 1u : 0u ),
+                   (unsigned)sections, (int)hshift,
+                   (long)alias_milli, (unsigned long)crc );
+            /* `clips` is the OUTPUT word at s24-left full scale.  A unity-gain filter whose
+             * L1 norm exceeds 1 does that on transients and the composed chain does it too,
+             * so read it against programme material, not against a square wave.  `refused`
+             * is a build mismatch (a block longer than the gather buffer) and must be 0. */
+            printf("      blocks=%lu out=%lu clips=%lu refused=%lu\n",
+                   (unsigned long)blocks, (unsigned long)out_frames,
+                   (unsigned long)clips, (unsigned long)refused );
+        }
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    if( ( in_len != 1u ) || ( sub > 6u ) )
+    {
+        printf(" \"*av SS\" bad args SS=%u (0=composed 1=thirdband 2=clear counters"
+               " 3=structural self-check 4=dynamic vector 5=arm live tap 6=dump tap)\n",
+               (unsigned)sub);
+        msg->status = APP_CONSOLE_ERR_BAD_DATA;
+        return;
+    }
+
+    if( sub == 2u )
+    {
+        asrc_thirdband_96_to_32_stats_clear();
+        printf(" \"*av\" 96->32 front-end counters cleared\n");
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    if( sub == 3u )
+    {
+        /* Runs the LIVE filter state, so audio must be stopped first -- `*ts`.  Two
+         * coefficient-independent predictions: H(DC) = 1 exactly, H(32 kHz) = 0 exactly. */
+        asrc_thirdband_selftest_t st;
+        const bool ok = asrc_thirdband_96_to_32_selftest( &st );
+        printf(" \"*av03\" structural check %s  dc=%ld want=%ld (tol %ld)"
+               "  null32k=%ld (tol %ld)\n",
+               ok ? "PASS" : "FAIL",
+               (long)st.dc_out, (long)st.dc_want, (long)st.dc_tol,
+               (long)st.null_out, (long)st.null_tol );
+        if( !ok )
+        {
+            printf("      a dc off by ~8x or ~1/8 is the kernel's headroom shift sign;"
+                   " a large null is the commutator branch order or the coefficient row\n");
+        }
+        msg->status = ok ? APP_CONSOLE_OK : APP_CONSOLE_ERR_BAD_DATA;
+        return;
+    }
+
+    if( sub == 5u )
+    {
+        /* Refused unless the third band is armed: the capture buffers are the composed
+         * chain's history arena when it is not, so there is no safe place to record. */
+        if( !asrc_thirdband_96_to_32_tap_arm() )
+        {
+            printf(" \"*av05\" refused -- the third band is not armed"
+                   " (the tap shares its arena); arm it with \"*av01\" first\n");
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            return;
+        }
+        printf(" \"*av05\" live tap armed -- play the tone, then \"*av06\"\n");
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    if( sub == 6u )
+    {
+        uint16_t on = 0u, bn = 0u;
+        if( !asrc_thirdband_96_to_32_tap_ready( &on, &bn ) )
+        {
+            bool od = false, bd = false;
+            const bool armed = asrc_thirdband_96_to_32_tap_side_done( &od, &bd );
+            /* Say which side is still filling.  The two run on independent clocks, so one
+             * finishing early is normal and is not a reason to read the other short. */
+            printf(" \"*av06\" tap not complete (out=%u%s legb=%u%s)%s\n",
+                   (unsigned)on, od ? " done" : "",
+                   (unsigned)bn, bd ? " done" : "",
+                   armed ? " -- still filling" : " -- arm with \"*av05\"" );
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            return;
+        }
+        /* Hex, eight words per line, so a host script can parse it out of the monitor log
+         * without a binary framing.  OUT is the 32 kHz stage output, B the 32 kHz block leg B
+         * hands to the codec -- the same window, the two ends of the digital chain. */
+        {
+            /* Report the CAPACITY next to the count.  A count that does not stop where the
+             * buffer ends is the one failure an instrument on the audio path must never hide,
+             * so the reader is given both numbers rather than being asked to trust one. */
+            uint16_t cap_o = 0u, cap_b = 0u;
+            asrc_thirdband_96_to_32_tap_capacity( &cap_o, &cap_b );
+            printf(" \"*av06\" tap out=%u/%u legb=%u/%u\n",
+                   (unsigned)on, (unsigned)cap_o, (unsigned)bn, (unsigned)cap_b );
+        }
+        for( uint8_t which = 0u; which < 2u; ++which )
+        {
+            const uint16_t cnt = ( which == 0u ) ? on : bn;
+            printf("TAP%c %u\n", ( which == 0u ) ? 'O' : 'B', (unsigned)cnt );
+            for( uint16_t i = 0u; i < cnt; i += 8u )
+            {
+                printf("  ");
+                for( uint16_t j = 0u; ( j < 8u ) && ( ( i + j ) < cnt ); ++j )
+                {
+                    printf("%08lX ", (unsigned long)(uint32_t)
+                           asrc_thirdband_96_to_32_tap_word( which, (uint16_t)( i + j ) ) );
+                }
+                printf("\n");
+            }
+        }
+        printf("TAPEND\n");
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+
+    if( sub == 4u )
+    {
+        /* The DYNAMIC check: a real waveform through the whole stage against host values.
+         * Nothing before it moved the allpass state -- see the header. */
+        asrc_thirdband_vector_t vc;
+        const bool ok = asrc_thirdband_96_to_32_vector_check( &vc );
+        printf(" \"*av04\" dynamic vector %s  frames=%u/%u first_bad=%d bad_ch=%d"
+               " refused=%u\n",
+               ok ? "PASS" : "FAIL", (unsigned)vc.frames, (unsigned)vc.expect,
+               (int)vc.first_bad, (int)vc.bad_channel, (unsigned)( vc.refused ? 1u : 0u ) );
+        if( vc.first_bad >= 0 )
+        {
+            printf("      frame %d: got %ld want %ld (diff %ld)\n",
+                   (int)vc.first_bad, (long)vc.got, (long)vc.want,
+                   (long)( vc.got - vc.want ) );
+        }
+        msg->status = ok ? APP_CONSOLE_OK : APP_CONSOLE_ERR_BAD_DATA;
+        return;
+    }
+
+    asrc_thirdband_96_to_32_set_mode( ( sub == 1u ) ? ASRC_THIRDBAND_MODE_ON
+                                                    : ASRC_THIRDBAND_MODE_OFF );
+
+    /* Re-apply leg A's own rate: same value, full restart path, so the selection is applied
+     * by the ordinary mute-bounded sequence -- which is also the only place either front end
+     * may be built, since they share an arena. */
+    {
+        audio_transport_snapshot_t snap;
+        uint32_t rate_a_hz = 0u;
+        if( audio_transport_snapshot_get( &snap ) &&
+            ( snap.leg_count > (uint8_t)AUDIO_TRANSPORT_LEG_A ) )
+        {
+            rate_a_hz = snap.legs[AUDIO_TRANSPORT_LEG_A].configured_rate_hz;
+        }
+        printf(" \"*av\" 96->32 front end -> %s (restarting leg A at %lu Hz)\n",
+               ( sub == 1u ) ? "thirdband" : "composed", (unsigned long)rate_a_hz );
+        if( ( rate_a_hz == 0u ) ||
+            !asrc_console_request_sample_rate_hz( 0u, rate_a_hz ) )
+        {
+            /* The mode is set; only the immediate re-arm failed.  Say which, so nobody reads
+             * a stale `fe=` field as the new selection. */
+            printf(" \"*av\" restart not performed -- selection takes effect at the next"
+                   " leg-A rate change or restart\n");
+        }
+    }
+    msg->status = APP_CONSOLE_OK;
+}
+#endif /* APP_ASRC_THIRDBAND_96_TO_32 */
+
 #if APP_ASRC_MEAS
 // *ac (write, no payload) : arm a one-shot A->B capture (was *nt20).
 // ?ac (read, no payload)  : dump the captured buffer for offline FFT (was *nt21).
@@ -479,6 +729,7 @@ static void asrc_console_tone( app_console_msg_t* msg )
 //   SS=0x08 VV    : Q51 feed-forward rate seed enable, VV=1/0 (was *nt3C)
 //   SS=0x09 VV    : Q52 differential fill-drift rate seed enable, VV=1/0 (was *nt3D)
 //   SS=0x0A       : freeze at live feed-forward ratio + centre FIFO (was *nt46)
+//   SS=0x0B VV    : FF ratio held at live x (1 + VV ppm), VV signed int8; 0 = plain hold (axis D)
 static void asrc_console_servo_write( app_console_msg_t* msg )
 {
     const uint16_t in_len  = msg->data_len;
@@ -554,7 +805,12 @@ static void asrc_console_servo_write( app_console_msg_t* msg )
 
     case 0x07u:
         if( in_len != 1u ) { printf(" \"*as 07\" takes no extra payload\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
+#if APP_ASRC_MEAS
+        /* An explicit servo re-arm is also a fresh convergence epoch. */
+        asrc_console_p1_begin( 0xFFu, 0u );
+#endif
         audio_app_asrc_reset_all();
+        asrc_clock_control_servo_rearm();
         printf(" *MEAS q50 servo restart (re-arm on next ratio lock; q50_en=%u)\n", (unsigned)audio_app_asrc_q50_get_en() );
         msg->status = APP_CONSOLE_OK;
         break;
@@ -575,7 +831,12 @@ static void asrc_console_servo_write( app_console_msg_t* msg )
 
     case 0x0Au:
         if( in_len != 1u ) { printf(" \"*as 0A\" takes no extra payload\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
-        audio_app_asrc_freeze_ratio_ab();
+        msg->status = audio_app_asrc_freeze_ratio_ab() ? APP_CONSOLE_OK : APP_CONSOLE_ERR_BAD_DATA;
+        break;
+
+    case 0x0Bu:
+        if( in_len != 2u ) { printf(" \"*as 0B VV\" bad args, VV=signed ppm\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
+        audio_app_asrc_ff_freeze_offset( (int8_t)v1 );
         msg->status = APP_CONSOLE_OK;
         break;
 
@@ -603,6 +864,9 @@ static void asrc_console_servo_read( app_console_msg_t* msg )
     {
         const uint32_t lp = audio_app_asrc_q50_lock_pulls();
         const float    ph = audio_app_asrc_q50_pull_hz();
+#if APP_ASRC_MEAS
+        audio_app_asrc_p1_status();
+#endif
         printf(" *MEAS q50 en=%u state=%u lock_pulls=%lu lock_s=%.3f pull_hz=%.2f ho_stepdiff=%.3e strend=%.3e\n",
                (unsigned)audio_app_asrc_q50_get_en(),
                (unsigned)audio_app_asrc_q50_state(),
@@ -629,6 +893,10 @@ static void asrc_console_servo_read( app_console_msg_t* msg )
 //   SS=0x01 VV       : observer-interference isolation probe, VV=mode 0..2 (was *nt2D)
 //   SS=0x02 VV WW XX : diagnostic servo-error injection, VV=en, WW=freq_hz, XX=amp index 0..3 (was *nt33)
 //   SS=0x03 VV WW    : servo sensitivity screen, VV=which 0..1, WW=code 0..2 (was *nt34)
+//   SS=0x04 VV       : P0 co-timed CCP FF window, T=VV x 500 ms (0=256 periods, 1..8)
+//   SS=0x05 VV       : P0 two-stage FF (256-period FF first, co-timed handover), VV=1/0
+//   SS=0x06 VV       : P0 QUIET_TRACK after QUALITY_READY, VV=0 OFF / 1..3 preset (Q31 only)
+//   SS=0x07 VV       : P0 Step 7 stage-2 FF bias, VV=signed int8 x 0.1 ppm (0 at boot)
 static void asrc_console_experiment( app_console_msg_t* msg )
 {
     const uint16_t in_len  = msg->data_len;
@@ -685,9 +953,9 @@ static void asrc_console_experiment( app_console_msg_t* msg )
         break;
 
     case 0x03u:
-        if( ( in_len != 3u ) || ( v1 > 1u ) || ( v2 > 2u ) )
+        if( ( in_len != 3u ) || ( v1 > 1u ) || ( v2 > 9u ) )
         {
-            printf(" \"*ax 03 VV WW\" bad args, which VV=%u (0=KP 1=ALPHA) code WW=%u (0..2)\n",
+            printf(" \"*ax 03 VV WW\" bad args, which VV=%u (0=KP 1=ALPHA) code WW=%u (0..9)\n",
                    (unsigned)v1, (unsigned)v2);
             msg->status = APP_CONSOLE_ERR_BAD_DATA;
             break;
@@ -696,6 +964,59 @@ static void asrc_console_experiment( app_console_msg_t* msg )
         printf(" *MEAS servo_mult KP=%.3f ALPHA=%.3f (which=%u code=%u)\n",
                (double)audio_app_asrc_get_kp_mult(), (double)audio_app_asrc_get_alpha_mult(),
                (unsigned)v1, (unsigned)v2 );
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 0x04u:
+        if( ( in_len != 2u ) || ( v1 > 8u ) )
+        {
+            printf(" \"*ax 04 VV\" bad co-timed window code VV=%u (0..8)\n", (unsigned)v1);
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            break;
+        }
+        asrc_clock_control_ff_cotimed_set( v1 );
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 0x05u:
+        if( ( in_len != 2u ) || ( v1 > 1u ) )
+        {
+            printf(" \"*ax 05 VV\" bad two-stage flag VV=%u (0/1)\n", (unsigned)v1);
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            break;
+        }
+        asrc_clock_control_ff_two_stage_set( v1 );
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 0x06u:
+#if APP_ASRC_QUIET_TRACK
+        if( ( in_len != 2u ) || ( v1 > 4u ) )
+        {
+            printf(" \"*ax 06 VV\" bad quiet-track preset VV=%u (0=OFF 1..4)\n", (unsigned)v1);
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            break;
+        }
+        audio_app_asrc_quiet_track_set( v1 );
+        printf(" *MEAS quiet-track = %u (0=OFF; enters at QUALITY_READY of each rate epoch)\n",
+               (unsigned)audio_app_asrc_quiet_track_get() );
+        msg->status = APP_CONSOLE_OK;
+#else
+        printf(" *MEAS quiet-track not compiled in this image\n");
+        msg->status = APP_CONSOLE_ERR_BAD_DATA;
+#endif
+        break;
+
+    case 0x07u:
+        if( in_len != 2u )
+        {
+            printf(" \"*ax 07 VV\" bad args, VV=signed 0.1 ppm steps\n");
+            msg->status = APP_CONSOLE_ERR_BAD_DATA;
+            break;
+        }
+        audio_app_asrc_p0_ff_bias_set( (int8_t)v1 );
+        printf(" *MEAS ff bias = %+.1f ppm (stage-2 handover of the next rate epoch; 0 at boot)\n",
+               (double)audio_app_asrc_p0_ff_bias_get() * 0.1 );
         msg->status = APP_CONSOLE_OK;
         break;
 
@@ -709,11 +1030,12 @@ static void asrc_console_experiment( app_console_msg_t* msg )
 // *af SS [..] (write only) : fill/phase servo config, subcode SS selects the sub-command.
 //   SS=0x00 VV    : servo fill observation source, VV: 1=MA64 0=RAW (was *nt2C)
 //   SS=0x01 VV    : continuous-fill estimator toggle, VV=1/0 (was *nt35)
-//   SS=0x02 VV    : automatic phase-centering toggle, VV=1/0 (was *nt36)
-//   SS=0x03 VV    : measured-producer-period phase toggle, VV=1/0 (was *nt38)
+//   SS=0x02/0x03  : retired; route-aware estimation is automatic
 //   SS=0x04 VV    : silent-startup FIFO prime toggle, VV=1/0 (was *nt3F)
 //   SS=0x05 VV    : ratio-lock fill pre-bias, VV=signed offset (was *nt41)
 //   SS=0x06 VV WW : block-phase-aware lock offset, VV=enable, WW=center frames, 0=keep (was *nt42)
+//   SS=0x07 VV    : consumer fractional-phase term in continuous fill, VV=1/0 (MEAS A/B)
+//   SS=0x08 VV    : P0 step 5 -- observe the A->B continuous fill at leg B's hardware instant, VV=1/0 (default 0)
 static void asrc_console_fill_write( app_console_msg_t* msg )
 {
     const uint16_t in_len  = msg->data_len;
@@ -738,15 +1060,10 @@ static void asrc_console_fill_write( app_console_msg_t* msg )
         break;
 
     case 0x02u:
-        if( in_len != 2u ) { printf(" \"*af 02 VV\" bad args\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
-        audio_app_asrc_pc_auto( v1 );
-        msg->status = APP_CONSOLE_OK;
-        break;
-
     case 0x03u:
-        if( in_len != 2u ) { printf(" \"*af 03 VV\" bad args\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
-        audio_app_asrc_hf_en( v1 );
-        msg->status = APP_CONSOLE_OK;
+        printf(" \"*af %02X\" retired; producer rate/center are calibrated automatically per engine\n",
+               (unsigned)subcode );
+        msg->status = APP_CONSOLE_ERR_BAD_DATA;
         break;
 
     case 0x04u:
@@ -774,6 +1091,18 @@ static void asrc_console_fill_write( app_console_msg_t* msg )
         msg->status = APP_CONSOLE_OK;
         break;
 
+    case 0x07u:
+        if( in_len != 2u ) { printf(" \"*af 07 VV\" bad args\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
+        audio_app_asrc_cfill_consumer_phase_en( v1 );
+        msg->status = APP_CONSOLE_OK;
+        break;
+
+    case 0x08u:
+        if( ( in_len != 2u ) || ( v1 > 1u ) ) { printf(" \"*af 08 VV\" bad args (0/1)\n"); msg->status = APP_CONSOLE_ERR_BAD_DATA; break; }
+        audio_app_asrc_cfill_hw_instant_en( v1 );
+        msg->status = APP_CONSOLE_OK;
+        break;
+
     default:
         printf(" \"*af\" unknown subcode %u\n", (unsigned)subcode);
         msg->status = APP_CONSOLE_ERR_BAD_DATA;
@@ -781,21 +1110,32 @@ static void asrc_console_fill_write( app_console_msg_t* msg )
     }
 }
 
-// ?af (read, no payload) : cfill/phase-center/producer-period status print (was *nt37).
+// ?af (read, no payload) : per-engine continuous-fill estimator status.
 static void asrc_console_fill_read( app_console_msg_t* msg )
 {
     const uint16_t in_len = msg->data_len;
 
+    const uint8_t  sub    = ( in_len >= 1u ) ? msg->data[0] : 0u;
+
     msg->data_len = 0u;
 
+#if APP_ASRC_MEAS && ASRC_SAMPLE_Q31
+    if( in_len == 1u && sub == 0x01u )   // "?af01": P0 kick log of the last capture
+    {
+        audio_app_asrc_p0k_dump();
+        msg->status = APP_CONSOLE_OK;
+        return;
+    }
+#endif
+    (void)sub;
     if( in_len != 0u )
     {
-        printf(" \"?af\" takes no payload\n");
+        printf(" \"?af\" takes no payload (or 01 = P0 kick log)\n");
         msg->status = APP_CONSOLE_ERR_BAD_DATA;
         return;
     }
 
-    audio_app_asrc_pc_status();
+    audio_app_asrc_cfill_status();
     msg->status = APP_CONSOLE_OK;
 }
 
@@ -1073,6 +1413,13 @@ static void asrc_console_fir_tradeoff_bench( app_console_msg_t* msg )
  * against the shipping dense 41 tap.  Validates the stride-8 modulo wrap before
  * it times anything and refuses to time a wrong answer.  Foreground-only and
  * defaults to 10,000 trials, like *ad. */
+static void asrc_console_thirdband_kernel_bench( app_console_msg_t* msg )
+{
+    const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
+    msg->data_len = 0u;
+    asrc_thirdband_kernel_bench_run( hundreds * 100u );
+}
+
 static void asrc_console_hb_kernel_bench( app_console_msg_t* msg )
 {
     const uint32_t hundreds = ( msg->data_len >= 1u ) ? (uint32_t)msg->data[0] : 0u;
@@ -1271,6 +1618,22 @@ void sonora_app_console_onmsg( app_console_msg_t* msg )
         break;
 #endif
 
+    case 'n':   // third-band 3-path allpass kernel bench: "*an [VV]" (write only), VV*100 trials
+#if ASRC_FIR_KERNEL_BENCH_AVAILABLE
+        if( msg->kind != '*' )
+        {
+            msg->data_len = 0u;
+            msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+            break;
+        }
+        asrc_console_thirdband_kernel_bench( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
     case 'j':   // 48->32 anti-alias stage select: "*aj SS" write / "?aj" read
 #if APP_ASRC_FULL_IIR_48_TO_32
         asrc_console_full_iir_mode( msg );
@@ -1287,6 +1650,19 @@ void sonora_app_console_onmsg( app_console_msg_t* msg )
     case 'u':   // Q31 kernel pair select: "*au SS" write / "?au" read
 #if APP_ASRC_Q31_OPT_KERNELS
         asrc_console_q31_opt_mode( msg );
+        break;
+#else
+        msg->data_len = 0u;
+        msg->status   = APP_CONSOLE_ERR_UNSUPPORTED;
+        break;
+#endif
+
+    /* 'v' for front-end VARIANT.  NOT 'j' (that is the 48->32 anti-alias stage) and NOT
+     * 'n' (that is the third-band kernel bench, which prices this same filter without
+     * putting it on the audio path). */
+    case 'v':   // 96->32 front-end select: "*av SS" write / "?av" read
+#if APP_ASRC_THIRDBAND_96_TO_32
+        asrc_console_thirdband_mode( msg );
         break;
 #else
         msg->data_len = 0u;

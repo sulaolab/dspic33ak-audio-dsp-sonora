@@ -73,7 +73,7 @@ nora_clock_status_t dspic33ak_clock_reg_clkgen_configure(
  * table, and the arithmetic is the core's.
  */
 typedef struct {
-    uint16_t source;        /* PLLxCONbits.NOSC    */
+    uint16_t source;        /* PLLxCONbits.COSC -- selected, not requested */
     uint32_t feedback_div;  /* PLLxDIVbits.PLLFBDIV */
     uint16_t pre_div;       /* PLLxDIVbits.PLLPRE   */
     uint16_t post_div1;     /* PLLxDIVbits.POSTDIV1 */

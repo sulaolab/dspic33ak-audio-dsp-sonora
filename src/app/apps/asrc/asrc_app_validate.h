@@ -21,6 +21,34 @@
   #error "SPI3/SPI4 TDM is currently an ASRC-only experimental transport."
 #endif
 
+// The 96 -> 32 kHz third-band front end replaces the COMPOSED 96 -> 32 kHz chain and no
+// other ratio, so a 48 kHz build has nothing for it to decimate: it would compile, link
+// nothing (its kernel sections are collected) and never arm.  Refuse instead of shipping a
+// build whose console offers a front end that cannot exist in it.  Checked HERE and not in
+// asrc_app_config.h because APP_USE_96K_RATE is decided by the header that includes that
+// one -- an #if there reads it as 0 in every build.
+#if APP_ASRC_THIRDBAND_96_TO_32 && !APP_USE_96K_RATE
+  #error "APP_ASRC_THIRDBAND_96_TO_32 needs a 96 kHz leg: it replaces the composed 96 -> 32 kHz front end, and in a 48 kHz build there is nothing for it to decimate. Build it into a 96 kHz preset (APP_BUILD_ASRC_CODEC_96K_12CH_32K) instead of leaving it compiled and unreachable."
+#endif
+
+// The boot banner says whether the third band is COMPILED IN, and APP_BUILD_DETAIL is chosen
+// in apps/app_build_config.h -- 100+ lines and one #include BEFORE the header that defaults
+// APP_ASRC_THIRDBAND_96_TO_32 to 0.  So the banner can only see an opt-in the command line
+// carried.  If someone later pins the switch in a header instead, the banner would describe a
+// build it is not -- which is exactly the defect that cost this preset a day (its M=28 pin was
+// unreachable, so every image was M30 while three signboards said 28).  Compare the arm the
+// banner took against the resolved value, now that everything is settled, and refuse.
+//
+// This checks COMPILED, not ARMED, and deliberately so: APP_ASRC_THIRDBAND_DEFAULT_ON and the
+// `*av00`/`*av01` switch decide what is actually filtering, and neither is a compile-time fact
+// the banner could carry.  That is why the banner claims no active front end -- the runtime
+// report (`ASRC 96->32 front end:` and the telemetry's `fe=`) is the authority on that.
+#if defined(APP_BUILD_DETAIL_THIRDBAND_COMPILED)
+  #if (APP_ASRC_THIRDBAND_96_TO_32 != 0) != (APP_BUILD_DETAIL_THIRDBAND_COMPILED != 0)
+    #error "The boot banner and the compiled configuration disagree: APP_BUILD_DETAIL was chosen before APP_ASRC_THIRDBAND_96_TO_32 reached its final value. Pass the third band on the command line (-Define APP_ASRC_THIRDBAND_96_TO_32=1), not as a pin in a header that apps/app_build_config.h includes after choosing the banner."
+  #endif
+#endif
+
 // UART2 long-stream role is a bench measurement build: it streams the REAL one-way A->B
 // resampler output, so it requires an APP_ASRC_MEAS build in the A->B direction (the same
 // build that runs B_ROUTE_ASRC_FROM_A and calls audio_app_meas_capture() from the SPI2 ISR).
@@ -34,6 +62,13 @@
   #if !APP_B_ROUTE_IS_ASRC
     #error "APP_ASRC_MEAS_UART2_STREAM requires the ASRC route (APP_B_ROUTE_IS_ASRC)."
   #endif
+#endif
+
+// The control-variable trace and its dumps read the A->B engine (the _ab getters).  A BA MEAS image
+// has no A->B engine unless APP_MEAS_BA_DROP_AB_ENGINE=0 (asrc_app_config.h), so refuse the pair
+// instead of letting it fail at link time with an unhelpful undefined symbol.
+#if APP_ASRC_MEAS && APP_MEAS_CTRL_TRACE && !APP_ASRC_HAS_AB_ENGINE
+  #error "APP_MEAS_CTRL_TRACE reads the A->B engine; a BA MEAS image has none. Build it with APP_MEAS_BA_DROP_AB_ENGINE=0."
 #endif
 
 // Q19 freeze-state causal map = the Q16-profile science build; it only makes sense on top of the
@@ -59,6 +94,26 @@
 // reason.
 #if (APP_BUILD == APP_BUILD_ASRC_CODEC_96K_12CH_32K) && (APP_TARGET != APP_TARGET_AK512)
   #error "APP_BUILD_ASRC_CODEC_96K_12CH_32K is an AK512 preset: 12 channels of Q31 history plus two engines do not fit the AK128 data memory. Use APP_BUILD_ASRC_AK128_CODEC_BIDIR on AK128."
+#endif
+
+/* AK128 Bi-Codec is intentionally a single 48 kHz <-> 48 kHz product cell.
+ * Keep every fact that makes that statement true together with the preset pin:
+ * changing an initial rate, adding a B-leg boot override, or re-enabling the
+ * low-rate front end must fail at compile time instead of quietly widening the
+ * ROM-fitted image's supported surface. */
+#if defined(APP_ASRC_AK128_FIXED_48K_PAIR) && APP_ASRC_AK128_FIXED_48K_PAIR
+  #if (APP_TARGET != APP_TARGET_AK128) || (APP_BUILD != APP_BUILD_ASRC_AK128_CODEC_BIDIR)
+    #error "APP_ASRC_AK128_FIXED_48K_PAIR is reserved for APP_BUILD_ASRC_AK128_CODEC_BIDIR on AK128."
+  #endif
+  #if (APP_SAMPLE_RATE_HZ != 48000u)
+    #error "APP_ASRC_AK128_FIXED_48K_PAIR requires a 48 kHz default transport rate."
+  #endif
+  #if defined(APP_TRANSPORT_LEG_B_BOOT_RATE_HZ) && (APP_TRANSPORT_LEG_B_BOOT_RATE_HZ != 48000u)
+    #error "APP_ASRC_AK128_FIXED_48K_PAIR requires the B-leg boot-rate override, if present, to be 48 kHz."
+  #endif
+  #if APP_ASRC_RUNTIME_48K_TO_8 || APP_ASRC_48K_TO_8_INTEGRATION || APP_ASRC_48K_TO_8_DECIMATOR
+    #error "APP_ASRC_AK128_FIXED_48K_PAIR admits only the 48 kHz <-> 48 kHz cell; low-rate front ends must remain disabled."
+  #endif
 #endif
 
 #if defined(ENA_96K_RATE)
@@ -128,5 +183,17 @@
   #endif
 
 #endif // defined(ENA_96K_RATE)
+
+// QUIET_TRACK replaces the Q31 integer step and enters only after the two-stage FF handover, whose
+// windows are built inside the CCP feed-forward acquire guard.  Without either the code would
+// compile and never run.
+#if APP_ASRC_QUIET_TRACK
+  #if !ASRC_SAMPLE_Q31
+    #error "APP_ASRC_QUIET_TRACK requires ASRC_SAMPLE_Q31=1: it drives the Q31 integer step, which the float arm does not have."
+  #endif
+  #if !( APP_ASRC_FF_ACQUIRE_GUARD || APP_ASRC_RUNTIME_48K_TO_8 )
+    #error "APP_ASRC_QUIET_TRACK requires APP_ASRC_FF_ACQUIRE_GUARD or APP_ASRC_RUNTIME_48K_TO_8: the two-stage FF handover it enters from lives in that CCP feed-forward guard."
+  #endif
+#endif
 
 #endif /* SONORA_ASRC_APP_VALIDATE_H */

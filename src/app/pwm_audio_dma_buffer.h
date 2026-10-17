@@ -13,6 +13,11 @@
  */
 // #define PWM_AUDIO_ENABLE_SECONDARY_PAIR
 
+// The legacy secondary map would drive MPQ IN1 (RP98) and nFAULT (RP82).
+#if (APP_PWM_OUTPUT == 1) && defined(PWM_AUDIO_ENABLE_SECONDARY_PAIR)
+#error "MPQ6612A mode cannot use PWM_AUDIO_ENABLE_SECONDARY_PAIR"
+#endif
+
 /*
  * Carrier = SAMPLE_RATE * PWM_AUDIO_UPSAMPLE_FACTOR. Target is still 10
  * (48000 * 10 = 480kHz, matching the switching frequency range of commercial
@@ -49,7 +54,11 @@
  * error-feedback (noise-shaping). Deliberately deferred (2026-08-16); see
  * float_conversion.c's function comment for where it would go.
  */
-#define PWM_AUDIO_UPSAMPLE_FACTOR  (2u)
+#if APP_PWM_OUTPUT == 1
+#define PWM_AUDIO_UPSAMPLE_FACTOR (MPQ6612A_CARRIER_FACTOR) // 48/96/192 kHz, zero-order hold
+#else
+#define PWM_AUDIO_UPSAMPLE_FACTOR (2u) // legacy MIC4607: 96 kHz
+#endif
 #if APP_USE_PWM_AUDIO
 #define PWM_AUDIO_GENERATOR_CLOCK_HZ  (SONORA_CLOCK_PWM_MCLK_HZ)
 #else
@@ -61,7 +70,7 @@
 #define PWM_AUDIO_DUTY_WORD_COUNT \
     (2u * APP_BLOCK_FRAMES * PWM_AUDIO_UPSAMPLE_FACTOR)
 
-#if APP_TARGET == APP_TARGET_AK512
+#if (APP_TARGET == APP_TARGET_AK512) || (defined(APP_TARGET_AK506) && APP_TARGET == APP_TARGET_AK506)
 extern volatile uint32_t g_pwm_audio_pg5_duty[PWM_AUDIO_DUTY_WORD_COUNT];
 extern volatile uint32_t g_pwm_audio_pg6_duty[PWM_AUDIO_DUTY_WORD_COUNT];
 #if defined(PWM_AUDIO_ENABLE_SECONDARY_PAIR)

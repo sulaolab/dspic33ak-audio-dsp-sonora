@@ -88,4 +88,18 @@ extern void convert_float_to_pwm_20bit( const float*    float_in,
                                               uint32_t  pwm_period );
 
 
+// Completed interleaved TDM TX Q31 L -> near-full-range PWM, scope only.
+// No codec/PWM gain is applied again. Endpoints retain 0x100 register guard.
+extern void convert_codec_q31_to_pwm_20bit(const int32_t* pcm, unsigned stride,
+                                         int32_t* output, size_t num_samples,
+                                         uint8_t up_sample_factor, uint32_t pwm_period);
+// ch-major float (one selected channel) -> planar Q1.31 for hal_pwm_audio.
+// Applies Post_Gain_PWM BEFORE saturation (the same order as
+// convert_float_to_pwm_20bit), maps NaN to 0 and saturates +/-1.0 and beyond
+// (including +/-Inf) to the Q1.31 end points.
+extern void convert_float_to_pwm_q31( const float*   float_in,
+                                            uint8_t  slot,
+                                            int32_t* q31_out,
+                                            size_t   num_samples );
+
 #endif	//!_FLOAT_CONVERSION_H

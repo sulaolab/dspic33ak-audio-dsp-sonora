@@ -70,6 +70,15 @@ typedef struct {
     uint32_t ON;
     /* No OE: PLLxCON has no OE bit -- only CLKxCON does. */
     uint32_t NOSC;
+    /*
+     * COSC and CLKRDY are modelled for the same reason CLKGEN's are: the reg
+     * layer's closing poll on a PLL asks all three of "OSCCTRL says locked",
+     * "PLLxCON.CLKRDY says ready" and "COSC is the source I requested".  Without
+     * COSC and CLKRDY here that poll could only ever be satisfied by OSCCTRL,
+     * which is the exact hole it was written to close.
+     */
+    uint32_t COSC;
+    uint32_t CLKRDY;
     uint32_t OSWEN;
     uint32_t DIVSWEN;
     uint32_t PLLSWEN;
@@ -116,12 +125,17 @@ uint32_t nora_fake_clkfail_word(void);
  * and a case that inherits the previous one's registers is not testing what it
  * says it is.
  *
- * CLKRDY is deliberately NOT tied to ON here.  The general CLKGEN sequence drops
- * ON before re-sourcing, and if the model cleared CLKRDY with it, the sequence's
- * closing WAIT_SET(CLKRDY) would be satisfied only by the OSWEN completion --
- * true on this silicon, but a coupling this file has no evidence for.  A PLL's
- * RDY *is* cleared with its ON, which is the one lock rule the reg layer's own
- * comments rely on (a PLL taken out of lock is not ready).
+ * A GENERATOR's CLKRDY is deliberately NOT tied to its ON here.  The general
+ * CLKGEN sequence drops ON before re-sourcing, and if the model cleared CLKRDY
+ * with it, the sequence's closing WAIT_SET(CLKRDY) would be satisfied only by the
+ * OSWEN completion -- true on this silicon, but a coupling this file has no
+ * evidence for.
+ *
+ * A PLL's is the opposite: both OSCCTRL's PLLxRDY and PLLxCON.CLKRDY are cleared
+ * with its ON, and its COSC is only updated when a source switch completes.  That
+ * is the one lock rule the reg layer's own comments rely on -- a PLL taken out of
+ * lock is not ready -- and it is what makes a repeat configure provable rather
+ * than satisfied by a stale indication.
  */
 void nora_fake_clock_reset(void);
 
@@ -147,5 +161,40 @@ uint32_t nora_fake_clkgen_on_clears(uint32_t generator);
 
 uint32_t nora_fake_pll_source_switches(uint32_t pll);
 uint32_t nora_fake_pll_on_clears(uint32_t pll);
+
+/*
+ * Model a consumer that is still requesting this PLL.  DS70005591D 12.4.1: "The ON
+ * bit is logically ORed with clock request signals from other peripherals ... and
+ * it can only be used to disable the CLKGEN or PLL when there are no active clock
+ * requests."
+ *
+ * So the ON BIT and the ENABLE are two different things, and this model keeps them
+ * apart: con.ON holds exactly what software wrote, and what decides whether the
+ * block runs is
+ *
+ *     effective enable = con.ON || request_held
+ *
+ * The lock indications follow the effective enable -- they fall only when BOTH are
+ * gone -- while on_clears still counts software's own ON writes.  An earlier
+ * revision forced con.ON to 1 while held, which made the two indistinguishable and
+ * made the interesting state unwritable as a test: settings matching and the PLL
+ * locked, with ON = 0 because only a consumer is holding it up.
+ *
+ * The register layer is written not to depend on ON = 0 succeeding; this is how
+ * that is tested on the host, because it cannot be arranged on the bench.
+ */
+void nora_fake_pll_set_request_held(uint32_t pll, uint32_t held);
+
+/*
+ * Model a source switch that COMPLETES without TAKING: OSWEN clears, so every
+ * "did the request finish" wait is satisfied, but COSC keeps its old value and the
+ * PLL keeps reporting lock -- on the source it was already on.
+ *
+ * This is the lie a driver has to be written against, and the reason the register
+ * layer's closing poll checks COSC and PLLxCON.CLKRDY and not just OSCCTRL's lock
+ * bit.  dspic33ak_clock_reg_system_switch_source() says the same thing about
+ * CLKGEN1 in its own comment; this is that hazard for a PLL.
+ */
+void nora_fake_pll_set_switch_refused(uint32_t pll, uint32_t refused);
 
 #endif /* NORA_FAKE_CLOCK_H */

@@ -19,7 +19,8 @@
 
 // One block-completion ISR's diagnostics. block_count / block_deadline_miss_count are
 // software/real-time stream health (not SPI HW over/underrun). The isr_* counters are raw
-// high-res-timer ticks; *_get_load() converts them to the public load monitor.
+// high-res-timer ticks; *_get_load() copies them into the public load monitor and
+// *_load_scale() converts them to microseconds (see those two declarations for why it is split).
 typedef struct {
     volatile uint32_t block_count;                // completed blocks since reset()
     volatile uint32_t block_deadline_miss_count;  // HALF+DONE conflicts on this instance since reset()
@@ -74,9 +75,22 @@ void nora_spi_i2s_tdm_diag_note_dma_status( nora_spi_i2s_tdm_diag_t* d,
 
 // Snapshot the load monitor and clear min/max/event when clear_peak is true. Returns false and
 // zeroes the monitor until a timed sample exists and the high-resolution timer is initialized.
-bool nora_spi_i2s_tdm_diag_get_load( nora_spi_i2s_tdm_diag_t* d,
-                                      nora_spi_i2s_tdm_load_t* monitor,
-                                      bool clear_peak );
+//
+// COUNTS ONLY: it fills last/min/max/event_count and leaves the *_us10 fields ZERO -- the name says
+// so, so a caller cannot compile against the old (counts + scaled) contract and silently read
+// 0.0 us. The caller masks this instance's RX-block ISR around it (see the read helpers above),
+// and the tick->us conversion is a 64-bit division per field -- three of them, which is interrupt
+// latency charged to the audio ISR for arithmetic that needs no consistency guarantee at all. Call
+// nora_spi_i2s_tdm_diag_load_scale() on the returned monitor AFTER restoring the interrupt, and
+// the published figures are identical.
+bool nora_spi_i2s_tdm_diag_get_load_counts( nora_spi_i2s_tdm_diag_t* d,
+                                             nora_spi_i2s_tdm_load_t* monitor,
+                                             bool clear_peak );
+
+// Fill the *_us10 fields of a monitor already populated by
+// nora_spi_i2s_tdm_diag_get_load_counts(). Pure arithmetic on the caller's own struct: no shared
+// state, so it MUST run with the RX-block ISR re-enabled. Idempotent, and a no-op-safe NULL guard.
+void nora_spi_i2s_tdm_diag_load_scale( nora_spi_i2s_tdm_load_t* monitor );
 
 // Read the block and deadline-miss counters. Either output pointer may be NULL.
 void nora_spi_i2s_tdm_diag_read_counts( const nora_spi_i2s_tdm_diag_t* d,

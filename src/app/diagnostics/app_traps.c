@@ -35,7 +35,7 @@
  * present its old counter here: at worst the tag fails and the count restarts at zero, which
  * is the same outcome as a cold boot and is what the tag is for. */
 #define APP_TRAP_COUNTER_MAGIC      (0x434Eu)     /* "CN" */
-#define APP_TRAP_SCHEMA_VERSION     (3u)   /* 2: + sp/fp/inttreg. 3: + stacked PC/SR */
+#define APP_TRAP_SCHEMA_VERSION     (4u)   /* 2: + sp/fp/inttreg. 3: + stacked PC/SR. 4: BMX error status replaces PCHOLD. */
 
 /*
  * The latch, in the hal_noinit_ram block's low region (src/noinit_ram_layout.h).
@@ -58,7 +58,7 @@ typedef struct
     uint32_t      pctrap;
     uint32_t      fex;
     uint32_t      fex2;
-    uint32_t      pchold;
+    uint32_t      bmx_cpu_err;
     uint32_t      vfa;
     uint32_t      splim;
     uint32_t      rcon;
@@ -122,7 +122,7 @@ static void app_traps_record_clear( void )
     TRAPS->pctrap         = 0u;
     TRAPS->fex            = 0u;
     TRAPS->fex2           = 0u;
-    TRAPS->pchold         = 0u;
+    TRAPS->bmx_cpu_err    = 0u;
     TRAPS->vfa            = 0u;
     TRAPS->splim          = 0u;
     TRAPS->rcon           = 0u;
@@ -175,7 +175,15 @@ static void __attribute__((noreturn)) app_traps_record_and_reset( app_trap_id_t 
     TRAPS->pctrap  = PCTRAP;
     TRAPS->fex     = FEX;
     TRAPS->fex2    = FEX2;
-    TRAPS->pchold  = PCHOLD;
+#if defined(BMXCPUERR)
+    /* AK512 CPU bus-error status. */
+    TRAPS->bmx_cpu_err = BMXCPUERR;
+#elif defined(BMXICDERR)
+    /* AK128 has no BMXCPUERR; its corresponding raw bus-matrix error status is BMXICDERR. */
+    TRAPS->bmx_cpu_err = BMXICDERR;
+#else
+#error "Trap record needs a BMX error-status register for this device."
+#endif
     TRAPS->vfa     = VFA;
     TRAPS->splim   = SPLIM;
     TRAPS->rcon    = RCON;
@@ -214,6 +222,15 @@ static void __attribute__((noreturn)) app_traps_record_and_reset( app_trap_id_t 
      */
     TRAPS->stacked_pc = *(const volatile uint32_t *)(uintptr_t)( sp_at_entry - 8u );
     TRAPS->stacked_sr = *(const volatile uint32_t *)(uintptr_t)( sp_at_entry - 12u );
+#if APP_TRAP_DIAG_FRAME
+    /* Repurposed fields -- see APP_TRAP_DIAG_FRAME in app_traps.h. */
+    TRAPS->intcon3 = MODCON;
+    TRAPS->intcon4 = YMODSRT;
+    TRAPS->intcon5 = YMODEND;
+    TRAPS->fex2    = *(const volatile uint32_t *)(uintptr_t)( sp_at_entry - 16u );
+    TRAPS->pchold  = *(const volatile uint32_t *)(uintptr_t)( sp_at_entry - 20u );
+    TRAPS->vfa     = *(const volatile uint32_t *)(uintptr_t)( sp_at_entry - 24u );
+#endif
 
     if( TRAPS->counter_magic != APP_TRAP_COUNTER_MAGIC )
     {
@@ -314,7 +331,7 @@ bool app_traps_previous_get( app_trap_record_t *out )
     out->pctrap         = TRAPS->pctrap;
     out->fex            = TRAPS->fex;
     out->fex2           = TRAPS->fex2;
-    out->pchold         = TRAPS->pchold;
+    out->bmx_cpu_err    = TRAPS->bmx_cpu_err;
     out->vfa            = TRAPS->vfa;
     out->splim          = TRAPS->splim;
     out->rcon           = TRAPS->rcon;
@@ -367,9 +384,9 @@ void app_traps_report_previous( void )
     printf( "    INTCON1=%08lX INTCON3=%08lX INTCON4=%08lX INTCON5=%08lX\n",
             (unsigned long)record.intcon1, (unsigned long)record.intcon3,
             (unsigned long)record.intcon4, (unsigned long)record.intcon5 );
-    printf( "    PC=%06lX PCTRAP=%06lX PCHOLD=%06lX VFA=%06lX SPLIM=%06lX\n",
+    printf( "    PC=%06lX PCTRAP=%06lX BMXERR=%08lX VFA=%06lX SPLIM=%06lX\n",
             (unsigned long)record.pc, (unsigned long)record.pctrap,
-            (unsigned long)record.pchold, (unsigned long)record.vfa,
+            (unsigned long)record.bmx_cpu_err, (unsigned long)record.vfa,
             (unsigned long)record.splim );
     printf( "    FEX=%08lX FEX2=%08lX RCON-at-trap=%08lX\n",
             (unsigned long)record.fex, (unsigned long)record.fex2,
@@ -402,6 +419,13 @@ void app_traps_report_previous( void )
             (unsigned long)( ( record.stacked_sr >> 2 ) & 0x1uL ),
             (unsigned long)( ( record.stacked_sr >> 1 ) & 0x1uL ),
             (unsigned long)( record.stacked_sr & 0x1uL ) );
+#if APP_TRAP_DIAG_FRAME
+    printf( "    DIAG MODCON=%08lX YMODSRT=%06lX YMODEND=%06lX [sp-16]=%08lX [sp-20]=%08lX [sp-24]=%08lX"
+            " (INTCON3/4/5 FEX2 PCHOLD VFA above are these, not registers)\n",
+            (unsigned long)record.intcon3, (unsigned long)record.intcon4,
+            (unsigned long)record.intcon5, (unsigned long)record.fex2,
+            (unsigned long)record.pchold, (unsigned long)record.vfa );
+#endif
     printf( "    traps since power-on: %lu%s\n",
             (unsigned long)count,
             ( count > 1u ) ? "  <- repeating" : "" );

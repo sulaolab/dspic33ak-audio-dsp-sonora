@@ -4,14 +4,14 @@
 //===========================================================
 // ASRC App measurement interface (audio_app_meas.h)
 //
-// ASRC quality MEASUREMENT harness (bench only, APP_ASRC_MEAS builds). Replaces the A->B
-// ASRC input with an on-chip pure sine and captures the DIGITAL A->B output to RAM so the
+// ASRC quality MEASUREMENT harness (bench only, APP_ASRC_MEAS builds). Replaces the selected
+// APP_MEAS_DIR source with an on-chip pure sine and captures that direction's DIGITAL output to RAM so the
 // resampler's image / alias / SNR can be measured by offline FFT -- isolated from the codec
 // DAC/ADC floor (~-90 dB) that would otherwise mask a good kernel. Console-driven:
 //   *nt20 arm capture   *nt21 dump buffer   *nt22 tone=low   *nt23 tone=high
 //
-// Only compiled/linked in an APP_ASRC_MEAS build (which also forces one-way A->B so the
-// B->A instance is not allocated -- freeing the RAM the capture buffer needs).
+// Only compiled/linked in an APP_ASRC_MEAS build. Most profiles select one-way A->B; the dedicated
+// B->A profile allocates that engine with a reduced diagnostic trace depth to retain stack headroom.
 //===========================================================
 
 #include <stdint.h>
@@ -19,12 +19,13 @@
 
 #if APP_ASRC_MEAS
 
-// Fill one A-input block with the current test sine (stereo slots 0/1, other slots 0), in the
-// 32-bit left-justified codec slot format. The A block callback pushes this into the A->B FIFO
-// instead of the codec input.
+// Fill one selected-leg input block with the current test sine (stereo slots 0/1, other slots 0),
+// in the 32-bit left-justified codec slot format. The source callback pushes this into the selected
+// ASRC FIFO instead of the codec input.
 void audio_app_meas_gen_input( int32_t* block );
 
-// While armed, capture one just-resampled A->B output block's L channel into the buffer.
+// While armed, capture one just-resampled selected-direction output block's L channel into the buffer.
+// The dump header reports both post-pull fill_at_cap and the phase-matched fill_pull_start/fill_target.
 void audio_app_meas_capture( const int32_t* out_block );
 
 // Real-clamp observation on the 32 kHz A->B OUTPUT block (MEAS builds only). Counts
@@ -42,6 +43,9 @@ void audio_app_meas_out_fs_clear( void );
 
 // Console control. arm: start a one-shot capture. dump: print the captured buffer for FFT.
 void audio_app_meas_arm( void );
+// Main-loop completion notifier. The audio ISR only latches readiness; this emits one
+// `*MEAS captured n=... fs_out=...` line per arm without doing UART work in the ISR.
+void audio_app_meas_service( void );
 void audio_app_meas_dump( void );
 void audio_app_meas_set_tone_low( void );
 // "High" = band-edge stress at 18 kHz REAL, so the row is resolved from the live source-leg rate

@@ -1931,9 +1931,15 @@ bool nora_spi_i2s_tdm_inst_get_load( nora_spi_i2s_tdm_inst_t* inst,
     // The diag counters are updated in this instance's RX-block ISR; mask its IE so
     // the snapshot + clear are consistent against the 16-bit core's non-atomic 32-bit
     // reads. The diag module itself does no masking.
+    //
+    // COUNTS ONLY inside the mask. Masking this IE holds off the audio block ISR's ENTRY, and the
+    // tick->us conversion is three 64-bit divisions on values already copied into the caller's own
+    // struct -- there is nothing there to keep consistent. Scale after the restore.
     rxie_bak = tdm_rx_ie_disable( inst->rx_dma_ch );
-    valid    = nora_spi_i2s_tdm_diag_get_load( &inst->diag, monitor, clear_peak );
+    valid    = nora_spi_i2s_tdm_diag_get_load_counts( &inst->diag, monitor, clear_peak );
     tdm_rx_ie_restore( inst->rx_dma_ch, rxie_bak );
+
+    nora_spi_i2s_tdm_diag_load_scale( monitor );
 
     return valid;
 }
